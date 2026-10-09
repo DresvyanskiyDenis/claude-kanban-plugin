@@ -1,0 +1,1536 @@
+"""Schema, migrations and every state change (STO, LIF).
+
+Each public domain function validates its guards, writes at least one event and commits
+atomically in one `BEGIN IMMEDIATE` (STO-01/02). Network and git validation runs before the
+transaction; side effects on processes run after it. Status changes are compare-and-swap.
+"""
+
+import contextlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+import time
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+from typing import Any
+
+from . import ghops, validate
+from .errors import Error, NotFound, Refused
+from .paths import dirs, ensure_dir
+
+SCHEMA = """
+CREATE TABLE boards (
+  slug TEXT PRIMARY KEY, name TEXT NOT NULL, default_workdir TEXT, claude_config_dir TEXT,
+  created_at INTEGER NOT NULL, archived_at INTEGER);
+CREATE TABLE tasks (
+  id TEXT PRIMARY KEY, board TEXT NOT NULL REFERENCES boards(slug), title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL CHECK (status IN
+    ('triage','todo','ready','running','review','blocked','done','archived')),
+  assignee TEXT, implementer TEXT, priority INTEGER NOT NULL DEFAULT 0,
+  workspace_kind TEXT NOT NULL DEFAULT 'scratch'
+    CHECK (workspace_kind IN ('worktree','dir','scratch')),
+  workspace_path TEXT, branch_name TEXT, base_branch TEXT,
+  max_runtime_seconds INTEGER, max_retries INTEGER,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  protocol_violations INTEGER NOT NULL DEFAULT 0, last_failure_error TEXT,
+  block_kind TEXT CHECK (block_kind IS NULL OR block_kind IN
+    ('needs_input','capability','transient','stopped','gave_up')),
+  block_recurrences INTEGER NOT NULL DEFAULT 0,
+  model_override TEXT, reasoning_effort TEXT, budget_usd REAL,
+  skills TEXT NOT NULL DEFAULT '[]', idempotency_key TEXT, retry_after INTEGER,
+  pr_number INTEGER, pr_url TEXT,
+  merge_state TEXT CHECK (merge_state IS NULL OR merge_state IN ('pending','merged','failed')),
+  merge_attempts INTEGER NOT NULL DEFAULT 0, merge_next_at INTEGER, merged_at INTEGER,
+  worktree_state TEXT CHECK (worktree_state IS NULL OR worktree_state IN
+    ('active','removed','kept_dirty','kept_unpushed')),
+  created_by TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  started_at INTEGER, completed_at INTEGER, version INTEGER NOT NULL DEFAULT 1);
+CREATE UNIQUE INDEX idx_tasks_idempotency ON tasks(board, idempotency_key)
+  WHERE idempotency_key IS NOT NULL AND status <> 'archived';
+CREATE INDEX idx_tasks_status ON tasks(status);
+CREATE INDEX idx_tasks_board ON tasks(board, status);
+CREATE TABLE task_links (
+  parent_id TEXT NOT NULL REFERENCES tasks(id), child_id TEXT NOT NULL REFERENCES tasks(id),
+  PRIMARY KEY (parent_id, child_id), CHECK (parent_id <> child_id));
+CREATE INDEX idx_links_child ON task_links(child_id);
+CREATE TABLE task_comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
+  author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX idx_comments_task ON task_comments(task_id, id);
+CREATE TABLE task_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, board TEXT, task_id TEXT REFERENCES tasks(id),
+  run_id INTEGER, kind TEXT NOT NULL, actor TEXT, payload TEXT, created_at INTEGER NOT NULL);
+CREATE INDEX idx_events_task ON task_events(task_id, id);
+CREATE INDEX idx_events_run ON task_events(run_id, id);
+CREATE TABLE task_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
+  n INTEGER NOT NULL, role TEXT, kind TEXT NOT NULL DEFAULT 'work' CHECK (kind IN ('work','review')),
+  status TEXT NOT NULL CHECK (status IN ('running','ended')), outcome TEXT, summary TEXT,
+  metadata TEXT, error TEXT, exit_code INTEGER, claude_exit_code INTEGER,
+  runner_pid INTEGER, runner_started INTEGER, claude_pid INTEGER, claude_started INTEGER,
+  session_id TEXT, resumed INTEGER, model TEXT, effort TEXT, budget_usd REAL,
+  claude_version TEXT, permission_mode TEXT, config_dir TEXT, max_runtime_seconds INTEGER,
+  started_at INTEGER NOT NULL, ended_at INTEGER, last_output_at INTEGER, num_turns INTEGER,
+  cost_usd REAL, session_cost_usd REAL, subtype TEXT, is_error INTEGER, api_error_status INTEGER,
+  terminal_verb TEXT, stop_requested INTEGER NOT NULL DEFAULT 0, stream_path TEXT, log_path TEXT);
+CREATE UNIQUE INDEX one_active_run ON task_runs(task_id) WHERE status = 'running';
+CREATE INDEX idx_runs_task ON task_runs(task_id, n);
+CREATE TABLE task_attachments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
+  filename TEXT NOT NULL, stored_path TEXT NOT NULL, content_type TEXT,
+  size INTEGER NOT NULL DEFAULT 0, uploaded_by TEXT, created_at INTEGER NOT NULL);
+CREATE TABLE grants (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
+  rules TEXT NOT NULL, approved TEXT NOT NULL, created_at INTEGER NOT NULL, revoked_at INTEGER);
+CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+# Forward-only: MIGRATIONS[i] takes user_version i to i + 1 (STO-03).
+MIGRATIONS: list[str] = [SCHEMA]
+BACKUPS_KEPT = 5
+
+STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "archived")
+WORKER_BLOCK_KINDS = ("needs_input", "capability", "transient")
+BUILDERS = ("smith", "designer")
+APPROVED_RE = re.compile(r"WARDEN: APPROVED PR #(\d+) @\s*([0-9a-f]{7,40})\b")
+BLOCK_RECURRENCE_LIMIT = 2
+PROTOCOL_VIOLATION_LIMIT = 3
+RETRY_AFTER_S = 60
+SYSTEMIC_CRASH_COUNT = 3
+SYSTEMIC_WINDOW_S = 600
+MAX_ATTACH_BYTES = 25 * 1024 * 1024
+COUNTED_OUTCOMES = ("budget_exceeded", "timed_out", "crashed")
+TRIAGE_RUNTIME_S = 7200
+OWNER = "owner:cli"
+RUN_ENDED = "run ended; the owner stopped it or it already finished. Stop working and exit"
+
+DEFAULTS: dict[str, Any] = {
+    "claude.bin": None,
+    "claude.config_dir": None,
+    "dispatch.max_in_progress": 2,
+    "dispatch.tick_seconds": 15,
+    "dispatch.roles": ["smith", "designer", "scout", "warden"],
+    "dispatch.reviewer": "warden",
+    "dispatch.default_assignee": None,
+    "dispatch.failure_limit": 2,
+    "models.default": "sonnet",
+    "models.review": "opus",
+    "effort.default": "xhigh",
+    "effort.review": "high",
+    "effort.scout": "high",
+    "runtime.scout": 1800,
+    "runtime.smith": 7200,
+    "runtime.designer": 7200,
+    "runtime.warden": 2700,
+    "runtime.atlassian": 900,
+    "budget.max_usd_per_run": 30,
+    "budget.ceiling": 100,
+    "quota.soft_wall": 0.9,
+    "quota.requeue_s": 300,
+    "worker.keep_awake": True,
+    "worker.terminal_grace_s": 120,
+    "worker.max_turns": None,
+    "worker.env_passthrough": [],
+    "worker.extra_mcp_config": None,
+    "web.enabled": True,
+    "web.port": 9129,
+    "web.jira_base_url": None,
+    "retention.stream_days": 30,
+    "roles.atlassian.enabled": False,
+}
+
+Row = sqlite3.Row
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def dumps(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+# --- connection, transactions, migrations ---------------------------------------------------
+
+
+def _statements(sql: str) -> Iterator[str]:
+    buf = ""
+    for line in sql.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            yield buf
+            buf = ""
+
+
+def _backup(conn: sqlite3.Connection, directory: Path, version: int) -> None:
+    ensure_dir(directory)
+    dest = (
+        directory / f"kanban-s{version}-{time.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(2)}.db"
+    )
+    os.close(os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    out = sqlite3.connect(dest)
+    try:
+        conn.backup(out)
+    finally:
+        out.close()
+    for old in sorted(directory.glob("kanban-s*.db"), key=lambda p: p.stat().st_mtime)[
+        :-BACKUPS_KEPT
+    ]:
+        old.unlink()
+
+
+def migrate(conn: sqlite3.Connection, backups: Path) -> int:
+    """Apply pending migrations after a backup (STO-03). Idempotent (STO-10)."""
+    version: int = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > len(MIGRATIONS):
+        raise Error(
+            f"database schema {version} is newer than this kanban ({len(MIGRATIONS)}); "
+            "upgrade the kanban-claude plugin and runtime"
+        )
+    if version == len(MIGRATIONS):
+        return version
+    if version > 0:
+        _backup(conn, backups, version)
+    for target in range(version, len(MIGRATIONS)):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if conn.execute("PRAGMA user_version").fetchone()[0] <= target:
+                for stmt in _statements(MIGRATIONS[target]):
+                    conn.execute(stmt)
+                conn.execute(f"PRAGMA user_version = {target + 1}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    return len(MIGRATIONS)
+
+
+def connect(home: Path | None = None, *, upgrade: bool = True) -> sqlite3.Connection:
+    """Open `$KANBAN_HOME/kanban.db` (0600, created before SQLite touches it, SEC-06)."""
+    home = ensure_dir(home or dirs().home)
+    db = home / "kanban.db"
+    with contextlib.suppress(FileExistsError):
+        os.close(os.open(db, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    conn = sqlite3.connect(db, isolation_level=None, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA synchronous = FULL")
+    if upgrade:
+        migrate(conn, home / "backups")
+    return conn
+
+
+@contextlib.contextmanager
+def tx(conn: sqlite3.Connection) -> Iterator[None]:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+# --- config and state -----------------------------------------------------------------------
+
+
+def cfg(conn: sqlite3.Connection, key: str) -> Any:
+    row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+    if row:
+        return json.loads(row["value"])
+    return json.loads(json.dumps(DEFAULTS[key]))
+
+
+def config_all(conn: sqlite3.Connection) -> dict[str, Any]:
+    return {k: cfg(conn, k) for k in sorted(DEFAULTS)}
+
+
+def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = OWNER) -> None:
+    if key not in DEFAULTS:
+        raise Refused(f"unknown config key {key!r}; list them with: kanban config list")
+    default = DEFAULTS[key]
+    if key.startswith("runtime."):
+        value = validate.duration(value)
+    elif default is not None and type(value) is not type(default):
+        ok_number = isinstance(default, float) and type(value) is int
+        if not ok_number:
+            raise Refused(f"{key} must be {type(default).__name__}, got {value!r}")
+    roles = value if key == "dispatch.roles" else cfg(conn, "dispatch.roles")
+    if key == "dispatch.roles":
+        if not value or not all(isinstance(r, str) for r in value):
+            raise Refused("dispatch.roles must be a non-empty list of role names")
+        default_assignee = cfg(conn, "dispatch.default_assignee")
+        if default_assignee is not None and default_assignee not in roles:
+            raise Refused(f"dispatch.default_assignee {default_assignee!r} would leave the roles")
+    unset_ok = value is None and key == "dispatch.default_assignee"
+    is_role_key = key in ("dispatch.default_assignee", "dispatch.reviewer")
+    if is_role_key and not unset_ok and value not in roles:
+        raise Refused(f"{key} must be one of dispatch.roles ({', '.join(roles)})")
+    if key == "dispatch.max_in_progress" and value < 1:
+        raise Refused("dispatch.max_in_progress must be at least 1")
+    if key == "budget.ceiling" and value <= 0:
+        raise Refused("budget.ceiling must be positive")
+    with tx(conn):
+        config_put(conn, key, value)
+        _ev(conn, None, "config_changed", actor, {"key": key, "value": value})
+
+
+def config_put(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    """The bare upsert, for callers already inside a transaction (no validation, no event)."""
+    conn.execute(
+        "INSERT INTO config(key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (key, json.dumps(value), now()),
+    )
+
+
+def state_get(conn: sqlite3.Connection, key: str) -> Any:
+    row = conn.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+    return json.loads(row["value"]) if row else None
+
+
+def state_put(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    conn.execute(
+        "INSERT INTO state(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, json.dumps(value)),
+    )
+
+
+# --- events ---------------------------------------------------------------------------------
+
+
+def _ev(
+    conn: sqlite3.Connection,
+    t: Row | dict[str, Any] | None,
+    kind: str,
+    actor: str,
+    payload: dict[str, Any] | None = None,
+    run_id: int | None = None,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO task_events(board, task_id, run_id, kind, actor, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            t["board"] if t else None,
+            t["id"] if t else None,
+            run_id,
+            kind,
+            actor,
+            None if payload is None else dumps(payload),
+            now(),
+        ),
+    )
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def events_since(
+    conn: sqlite3.Connection,
+    after: int,
+    *,
+    kinds: Sequence[str] = (),
+    board: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    sql = (
+        "SELECT e.*, t.assignee FROM task_events e LEFT JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.id > ?"
+    )
+    args: list[Any] = [after]
+    if kinds:
+        sql += f" AND e.kind IN ({','.join('?' * len(kinds))})"
+        args += kinds
+    if board:
+        sql += " AND e.board = ?"
+        args.append(board)
+    rows = conn.execute(sql + " ORDER BY e.id LIMIT ?", [*args, limit]).fetchall()
+    return [dict(r) for r in rows]
+
+
+# --- lookups --------------------------------------------------------------------------------
+
+
+def get_task(conn: sqlite3.Connection, task_id: str) -> Row:
+    validate.task_id(task_id)
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        raise NotFound(f"no card {task_id}; list cards with: kanban list")
+    return row  # type: ignore[no-any-return]
+
+
+def get_board(conn: sqlite3.Connection, slug: str) -> Row:
+    row = conn.execute("SELECT * FROM boards WHERE slug = ?", (slug,)).fetchone()
+    if row is None:
+        raise NotFound(f"no board {slug!r}; list boards with: kanban boards list")
+    return row  # type: ignore[no-any-return]
+
+
+def _all_done(conn: sqlite3.Connection, parent_ids: Sequence[str], ignore_merge: bool) -> bool:
+    open_parent = conn.execute(
+        f"SELECT 1 FROM tasks p WHERE p.id IN ({','.join('?' * len(parent_ids))}) "
+        "AND NOT (p.status IN ('done', 'archived') "
+        "AND (? OR p.merge_state IS NULL OR p.merge_state = 'merged')) LIMIT 1",
+        (*parent_ids, ignore_merge),
+    ).fetchone()
+    return open_parent is None
+
+
+def parents_satisfied(
+    conn: sqlite3.Connection, task_id: str, *, ignore_merge: bool = False
+) -> bool:
+    """STO-09: every parent is done or archived, and merged unless `ignore_merge` waives that."""
+    q = "SELECT parent_id FROM task_links WHERE child_id = ?"
+    return _all_done(conn, [r[0] for r in conn.execute(q, (task_id,))], ignore_merge)
+
+
+def _cas(conn: sqlite3.Connection, task_id: str, expected: Sequence[str], **fields: Any) -> None:
+    """Status compare-and-swap (STO-02): any rowcount but 1 means the card moved under us."""
+    sets = "".join(f"{k} = ?, " for k in fields)
+    cur = conn.execute(
+        f"UPDATE tasks SET {sets}updated_at = ?, version = version + 1 "
+        f"WHERE id = ? AND status IN ({','.join('?' * len(expected))})",
+        [*fields.values(), now(), task_id, *expected],
+    )
+    if cur.rowcount != 1:
+        now_status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        raise Refused(
+            f"card {task_id} is {now_status['status'] if now_status else 'gone'}; "
+            f"this needs it in {' or '.join(expected)}"
+        )
+
+
+def _comment(conn: sqlite3.Connection, t: Row, author: str, body: str, actor: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO task_comments(task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+        (t["id"], author, body, now()),
+    )
+    assert cur.lastrowid is not None
+    _ev(conn, t, "commented", actor, {"comment_id": cur.lastrowid, "author": author})
+    return cur.lastrowid
+
+
+def _need(text: str | None, what: str, fix: str) -> str:
+    if not text or not text.strip():
+        raise Refused(f"{what} is required; {fix}")
+    return text.strip()
+
+
+# --- boards ---------------------------------------------------------------------------------
+
+
+def board_create(
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    default_workdir: str,
+    name: str | None = None,
+    claude_config_dir: str | None = None,
+    actor: str = OWNER,
+) -> dict[str, Any]:
+    validate.slug(slug)
+    workdir = validate.workspace("dir", default_workdir)
+    with tx(conn):
+        if conn.execute("SELECT 1 FROM boards WHERE slug = ?", (slug,)).fetchone():
+            raise Refused(f"board {slug!r} already exists; edit it with: kanban boards edit {slug}")
+        conn.execute(
+            "INSERT INTO boards(slug, name, default_workdir, claude_config_dir, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (slug, name or slug, workdir, claude_config_dir, now()),
+        )
+        _ev(conn, {"board": slug, "id": None}, "board_created", actor, {"slug": slug})
+    return {"slug": slug}
+
+
+def board_edit(
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    default_workdir: str | None = None,
+    name: str | None = None,
+    claude_config_dir: str | None = None,
+    actor: str = OWNER,
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    if default_workdir is not None:
+        fields["default_workdir"] = validate.workspace("dir", default_workdir)
+    if name is not None:
+        fields["name"] = name
+    if claude_config_dir is not None:
+        fields["claude_config_dir"] = claude_config_dir
+    if not fields:
+        raise Refused("nothing to change; pass --default-workdir, --name or --claude-config-dir")
+    with tx(conn):
+        get_board(conn, slug)
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(f"UPDATE boards SET {sets} WHERE slug = ?", [*fields.values(), slug])
+        _ev(conn, {"board": slug, "id": None}, "board_edited", actor, {"fields": sorted(fields)})
+    return {"slug": slug}
+
+
+def board_archive(conn: sqlite3.Connection, slug: str, *, actor: str = OWNER) -> dict[str, Any]:
+    with tx(conn):
+        b = get_board(conn, slug)
+        if b["archived_at"] is None:
+            conn.execute("UPDATE boards SET archived_at = ? WHERE slug = ?", (now(), slug))
+            _ev(conn, {"board": slug, "id": None}, "board_archived", actor, {"slug": slug})
+    return {"slug": slug}
+
+
+def boards_list(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    return [dict(r) for r in conn.execute("SELECT * FROM boards ORDER BY slug")]
+
+
+# --- cards: create, specify, edit -----------------------------------------------------------
+
+FIELD_COLUMNS = {
+    "title": "title",
+    "body": "body",
+    "assignee": "assignee",
+    "priority": "priority",
+    "branch": "branch_name",
+    "base": "base_branch",
+    "max_runtime": "max_runtime_seconds",
+    "max_retries": "max_retries",
+    "skills": "skills",
+    "model": "model_override",
+    "effort": "reasoning_effort",
+    "budget": "budget_usd",
+}
+
+
+def _claude_dirs(conn: sqlite3.Connection, board: Row | None = None) -> tuple[Path, ...]:
+    found = [
+        cfg(conn, "claude.config_dir"),
+        os.environ.get("CLAUDE_CONFIG_DIR"),
+        Path.home() / ".claude",
+    ]
+    if board is not None:
+        found.append(board["claude_config_dir"])
+    return tuple(Path(p) for p in found if p)
+
+
+def _columns(conn: sqlite3.Connection, fields: dict[str, Any], board: Row) -> dict[str, Any]:
+    """Field-level validation (SEC-12) of the provided fields, as DB columns."""
+    out: dict[str, Any] = {}
+    roles = cfg(conn, "dispatch.roles")
+    for key, v in fields.items():
+        if key == "workspace":
+            kind, path = validate.parse_workspace(v)
+            out["workspace_kind"] = kind
+            out["workspace_path"] = validate.workspace(
+                kind, path, claude_dirs=_claude_dirs(conn, board), strict=False
+            )
+            continue
+        col = FIELD_COLUMNS[key]
+        if key == "title":
+            v = _need(v, "title", "pass a non-empty title")
+        elif key == "assignee" and v is not None and v not in roles:
+            raise Refused(f"assignee {v!r} is not a dispatchable role ({', '.join(roles)})")
+        elif key == "priority" and not isinstance(v, int):
+            raise Refused(f"priority {v!r} must be an integer")
+        elif key == "max_runtime":
+            v = validate.duration(v)
+        elif key == "max_retries" and (not isinstance(v, int) or v < 1):
+            raise Refused(f"max-retries {v!r} must be a positive integer")
+        elif key == "skills":
+            v = dumps(validate.skills(v))
+        elif key == "model" and v is not None:
+            validate.model(v)
+        elif key == "effort" and v is not None:
+            validate.effort(v)
+        elif key == "budget" and v is not None:
+            v = validate.budget(v, cfg(conn, "budget.ceiling"))
+        elif key in ("branch", "base") and v is not None:
+            validate.branch(v)
+        out[col] = v
+    return out
+
+
+def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> None:
+    """The non-triage checks of lifecycle #1, on a merged card (SEC-10, GIT-01/09, MN-31)."""
+    _need(
+        t["body"], "body", "pass --body-file - with the card contract, or keep the card in --triage"
+    )
+    roles = cfg(conn, "dispatch.roles")
+    if not t["assignee"]:
+        raise Refused("no assignee given; pass --assignee or keep the card in --triage")
+    if t["assignee"] not in roles:
+        raise Refused(
+            f"assignee {t['assignee']!r} is not a dispatchable role ({', '.join(roles)}); "
+            "pass --assignee or keep the card in --triage"
+        )
+    kind = t["workspace_kind"]
+    if kind == "scratch":
+        return
+    validate.workspace(kind, t["workspace_path"], claude_dirs=_claude_dirs(conn, board))
+    if kind == "worktree":
+        if not t["branch_name"]:
+            raise Refused("a worktree card needs a branch; pass --branch feature/<slug>")
+        default = ghops.default_branch(t["workspace_path"])
+        validate.branch(t["branch_name"], default)
+        if t["base_branch"]:
+            validate.branch(t["base_branch"])
+
+
+def _new_id(conn: sqlite3.Connection) -> str:
+    while True:
+        tid = "t_" + secrets.token_hex(4)
+        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (tid,)).fetchone():
+            return tid
+
+
+def create(
+    conn: sqlite3.Connection,
+    board: str,
+    title: str,
+    *,
+    actor: str = OWNER,
+    body: str = "",
+    assignee: str | None = None,
+    workspace: str | None = None,
+    branch: str | None = None,
+    base: str | None = None,
+    priority: int = 0,
+    max_runtime: str | int | None = None,
+    max_retries: int | None = None,
+    idempotency_key: str | None = None,
+    parents: Sequence[str] = (),
+    skills: Sequence[str] = (),
+    model: str | None = None,
+    effort: str | None = None,
+    budget: float | None = None,
+    triage: bool = False,
+) -> dict[str, Any]:
+    b = get_board(conn, board)
+    if b["archived_at"] is not None:
+        raise Refused(f"board {board!r} is archived; unarchive is not offered, create a new board")
+    if assignee is None and not triage:
+        assignee = cfg(conn, "dispatch.default_assignee")
+    given: dict[str, Any] = {
+        "title": title, "body": body, "assignee": assignee, "priority": priority,
+        "branch": branch, "base": base, "max_retries": max_retries, "skills": list(skills),
+        "model": model, "effort": effort, "budget": budget,
+    }  # fmt: skip
+    if max_runtime is not None:
+        given["max_runtime"] = max_runtime
+    if workspace is not None:
+        given["workspace"] = workspace
+    tid = _new_id(conn)
+    cols = _columns(conn, {k: v for k, v in given.items() if v is not None or k == "body"}, b)
+    cols.setdefault("workspace_kind", "scratch")
+    if cols["workspace_kind"] == "scratch":
+        cols["workspace_path"] = str(dirs().work / "scratch" / tid)
+    cols.setdefault("max_runtime_seconds", None if triage else role_runtime(conn, assignee))
+    row = {**_EMPTY_CARD, **cols, "id": tid, "board": board, "assignee": assignee}
+    if not triage:
+        _dispatchable(conn, row, b)
+    ts = now()
+    with tx(conn):
+        if idempotency_key:
+            dup = conn.execute(
+                "SELECT id, status FROM tasks WHERE board = ? AND idempotency_key = ? AND status <> 'archived'",
+                (board, idempotency_key),
+            ).fetchone()
+            if dup:
+                return {"id": dup["id"], "status": dup["status"], "existing": True}
+        for p in parents:
+            pt = get_task(conn, p)
+            if pt["board"] != board:
+                raise Refused(f"parent {p} is on board {pt['board']!r}, not {board!r}")
+        status = "triage" if triage else "ready" if _all_done(conn, parents, False) else "todo"
+        row.update(
+            status=status, idempotency_key=idempotency_key, created_by=actor,
+            created_at=ts, updated_at=ts, version=1,
+        )  # fmt: skip
+        names = list(row)
+        conn.execute(
+            f"INSERT INTO tasks({','.join(names)}) VALUES ({','.join('?' * len(names))})",
+            [row[n] for n in names],
+        )
+        for p in parents:
+            conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (p, tid))
+        _ev(
+            conn,
+            row,
+            "created",
+            actor,
+            {"status": status, "assignee": assignee, "parents": list(parents)},
+        )
+    return {"id": tid, "status": status, "existing": False}
+
+
+def role_runtime(conn: sqlite3.Connection, role: str | None) -> int:
+    key = f"runtime.{role}"
+    return int(cfg(conn, key)) if key in DEFAULTS else TRIAGE_RUNTIME_S
+
+
+_EMPTY_CARD: dict[str, Any] = {
+    "title": "", "body": "", "assignee": None, "implementer": None, "priority": 0,
+    "workspace_kind": "scratch", "workspace_path": None, "branch_name": None, "base_branch": None,
+    "max_retries": None, "model_override": None, "reasoning_effort": None, "budget_usd": None,
+    "skills": "[]",
+}  # fmt: skip
+
+
+def specify(
+    conn: sqlite3.Connection, task_id: str, fields: dict[str, Any], *, actor: str = OWNER
+) -> dict[str, Any]:
+    t = get_task(conn, task_id)
+    if t["status"] != "triage":
+        raise Refused(
+            f"card {task_id} is {t['status']}; specify applies to triage cards (edit changes others)"
+        )
+    b = get_board(conn, t["board"])
+    cols = _columns(conn, {k: v for k, v in fields.items() if v is not None}, b)
+    merged = {**dict(t), **cols}
+    if merged["max_runtime_seconds"] is None:
+        cols["max_runtime_seconds"] = merged["max_runtime_seconds"] = role_runtime(
+            conn, merged["assignee"]
+        )
+    _dispatchable(conn, merged, b)
+    with tx(conn):
+        status = "ready" if parents_satisfied(conn, task_id) else "todo"
+        _cas(conn, task_id, ["triage"], **cols, status=status)
+        _ev(conn, t, "specified", actor, {"fields": sorted(cols), "status": status})
+    return {"id": task_id, "status": status}
+
+
+def edit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    fields: dict[str, Any],
+    *,
+    actor: str = OWNER,
+    allow_empty_body: bool = False,
+    expect_version: int | None = None,
+) -> dict[str, Any]:
+    t = get_task(conn, task_id)
+    if t["status"] == "running":
+        raise Refused(f"card {task_id} is running; stop it first with: kanban stop {task_id}")
+    if "body" in fields and not (fields["body"] or "").strip() and not allow_empty_body:
+        raise Refused("refusing to wipe the card body; pass --allow-empty-body to do it on purpose")
+    if "assignee" in fields:
+        raise Refused("edit does not change the assignee; use: kanban assign")
+    b = get_board(conn, t["board"])
+    cols = _columns(conn, fields, b)
+    if not cols:
+        raise Refused("nothing to change")
+    if t["status"] in ("todo", "ready"):
+        _dispatchable(conn, {**dict(t), **cols}, b)
+    previous = {k: t[k] for k in cols}
+    version = t["version"] if expect_version is None else expect_version
+    with tx(conn):
+        sets = "".join(f"{k} = ?, " for k in cols)
+        cur = conn.execute(
+            f"UPDATE tasks SET {sets}updated_at = ?, version = version + 1 "
+            "WHERE id = ? AND version = ? AND status <> 'running'",
+            [*cols.values(), now(), task_id, version],
+        )
+        if cur.rowcount != 1:
+            raise Refused(f"card {task_id} changed since it was read; re-read it and retry")
+        _ev(conn, t, "edited", actor, {"fields": sorted(cols), "previous": previous})
+    return {"id": task_id, "fields": sorted(cols)}
+
+
+# --- owner transitions ----------------------------------------------------------------------
+
+
+def assign(
+    conn: sqlite3.Connection,
+    task_id: str,
+    role: str,
+    *,
+    reclaim: bool = False,
+    actor: str = OWNER,
+) -> dict[str, Any]:
+    roles = cfg(conn, "dispatch.roles")
+    if role not in roles:
+        raise Refused(f"assignee {role!r} is not a dispatchable role ({', '.join(roles)})")
+    with tx(conn):
+        t = get_task(conn, task_id)
+        changed = t["assignee"] != role
+        reset = {"consecutive_failures": 0, "protocol_violations": 0} if changed else {}
+        payload = {"assignee": role, "from": t["assignee"]}
+        if t["status"] == "running":
+            if not reclaim:
+                raise Refused(f"card {task_id} is running; pass --reclaim to stop its run first")
+            run = _running_run(conn, task_id)
+            end_run(
+                conn, run["id"], "terminated", "retry", actor=actor, event_kind="assigned",
+                payload={**payload, "reclaim": True}, counted=False,
+                card_fields={"assignee": role, **reset}, run_fields={"stop_requested": 1},
+            )  # fmt: skip
+            return {"id": task_id, "assignee": role, "run_id": run["id"]}
+        if not changed:
+            return {"id": task_id, "assignee": role, "noop": True}
+        _cas(conn, task_id, [s for s in STATUSES if s != "running"], assignee=role, **reset)
+        _ev(conn, t, "assigned", actor, payload)
+    return {"id": task_id, "assignee": role}
+
+
+def promote(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    ignore_merge: bool = False,
+    actor: str = OWNER,
+) -> dict[str, Any]:
+    reason = _need(reason, "reason", "pass --reason")
+    with tx(conn):
+        t = get_task(conn, task_id)
+        if not parents_satisfied(conn, task_id, ignore_merge=ignore_merge):
+            raise Refused(
+                f"card {task_id} still has an open parent; finish it, unlink it, "
+                "or for a stuck merge pass --ignore-merge"
+            )
+        _cas(conn, task_id, ["todo"], status="ready", retry_after=None)
+        _ev(
+            conn,
+            t,
+            "promoted_manual",
+            actor,
+            {"actor": actor, "reason": reason, "ignore_merge": ignore_merge},
+        )
+    return {"id": task_id, "status": "ready"}
+
+
+def promote_auto(conn: sqlite3.Connection, task_id: str, *, actor: str = "dispatcher") -> bool:
+    """DSP-03: a todo card whose parents are satisfied becomes ready."""
+    with tx(conn):
+        t = get_task(conn, task_id)
+        if t["status"] != "todo" or not parents_satisfied(conn, task_id):
+            return False
+        _cas(conn, task_id, ["todo"], status="ready")
+        _ev(conn, t, "promoted", actor)
+    return True
+
+
+def hold(
+    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+) -> dict[str, Any]:
+    reason = _need(reason, "reason", "pass --reason")
+    with tx(conn):
+        t = get_task(conn, task_id)
+        _cas(conn, task_id, ["todo", "ready", "blocked"], status="triage")
+        _ev(conn, t, "held", actor, {"reason": reason, "from": t["status"]})
+    return {"id": task_id, "status": "triage"}
+
+
+def _last_run_kind(conn: sqlite3.Connection, task_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT kind FROM task_runs WHERE task_id = ? ORDER BY n DESC LIMIT 1", (task_id,)
+    ).fetchone()
+    return row["kind"] if row else None
+
+
+def unblock(
+    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+) -> dict[str, Any]:
+    reason = _need(reason, "reason", "pass --reason")
+    with tx(conn):
+        t = get_task(conn, task_id)
+        if _last_run_kind(conn, task_id) == "review":
+            target = "review"
+        else:
+            target = "ready" if parents_satisfied(conn, task_id) else "todo"
+        _cas(
+            conn, task_id, ["blocked"], status=target, consecutive_failures=0,
+            protocol_violations=0, last_failure_error=None, retry_after=None,
+        )  # fmt: skip
+        _comment(conn, t, "owner", f"UNBLOCK: {reason}", actor)
+        _ev(conn, t, "unblocked", actor, {"reason": reason, "status": target})
+    return {"id": task_id, "status": target}
+
+
+def reopen_review(
+    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+) -> dict[str, Any]:
+    """review -> ready/todo for the implementer; also a done card whose merge failed (REV-05)."""
+    reason = _need(reason, "reason", "pass --reason")
+    with tx(conn):
+        t = get_task(conn, task_id)
+        if not t["implementer"]:
+            raise Refused(
+                f"card {task_id} has no recorded implementer; use: kanban assign {task_id} ROLE"
+            )
+        merge_reset: dict[str, Any] = {}
+        expected = ["review"]
+        if t["status"] == "done" and t["merge_state"] == "failed":
+            expected = ["done"]
+            merge_reset = {
+                "merge_state": None,
+                "merge_attempts": 0,
+                "merge_next_at": None,
+                "completed_at": None,
+            }
+        target = "ready" if parents_satisfied(conn, task_id) else "todo"
+        _cas(conn, task_id, expected, status=target, assignee=t["implementer"], **merge_reset)
+        _ev(conn, t, "review_reopened", actor, {"reason": reason, "status": target})
+    return {"id": task_id, "status": target}
+
+
+def reopen(
+    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+) -> dict[str, Any]:
+    reason = _need(reason, "reason", "pass --reason")
+    with tx(conn):
+        t = get_task(conn, task_id)
+        _cas(
+            conn, task_id, ["done"], status="ready", completed_at=None, merge_state=None,
+            merge_attempts=0, merge_next_at=None, merged_at=None, retry_after=None,
+            assignee=t["implementer"] or t["assignee"],
+        )  # fmt: skip
+        _ev(conn, t, "reopened", actor, {"reason": reason})
+        children = conn.execute(
+            "SELECT c.* FROM task_links l JOIN tasks c ON c.id = l.child_id WHERE l.parent_id = ?",
+            (task_id,),
+        ).fetchall()
+        for c in children:
+            if c["status"] == "ready":
+                _cas(conn, c["id"], ["ready"], status="todo")
+                _ev(conn, c, "dependency_wait", actor, {"parent": task_id})
+            elif c["status"] in ("running", "review", "done"):
+                _comment(conn, c, "kanban", f"parent {task_id} was reopened: {reason}", actor)
+    return {"id": task_id, "status": "ready"}
+
+
+def mark_done(
+    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+) -> dict[str, Any]:
+    reason = _need(reason, "reason", "pass --reason")
+    with tx(conn):
+        t = get_task(conn, task_id)
+        _cas(conn, task_id, ["review", "blocked"], status="done", completed_at=now())
+        _ev(conn, t, "completed_by_owner", actor, {"reason": reason, "from": t["status"]})
+    return {"id": task_id, "status": "done"}
+
+
+def _reaches(conn: sqlite3.Connection, start: str, target: str) -> bool:
+    """DFS down the child edges from `start`: is `target` a descendant?"""
+    seen: set[str] = set()
+    stack = [start]
+    while stack:
+        node = stack.pop()
+        if node == target:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack += [
+            r[0]
+            for r in conn.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (node,))
+        ]
+    return False
+
+
+def link(
+    conn: sqlite3.Connection, parent: str, child: str, *, actor: str = OWNER
+) -> dict[str, Any]:
+    with tx(conn):
+        p, c = get_task(conn, parent), get_task(conn, child)
+        if parent == child:
+            raise Refused("a card cannot be its own parent")
+        if p["board"] != c["board"]:
+            raise Refused(f"{parent} and {child} are on different boards")
+        if conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?", (parent, child)
+        ).fetchone():
+            return {"parent": parent, "child": child, "noop": True}
+        if c["status"] == "running":
+            raise Refused(f"card {child} is running; stop it first with: kanban stop {child}")
+        if _reaches(conn, child, parent):
+            raise Refused(f"linking {parent} -> {child} would create a cycle")
+        conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, child))
+        _ev(conn, c, "linked", actor, {"parent": parent, "child": child})
+        if c["status"] == "ready" and not parents_satisfied(conn, child):
+            _cas(conn, child, ["ready"], status="todo")
+            _ev(conn, c, "dependency_wait", actor, {"parent": parent})
+    return {"parent": parent, "child": child}
+
+
+def unlink(
+    conn: sqlite3.Connection, parent: str, child: str, *, actor: str = OWNER
+) -> dict[str, Any]:
+    with tx(conn):
+        c = get_task(conn, child)
+        cur = conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (parent, child)
+        )
+        if cur.rowcount == 0:
+            return {"parent": parent, "child": child, "noop": True}
+        _ev(conn, c, "unlinked", actor, {"parent": parent, "child": child})
+        if c["status"] == "todo" and parents_satisfied(conn, child):
+            _cas(conn, child, ["todo"], status="ready")
+            _ev(conn, c, "promoted", actor, {"reason": "unlink"})
+    return {"parent": parent, "child": child}
+
+
+def stop(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) -> dict[str, Any]:
+    """The DB half of `stop`; the caller signals the runner after this returns (RUN-17)."""
+    with tx(conn):
+        t = get_task(conn, task_id)
+        run = _running_run(conn, task_id)
+        end_run(
+            conn, run["id"], "terminated", "blocked", actor=actor, event_kind="stopped",
+            payload={"actor": actor},
+            card_fields={
+                "block_kind": "stopped", "consecutive_failures": 0, "protocol_violations": 0,
+                "last_failure_error": None, "retry_after": None,
+            },
+            run_fields={"stop_requested": 1},
+        )  # fmt: skip
+    return {
+        "id": task_id, "status": "blocked", "run_id": run["id"],
+        "runner_pid": run["runner_pid"], "runner_started": run["runner_started"],
+        "board": t["board"],
+    }  # fmt: skip
+
+
+def archive(
+    conn: sqlite3.Connection, task_id: str, *, rm: bool = False, actor: str = OWNER
+) -> dict[str, Any]:
+    blobs = dirs().home / "attachments" / task_id
+    with tx(conn):
+        t = get_task(conn, task_id)
+        if t["status"] == "running":
+            raise Refused(f"card {task_id} is running; stop it first with: kanban stop {task_id}")
+        if rm:
+            conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+            for table, col in (
+                ("task_attachments", "task_id"), ("task_comments", "task_id"), ("grants", "task_id"),
+                ("task_runs", "task_id"), ("task_links", "parent_id"), ("task_links", "child_id"),
+            ):  # fmt: skip
+                conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (task_id,))
+            conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            _ev(
+                conn,
+                {"board": t["board"], "id": None},
+                "deleted",
+                actor,
+                {"id": task_id, "title": t["title"]},
+            )
+        elif t["status"] != "archived":
+            _cas(
+                conn,
+                task_id,
+                [s for s in STATUSES if s not in ("running", "archived")],
+                status="archived",
+            )
+            _ev(conn, t, "archived", actor, {"from": t["status"]})
+    if rm and blobs.is_dir():
+        for f in blobs.iterdir():
+            f.unlink()
+        blobs.rmdir()
+    return {"id": task_id, "status": "deleted" if rm else "archived"}
+
+
+def merge_retry(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) -> dict[str, Any]:
+    with tx(conn):
+        t = get_task(conn, task_id)
+        if t["status"] != "done" or t["merge_state"] != "failed":
+            raise Refused(
+                f"card {task_id} has no failed merge to retry (status {t['status']}, merge {t['merge_state']})"
+            )
+        conn.execute(
+            "UPDATE tasks SET merge_state = 'pending', merge_attempts = 0, merge_next_at = ?, "
+            "updated_at = ?, version = version + 1 WHERE id = ? AND merge_state = 'failed'",
+            (now(), now(), task_id),
+        )
+        _ev(conn, t, "merge_retry", actor)
+    return {"id": task_id, "merge_state": "pending"}
+
+
+# --- comments and attachments ---------------------------------------------------------------
+
+
+def _require_running(conn: sqlite3.Connection, run_id: int | None) -> None:
+    """Inside the caller's tx: a worker write needs its run still running (CLI-05)."""
+    if run_id is None:
+        return
+    run = conn.execute("SELECT status FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    if run is None or run["status"] != "running":
+        raise Refused(RUN_ENDED)
+
+
+def comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    body: str,
+    *,
+    author: str = "owner",
+    actor: str = OWNER,
+    run_id: int | None = None,
+) -> dict[str, Any]:
+    body = _need(body, "comment text", "pass the text")
+    with tx(conn):
+        _require_running(conn, run_id)
+        cid = _comment(conn, get_task(conn, task_id), author, body, actor)
+    return {"id": task_id, "comment_id": cid}
+
+
+def write_blob(task_id: str, filename: str, data: bytes) -> tuple[Path, str]:
+    """Store an attachment blob (0600) under the home directory; returns its path and clean name."""
+    clean = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(filename))[:100].lstrip(".") or "file"
+    stored = ensure_dir(dirs().home / "attachments" / task_id) / f"{secrets.token_hex(4)}-{clean}"
+    fd = os.open(stored, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except BaseException:
+        stored.unlink(missing_ok=True)
+        raise
+    return stored, clean
+
+
+def attach(
+    conn: sqlite3.Connection,
+    task_id: str,
+    filename: str,
+    data: bytes,
+    *,
+    content_type: str | None = None,
+    uploaded_by: str = "owner",
+    actor: str = OWNER,
+    run_id: int | None = None,
+) -> dict[str, Any]:
+    if len(data) > MAX_ATTACH_BYTES:
+        raise Refused(f"attachment is {len(data)} bytes; the cap is {MAX_ATTACH_BYTES} (25 MiB)")
+    get_task(conn, task_id)
+    stored, clean = write_blob(task_id, filename, data)
+    try:
+        with tx(conn):
+            _require_running(conn, run_id)
+            t = get_task(conn, task_id)
+            cur = conn.execute(
+                "INSERT INTO task_attachments(task_id, filename, stored_path, content_type, size, "
+                "uploaded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, clean, str(stored), content_type, len(data), uploaded_by, now()),
+            )
+            _ev(
+                conn,
+                t,
+                "attached",
+                actor,
+                {"attachment_id": cur.lastrowid, "filename": clean, "size": len(data)},
+            )
+    except BaseException:
+        stored.unlink(missing_ok=True)
+        raise
+    return {"id": task_id, "filename": clean, "path": str(stored), "size": len(data)}
+
+
+# --- runs: claim, end_run -------------------------------------------------------------------
+
+
+def _running_run(conn: sqlite3.Connection, task_id: str) -> Row:
+    run = conn.execute(
+        "SELECT * FROM task_runs WHERE task_id = ? AND status = 'running'", (task_id,)
+    ).fetchone()
+    if run is None:
+        raise Refused(f"card {task_id} has no active run")
+    return run  # type: ignore[no-any-return]
+
+
+def claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    config_dir: str | None = None,
+    actor: str = "dispatcher",
+) -> int | None:
+    """DSP-06. Returns the new run id, or None when the card was skipped."""
+    try:
+        with tx(conn):
+            t = get_task(conn, task_id)
+            source = t["status"]
+            if source not in ("ready", "review"):
+                return None
+            if source == "ready" and not parents_satisfied(conn, task_id):
+                _cas(conn, task_id, ["ready"], status="todo")
+                _ev(conn, t, "claim_rejected", actor, {"reason": "parents_not_done"})
+                return None
+            _cas(conn, task_id, [source], status="running", started_at=t["started_at"] or now())
+            n = conn.execute(
+                "SELECT COALESCE(MAX(n), 0) + 1 FROM task_runs WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            cur = conn.execute(
+                "INSERT INTO task_runs(task_id, n, role, kind, status, max_runtime_seconds, config_dir, started_at) "
+                "VALUES (?, ?, ?, ?, 'running', ?, ?, ?)",
+                (task_id, n, t["assignee"], "review" if source == "review" else "work",
+                 t["max_runtime_seconds"], config_dir, now()),
+            )  # fmt: skip
+            _ev(
+                conn,
+                t,
+                "claimed",
+                actor,
+                {"run_id": cur.lastrowid, "source_status": source},
+                cur.lastrowid,
+            )
+            return cur.lastrowid
+    except (sqlite3.IntegrityError, Refused):
+        return None
+
+
+def end_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    outcome: str,
+    card_to: str,
+    *,
+    actor: str,
+    event_kind: str,
+    payload: dict[str, Any] | None = None,
+    card_fields: dict[str, Any] | None = None,
+    run_fields: dict[str, Any] | None = None,
+    counted: bool | None = None,
+    retry_after: int | None = None,
+    error: str | None = None,
+    summary: str | None = None,
+) -> bool:
+    """RUN-13: the only code that ends a run. Runs inside the caller's BEGIN IMMEDIATE.
+
+    `card_to` is a status, or "retry" for the failure rule of RUN-12 (review for a review run,
+    ready otherwise). Returns False, changing nothing, when the run had already ended.
+    """
+    ts = now()
+    run_set = {"status": "ended", "outcome": outcome, "ended_at": ts, **(run_fields or {})}
+    if error is not None:
+        run_set["error"] = error
+    if summary is not None:
+        run_set["summary"] = summary
+    cur = conn.execute(
+        f"UPDATE task_runs SET {', '.join(f'{k} = ?' for k in run_set)} WHERE id = ? AND status = 'running'",
+        [*run_set.values(), run_id],
+    )
+    if cur.rowcount != 1:
+        return False
+    run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    t = conn.execute("SELECT * FROM tasks WHERE id = ?", (run["task_id"],)).fetchone()
+    fields = dict(card_fields or {})
+    events: list[tuple[str, dict[str, Any]]] = []
+    if card_to == "retry":
+        card_to, fields, events = _retry_rule(
+            conn, t, run, outcome, counted, error, retry_after, fields
+        )
+    cas = conn.execute(
+        f"UPDATE tasks SET {''.join(f'{k} = ?, ' for k in {**fields, 'status': 0})}"
+        "updated_at = ?, version = version + 1 WHERE id = ? AND status = 'running'",
+        [*({**fields, "status": card_to}).values(), ts, t["id"]],
+    )
+    if cas.rowcount != 1:
+        raise Refused(
+            f"card {t['id']} is not running although run {run_id} was; run: kanban doctor --fix"
+        )
+    _ev(
+        conn,
+        t,
+        event_kind,
+        actor,
+        {"run_id": run_id, "outcome": outcome, **(payload or {})},
+        run_id,
+    )
+    for kind, extra in events:
+        _ev(conn, t, kind, actor, extra, run_id)
+    return True
+
+
+def _retry_rule(
+    conn: sqlite3.Connection,
+    t: Row,
+    run: Row,
+    outcome: str,
+    counted: bool | None,
+    error: str | None,
+    retry_after: int | None,
+    fields: dict[str, Any],
+) -> tuple[str, dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+    """RUN-12 failure rule, protocol-violation streak and systemic crash pause."""
+    ts = now()
+    retry_status = "review" if run["kind"] == "review" else "ready"
+    events: list[tuple[str, dict[str, Any]]] = []
+    count = outcome in COUNTED_OUTCOMES if counted is None else counted
+    if outcome == "crashed":
+        recent = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE outcome = 'crashed' AND ended_at >= ?",
+            (ts - SYSTEMIC_WINDOW_S,),
+        ).fetchone()[0]
+        if recent >= SYSTEMIC_CRASH_COUNT and state_get(conn, "dispatch_paused") is None:
+            detail = (error or "").splitlines()[0] if error else ""
+            state_put(
+                conn, "dispatch_paused", {"reason": "systemic", "since": ts, "detail": detail}
+            )
+            _ev(conn, None, "dispatch_paused", "runner", {"reason": "systemic", "detail": detail})
+            count = False
+    limit_card = t["max_retries"]
+    if outcome == "protocol_violation":
+        streak = t["protocol_violations"] + 1
+        fields["protocol_violations"] = streak
+        limit = limit_card or PROTOCOL_VIOLATION_LIMIT
+        if streak >= limit:
+            fields.update(block_kind="gave_up")
+            events.append(("gave_up", {"failures": streak, "effective_limit": limit,
+                                       "limit_source": "card" if limit_card else "default",
+                                       "error": error, "trigger_outcome": outcome}))  # fmt: skip
+            return "blocked", fields, events
+    elif count:
+        failures = t["consecutive_failures"] + 1
+        limit = limit_card or cfg(conn, "dispatch.failure_limit")
+        fields["consecutive_failures"] = failures
+        fields["last_failure_error"] = (error or "")[:500]
+        if failures >= limit:
+            fields.update(block_kind="gave_up")
+            events.append(("gave_up", {"failures": failures, "effective_limit": limit,
+                                       "limit_source": "card" if limit_card else "config",
+                                       "error": (error or "")[:500], "trigger_outcome": outcome}))  # fmt: skip
+            return "blocked", fields, events
+    if retry_after is None and (count or outcome == "protocol_violation"):
+        retry_after = ts + RETRY_AFTER_S
+    fields["retry_after"] = retry_after
+    return retry_status, fields, events
+
+
+# --- worker terminal verbs ------------------------------------------------------------------
+
+
+def _verb_run(conn: sqlite3.Connection, run_id: int, verb: str) -> tuple[Row, Row] | None:
+    """The run and its card, or None when this verb already ended the run (CLI-05)."""
+    run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    if run is None:
+        raise NotFound(f"no run {run_id}")
+    if run["status"] != "running":
+        if run["terminal_verb"] == verb:
+            return None
+        raise Refused(RUN_ENDED)
+    return run, conn.execute("SELECT * FROM tasks WHERE id = ?", (run["task_id"],)).fetchone()
+
+
+def _worker(run: Row) -> str:
+    return f"worker:{run['role']}#{run['id']}"
+
+
+_TERMINAL_CARD = {"retry_after": None, "protocol_violations": 0}
+
+
+def block(conn: sqlite3.Connection, run_id: int, kind: str, reason: str) -> dict[str, Any]:
+    if kind not in WORKER_BLOCK_KINDS:
+        raise Refused(f"block kind {kind!r} must be one of {', '.join(WORKER_BLOCK_KINDS)}")
+    reason = _need(reason, "reason", "pass --reason")
+    with tx(conn):
+        found = _verb_run(conn, run_id, "block")
+        if found is None:
+            return {"noop": True}
+        run, t = found
+        loops = t["block_recurrences"] + 1 if t["block_kind"] == kind else 0
+        looped = loops >= BLOCK_RECURRENCE_LIMIT
+        to = "triage" if looped else "blocked"
+        end_run(
+            conn, run_id, "blocked", to, actor=_worker(run),
+            event_kind="block_loop_detected" if looped else "blocked",
+            payload={"kind": kind, "recurrences": loops},
+            card_fields={**_TERMINAL_CARD, "block_kind": kind, "block_recurrences": loops},
+            run_fields={"terminal_verb": "block"}, summary=reason,
+        )  # fmt: skip
+        _comment(conn, t, run["role"], f"BLOCKED: {reason}", _worker(run))
+    return {"id": t["id"], "status": to}
+
+
+def complete(
+    conn: sqlite3.Connection,
+    run_id: int,
+    summary: str,
+    *,
+    commits_ahead: int = 0,
+    default_branch: str | None = None,
+) -> dict[str, Any]:
+    summary = _need(summary, "summary", "pass --summary")
+    with tx(conn):
+        found = _verb_run(conn, run_id, "complete")
+        if found is None:
+            return {"noop": True}
+        run, t = found
+        merge: dict[str, Any] = {}
+        extra: list[tuple[str, dict[str, Any]]] = []
+        if run["kind"] == "review":
+            m = APPROVED_RE.search(summary)
+            if not m:
+                raise Refused(
+                    "a review run completes only with 'WARDEN: APPROVED PR #<n> @ <sha>'; "
+                    "otherwise use request-changes or block"
+                )
+            if t["base_branch"] and t["base_branch"] != default_branch:
+                merge = {"merge_state": "pending", "merge_attempts": 0, "merge_next_at": now()}
+                extra.append(("merge_pending", {"run_id": run_id, "pr": int(m[1]), "sha": m[2]}))
+            else:
+                extra.append(
+                    ("awaiting_owner_merge", {"run_id": run_id, "pr": int(m[1]), "sha": m[2]})
+                )
+        elif run["role"] in BUILDERS and commits_ahead > 0:
+            raise Refused(
+                f"branch {t['branch_name']} has {commits_ahead} commit(s) not on origin/{t['base_branch'] or 'the default branch'}; "
+                "open a PR and run: kanban request-review"
+            )
+        end_run(
+            conn, run_id, "completed", "done", actor=_worker(run), event_kind="completed",
+            card_fields={
+                **_TERMINAL_CARD, "completed_at": now(), "block_kind": None, "block_recurrences": 0,
+                "consecutive_failures": 0, "last_failure_error": None, **merge,
+            },
+            run_fields={"terminal_verb": "complete"}, summary=summary,
+        )  # fmt: skip
+        for kind, payload in extra:
+            _ev(conn, t, kind, _worker(run), payload, run_id)
+    return {"id": t["id"], "status": "done", "merge_state": merge.get("merge_state")}
+
+
+def request_review(
+    conn: sqlite3.Connection,
+    run_id: int,
+    summary: str,
+    *,
+    pr_number: int,
+    pr_url: str,
+    reviewer: str | None = None,
+) -> dict[str, Any]:
+    summary = _need(summary, "summary", "name the PR as 'PR #<n>' or its URL")
+    reviewer = reviewer or cfg(conn, "dispatch.reviewer")
+    if reviewer not in cfg(conn, "dispatch.roles"):
+        raise Refused(f"reviewer {reviewer!r} is not a dispatchable role")
+    with tx(conn):
+        found = _verb_run(conn, run_id, "request-review")
+        if found is None:
+            return {"noop": True}
+        run, t = found
+        if run["kind"] != "work" or run["role"] not in BUILDERS:
+            raise Refused(
+                "request-review is for smith or designer work runs; use complete or request-changes"
+            )
+        end_run(
+            conn, run_id, "review_requested", "review", actor=_worker(run), event_kind="review_requested",
+            payload={"implementer": t["assignee"], "pr": pr_number},
+            card_fields={
+                **_TERMINAL_CARD, "implementer": t["assignee"], "assignee": reviewer,
+                "pr_number": pr_number, "pr_url": pr_url,
+            },
+            run_fields={"terminal_verb": "request-review"}, summary=summary,
+        )  # fmt: skip
+    return {"id": t["id"], "status": "review", "assignee": reviewer, "pr_number": pr_number}
+
+
+def request_changes(conn: sqlite3.Connection, run_id: int, reason: str) -> dict[str, Any]:
+    reason = _need(reason, "reason", "pass --reason")
+    with tx(conn):
+        found = _verb_run(conn, run_id, "request-changes")
+        if found is None:
+            return {"noop": True}
+        run, t = found
+        if run["kind"] != "review":
+            raise Refused("request-changes is for review runs; use block or complete")
+        if not t["implementer"]:
+            raise Refused(
+                f"card {t['id']} has no recorded implementer; use block --kind needs_input"
+            )
+        to = "ready" if parents_satisfied(conn, t["id"]) else "todo"
+        end_run(
+            conn, run_id, "changes_requested", to, actor=_worker(run), event_kind="changes_requested",
+            payload={"reason": reason},
+            card_fields={**_TERMINAL_CARD, "assignee": t["implementer"]},
+            run_fields={"terminal_verb": "request-changes"}, summary=reason,
+        )  # fmt: skip
+        _comment(conn, t, run["role"], f"CHANGES REQUESTED: {reason}", _worker(run))
+    return {"id": t["id"], "status": to, "assignee": t["implementer"]}
+
+
+# --- grants, pause, stats -------------------------------------------------------------------
+
+_RULE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*\((.+)\)$")
+
+
+def grant_add(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rules: Sequence[str],
+    approved: str,
+    *,
+    actor: str = OWNER,
+) -> dict[str, Any]:
+    approved = _need(approved, "--approved", "quote the owner's words, source and date")
+    if not rules:
+        raise Refused("pass at least one --allow RULE")
+    for r in rules:
+        m = _RULE_RE.match(r)
+        if not m or m[1].strip() in ("*", ":*") or m[1].endswith(":*"):
+            raise Refused(
+                f"grant rule {r!r} must name the exact action, not a wildcard or a tool prefix"
+            )
+    with tx(conn):
+        t = get_task(conn, task_id)
+        cur = conn.execute(
+            "INSERT INTO grants(task_id, rules, approved, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, json.dumps(list(rules)), approved, now()),
+        )
+        _ev(conn, t, "grant_added", actor, {"grant_id": cur.lastrowid, "rules": list(rules)})
+    return {"id": task_id, "grant_id": cur.lastrowid}
+
+
+def grant_revoke(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) -> dict[str, Any]:
+    with tx(conn):
+        t = get_task(conn, task_id)
+        cur = conn.execute(
+            "UPDATE grants SET revoked_at = ? WHERE task_id = ? AND revoked_at IS NULL",
+            (now(), task_id),
+        )
+        if cur.rowcount:
+            _ev(conn, t, "grant_revoked", actor, {"count": cur.rowcount})
+    return {"id": task_id, "revoked": cur.rowcount}
+
+
+def grants_list(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+    get_task(conn, task_id)
+    out = []
+    for r in conn.execute("SELECT * FROM grants WHERE task_id = ? ORDER BY id", (task_id,)):
+        d = dict(r)
+        d["rules"] = json.loads(d["rules"])
+        out.append(d)
+    return out
+
+
+def pause(conn: sqlite3.Connection, reason: str = "", *, actor: str = OWNER) -> None:
+    with tx(conn):
+        state_put(conn, "dispatch_paused", {"reason": "manual", "since": now(), "detail": reason})
+        _ev(conn, None, "dispatch_paused", actor, {"reason": "manual", "detail": reason})
+
+
+def resume(conn: sqlite3.Connection, *, actor: str = OWNER) -> bool:
+    with tx(conn):
+        cur = conn.execute("DELETE FROM state WHERE key = 'dispatch_paused'")
+        if cur.rowcount:
+            _ev(conn, None, "dispatch_resumed", actor)
+    return bool(cur.rowcount)
+
+
+def stats(conn: sqlite3.Connection, *, board: str | None = None, days: int = 7) -> dict[str, Any]:
+    since = now() - days * 86400
+    where = "r.started_at >= ?" + (" AND t.board = ?" if board else "")
+    args: list[Any] = [since, *([board] if board else [])]
+    base = f"FROM task_runs r JOIN tasks t ON t.id = r.task_id WHERE {where}"
+
+    def table(sql: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in conn.execute(sql, args)]
+
+    return {
+        "days": days,
+        "cost_by_role": table(f"SELECT r.role, COUNT(*) runs, ROUND(COALESCE(SUM(r.cost_usd), 0), 4) cost {base} GROUP BY r.role ORDER BY r.role"),
+        "cost_by_model": table(f"SELECT r.model, ROUND(COALESCE(SUM(r.cost_usd), 0), 4) cost {base} GROUP BY r.model ORDER BY r.model"),
+        "cost_by_day": table(f"SELECT date(r.started_at, 'unixepoch', 'localtime') day, ROUND(COALESCE(SUM(r.cost_usd), 0), 4) cost {base} GROUP BY day ORDER BY day"),
+        "outcomes": table(f"SELECT r.outcome, COUNT(*) runs {base} GROUP BY r.outcome ORDER BY r.outcome"),
+        "review_rounds": table(f"SELECT t.id, COUNT(*) rounds {base} AND r.kind = 'review' GROUP BY t.id ORDER BY rounds DESC"),
+    }  # fmt: skip

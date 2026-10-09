@@ -1,0 +1,38 @@
+[project]
+name = "kanban-claude"
+version = "0.2.0.dev0"
+description = "Local kanban board for Claude Code: store, CLI, dispatcher."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+kanban = "kanban_claude.cli:main"
+
+[build-system]
+requires = ["uv_build==0.12.23"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["ruff", "mypy", "pytest"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM"]
+ignore = ["S101", "S603", "S607", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/kanban_claude/store.py" = ["S608"]
+"src/kanban_claude/importer.py" = ["S608"]
+"src/kanban_claude/views.py" = ["S608"]
+"tests/**" = ["S105", "S106", "S108", "S608"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
