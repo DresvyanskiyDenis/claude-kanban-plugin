@@ -118,6 +118,15 @@ def test_c2_a_refusal_on_exit_0_is_quota_not_a_finished_report(
     assert run["outcome"] == "quota" and store.get_task(conn, tid)["status"] == "ready"
 
 
+def test_a_finished_report_stays_completed_whatever_its_last_message_says(
+    conn: Any, card: Card, execute: Execute
+) -> None:
+    tid = card()
+    run = execute(tid, "refusal", terminal=["complete", tid, "--summary", "done"])
+    assert run["outcome"] == "completed" and store.get_task(conn, tid)["status"] == "done"
+    assert "hard_until" not in account(conn, tid)
+
+
 def test_c3_the_soft_wall_is_set_from_the_utilisation(
     conn: Any, card: Card, execute: Execute
 ) -> None:

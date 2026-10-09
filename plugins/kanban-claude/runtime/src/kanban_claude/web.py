@@ -521,17 +521,14 @@ def patch(r: Req, task_id: str) -> Any:
         raise Refused(f"assignee {role!r} must be one of the dispatchable roles")
     if not fields and not assign:
         raise Refused("nothing to change")
-    # one transaction: an edit refused after the assign takes the new role back with it
-    with versioned(r, task_id, version), store.tx(r.conn):
-        if assign and not store.assign(
-            r.conn, task_id, role, actor=ACTOR, expect_version=version
-        ).get("noop"):
-            version += 1  # a changed role is one version bump of its own
+    with versioned(r, task_id, version):
         if fields:
             store.edit(
                 r.conn, task_id, fields, actor=ACTOR, expect_version=version,
-                allow_empty_body=t["status"] == "triage",
+                allow_empty_body=t["status"] == "triage", assignee=role,
             )  # fmt: skip
+        else:
+            store.assign(r.conn, task_id, role, actor=ACTOR, expect_version=version)
     return {"card": one(r, task_id)}
 
 

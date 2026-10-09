@@ -9,7 +9,7 @@ import pytest
 
 from kanban_claude import dispatcher, housekeeping, store
 
-from .conftest import FakeProcs
+from .conftest import Calls, FakeProcs
 
 Prs = Callable[[dict[str, dict[str, Any]]], None]
 SHA = "abc1234def5678abc1234def5678abc1234def56"
@@ -83,7 +83,7 @@ def test_v1_a_clean_approval_squash_merges_and_posts_a_comment(
     [
         ({}, f"{CLEAN} PARTIAL REVIEW: tests not run", "approval_not_clean"),
         ({"state": "DRAFT"}, CLEAN, "pr_not_open"),
-        ({"number": 8}, CLEAN, "number_mismatch"),
+        ({"baseRefName": "release/y"}, CLEAN, "base_changed"),
         ({"headRefName": "feat/other"}, CLEAN, "head_branch_changed"),
         ({"baseRefName": "main"}, CLEAN, "base_is_default"),
         ({"headRefOid": "f" * 40}, CLEAN, "head_moved"),
@@ -296,3 +296,46 @@ def test_settle_speaks_only_when_it_changed_the_card(conn: Any, repo: Path, set_
     housekeeping.settle(conn, t, "merged", "merged", {"pr": 7}, "[merge] squash-merged PR #7")
     assert comments(conn, tid) == [] and store.get_task(conn, tid)["merge_state"] is None
     assert not conn.execute("SELECT 1 FROM task_events WHERE kind = 'merged'").fetchone()
+
+
+@pytest.mark.parametrize("move", ["reopen", "archive"])
+def test_a_card_that_left_the_queue_after_selection_is_not_merged(
+    conn: Any, repo: Path, set_prs: Prs, env: Path, move: str
+) -> None:
+    set_prs({"7": PR})
+    tid = approved(conn, repo)
+    selected = store.get_task(conn, tid)
+    if move == "reopen":
+        store.reopen(conn, tid, "the owner changed their mind")
+    else:
+        store.archive(conn, tid)
+    housekeeping.merge_one(conn, selected)
+    assert merge_calls(env) == []
+    assert store.get_task(conn, tid)["merge_state"] != "merged"
+
+
+def test_a_card_archived_while_a_merge_is_pending_is_left_alone(
+    conn: Any, repo: Path, set_prs: Prs, env: Path
+) -> None:
+    set_prs({"7": PR})
+    tid = approved(conn, repo)
+    store.archive(conn, tid)
+    housekeeping.run_due(conn, later())
+    assert [c for c in Calls(env / "gh.log")() if c[0] == "pr"] == []
+
+
+def test_a_retry_does_not_touch_a_card_that_was_reopened_during_the_attempt(
+    conn: Any, repo: Path, set_prs: Prs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_prs({"7": PR})
+    tid = approved(conn, repo)
+
+    def reopen_then_fail(*_a: Any, **_k: Any) -> None:
+        store.reopen(conn, tid, "the owner changed their mind")
+        raise RuntimeError("surprise")
+
+    monkeypatch.setattr(housekeeping.ghops, "pr_view", reopen_then_fail)
+    housekeeping.run_due(conn, later())
+    t = store.get_task(conn, tid)
+    assert (t["merge_attempts"], t["merge_next_at"]) == (0, None)
+    assert comments(conn, tid) == []

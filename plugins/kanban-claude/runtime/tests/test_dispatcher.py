@@ -100,6 +100,16 @@ def test_d3_a_ready_card_at_the_limit_is_skipped(conn: Any, card: Card, procs: F
     assert tick(conn, procs)["skipped"] == {tid: "failure_limit"}
 
 
+def test_a_ready_card_on_an_archived_board_is_skipped(
+    conn: Any, card: Card, procs: FakeProcs
+) -> None:
+    tid = card()
+    store.board_archive(conn, "main")
+    report = tick(conn, procs)
+    assert report["skipped"] == {tid: "board_archived"} and report["claimed"] == []
+    assert procs.spawned == [] and store.get_task(conn, tid)["status"] == "ready"
+
+
 def test_d4_quota_walls_hold_and_expire(conn: Any, card: Card, procs: FakeProcs) -> None:
     tid = card()
     cfg_dir = store.effective_config_dir(conn, store.get_board(conn, "main"))
@@ -506,7 +516,8 @@ def test_the_tick_thread_survives_a_failure_anywhere_in_its_body(
 def any_port() -> None:
     """The daemon serves the board on `web.port`; 0 keeps tests off a real daemon's port."""
     c = store.connect()
-    store.config_set(c, "web.port", 0)
+    with store.tx(c):
+        store.config_put(c, "web.port", 0)
     c.close()
 
 

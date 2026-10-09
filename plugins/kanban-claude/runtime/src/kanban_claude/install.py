@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import fcntl
 import json
 import logging
 import logging.handlers
@@ -17,13 +18,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from . import __version__, classify, dispatcher, gitops, launchd, runner, store, web
+from . import __version__, classify, gitops, launchd, runner, store, web
 from .errors import Error, Refused, Usage
 from .paths import dirs, ensure_dir, write_private
 from .procs import Procs
 
 MIN_CLAUDE = (2, 1, 259)
-STALE_LOCK_S = 600
 HEALTH_WAIT_S = 10.0
 PROBE_TIMEOUT_S = 180
 STAMP_SCHEMA = 1
@@ -35,7 +35,9 @@ TOOL_FIX = {
 }
 PLUGIN_INSTALL = "/plugin install kanban-claude@claude-kanban-plugin"
 PLUGIN_UNINSTALL = PLUGIN_INSTALL.replace("install", "uninstall")
-STOP_WAIT_S = 10.0
+# a runner notices its stopped row within one poll, then claude exits
+STOP_WAIT_S = runner.QUIET_POLL_S + 10.0
+WORK_ENTRIES = ("scratch",)
 log = logging.getLogger("kanban.install")
 
 
@@ -72,22 +74,20 @@ def write_stamp(stamp: dict[str, Any]) -> None:
 
 @contextlib.contextmanager
 def upgrade_lock(home: Path) -> Iterator[bool]:
-    """INS-09: `mkdir` is the lock. Yields False when someone else holds it; a stale one is taken over."""
-    lock = home / "upgrade.lock"
+    """INS-09: an exclusive flock on `upgrade.lock`; yields False when another setup holds it.
+
+    The kernel drops the lock with its process, so a crash leaves nothing to clear and a live holder is never taken over.
+    """
+    fd = os.open(home / "upgrade.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        lock.mkdir(mode=0o700)
-    except FileExistsError:
-        if time.time() - lock.stat().st_mtime < STALE_LOCK_S:
-            yield False
-            return
-        # ponytail: two setups that both see a stale lock can both go ahead; they are typed by hand
-        shutil.rmtree(lock, ignore_errors=True)
-        lock.mkdir(mode=0o700)
-    try:
-        yield True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held = True
+        except BlockingIOError:
+            held = False
+        yield held
     finally:
-        with contextlib.suppress(OSError):
-            lock.rmdir()
+        os.close(fd)
 
 
 @contextlib.contextmanager
@@ -345,7 +345,7 @@ def run_setup(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str
     captured = launchd.capture_env(
         os.environ, store.cfg(conn, "worker.env_passthrough"), tool_dirs(claude)
     )
-    say("captured environment: " + " ".join(f"{k}={v}" for k, v in captured.items()))
+    say("captured environment: " + " ".join(captured))
     env = probe_env(captured, config_dir)
     model = store.cfg(conn, "models.review")
     say(f"probing {claude} with the worker flags (model {model}, config {config_dir})")
@@ -432,12 +432,22 @@ def human(n: float) -> str:
 
 
 def purge_targets() -> list[Path]:
-    """Both data directories, refusing any that is, or holds, the user's home or the root."""
-    d, home = dirs(), Path.home().resolve()
-    targets = [p.resolve() for p in (d.home, d.work)]
+    """Both data directories. Refused: any that is, or holds, the user's home or the root; a home
+    without the board database; a work directory with an entry kanban did not create."""
+    home = Path.home().resolve()
+    targets = [p.resolve() for p in dirs()]
     for p in targets:
         if p == p.parent or p == home or p in home.parents:
             raise Refused(f"refusing to delete {p}: it is or contains your home directory")
+    data, work = targets
+    if data.exists() and not (data / "kanban.db").exists():
+        raise Refused(f"refusing to delete {data}: it holds no kanban.db, so it is not board data")
+    if work.is_dir() and (
+        strange := sorted(c.name for c in work.iterdir() if c.name not in WORK_ENTRIES)
+    ):
+        raise Refused(
+            f"refusing to delete {work}: it holds {', '.join(strange)}, not made by kanban"
+        )
     return targets
 
 
@@ -489,7 +499,7 @@ def uninstall(a: argparse.Namespace) -> tuple[dict[str, Any], str]:
         if conn:
             runners = []
             for r in active:
-                got = dispatcher.stop(conn, r["task_id"])
+                got = store.stop(conn, r["task_id"])
                 stopped.append(r["task_id"])
                 runners.append((got["runner_pid"], got["runner_started"]))
             if stopped:

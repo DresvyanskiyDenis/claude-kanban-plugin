@@ -361,7 +361,7 @@ def v_unlink(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
 
 @owner_verb("stop")
 def v_stop(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    return dispatcher.stop(conn, a.id), None
+    return store.stop(conn, a.id), None
 
 
 @owner_verb("archive")

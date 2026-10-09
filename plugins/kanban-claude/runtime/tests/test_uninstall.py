@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import install, launchd, paths, store
+from kanban_claude import install, launchd, paths, runner, store
 from kanban_claude.procs import start_time
 
 from .conftest import Calls, Kb, git
@@ -46,7 +46,7 @@ def test_active_runs_refuse_the_uninstall_and_nothing_is_touched(
     assert agent_loaded() and launchd.plist_path().exists() and not removed(uv_calls)
 
 
-def test_force_stops_active_runs_as_an_owner_stop_and_signals_their_runners(
+def test_force_stops_active_runs_in_the_database_and_leaves_their_runners_to_the_poll(
     kb: Kb,
     healthy: int,
     conn: Any,
@@ -59,20 +59,25 @@ def test_force_stops_active_runs_as_an_owner_stop_and_signals_their_runners(
     tid = card()
     run = claim(tid)
     monkeypatch.setattr(install, "STOP_WAIT_S", 0.3)
-    runner = subprocess.Popen(["sleep", "60"])
+    sleeper = subprocess.Popen(["sleep", "60"])
     try:
         conn.execute(
             "UPDATE task_runs SET runner_pid = ?, runner_started = ? WHERE id = ?",
-            (runner.pid, start_time(runner.pid), run),
+            (sleeper.pid, start_time(sleeper.pid), run),
         )
         code, out, err = kb("uninstall", "--force")
         assert code == 0, err
-        assert runner.wait(timeout=10) == -15
+        assert sleeper.poll() is None
+        assert f"runner {sleeper.pid} is still ending" in out + err
     finally:
-        runner.kill()
+        sleeper.kill()
     task = store.get_task(conn, tid)
     assert task["status"] == "blocked" and task["block_kind"] == "stopped"
     assert not agent_loaded() and tid in out
+
+
+def test_the_uninstall_wait_outlasts_the_runners_poll_of_its_row() -> None:
+    assert install.STOP_WAIT_S > runner.QUIET_POLL_S
 
 
 def make_worktree(repo: Path, task_id: str, branch: str) -> Path:
@@ -145,6 +150,28 @@ def test_purge_refuses_a_directory_that_is_or_contains_the_users_home(
     code, _, err = kb("uninstall", "--purge", "--yes")
     assert code == 4 and "refusing" in err
     assert Path.home().is_dir()
+
+
+def test_purge_refuses_a_home_that_holds_no_board_database(
+    kb: Kb, env: Path, uv_calls: Calls
+) -> None:
+    home = paths.dirs().home
+    home.mkdir()
+    (home / "thesis.tex").write_text("precious")
+    code, _, err = kb("uninstall", "--purge", "--yes")
+    assert code == 4 and "kanban.db" in err
+    assert (home / "thesis.tex").exists() and not removed(uv_calls)
+
+
+def test_purge_refuses_a_work_directory_that_holds_anything_kanban_did_not_create(
+    kb: Kb, healthy: int, agent_loaded: Callable[[], bool]
+) -> None:
+    d = paths.dirs()
+    (d.work / "scratch").mkdir()
+    (d.work / "notes.txt").write_text("mine")
+    code, _, err = kb("uninstall", "--purge", "--yes")
+    assert code == 4 and "notes.txt" in err
+    assert agent_loaded() and (d.work / "notes.txt").exists() and (d.home / "kanban.db").exists()
 
 
 def test_uninstalling_what_was_never_installed_is_quiet_and_creates_nothing(

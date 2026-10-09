@@ -16,6 +16,7 @@ import pytest
 from kanban_claude import runner, store
 from kanban_claude.gitops import ProvisionError
 from kanban_claude.paths import dirs
+from kanban_claude.procs import start_time
 
 from .conftest import Execute, Go
 
@@ -273,7 +274,7 @@ def test_the_log_says_when_the_worker_already_ended_the_run(
     assert "run already ended" in p.stdout and "classified=" not in p.stdout
 
 
-def test_r8_stop_signals_the_runner_which_takes_the_group_down(
+def test_r8_a_database_only_stop_is_enough_for_the_runner_to_take_the_group_down(
     conn: Any, card: Card, claim: Claim, go: Go, env: Path, kb: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tid = card()
@@ -297,13 +298,35 @@ def test_r8_stop_signals_the_runner_which_takes_the_group_down(
         if row["claude_pid"]:
             break
         time.sleep(0.1)
+    stopped = time.monotonic()
     assert kb("stop", tid)[0] == 0
     assert proc.wait(timeout=60) == 0
+    assert time.monotonic() - stopped < runner.QUIET_POLL_S + 15
     row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
     assert row["outcome"] == "terminated" and row["stop_requested"] == 1
     t = store.get_task(conn, tid)
     assert t["status"] == "blocked" and t["block_kind"] == "stopped"
     assert dead(int(pidfile.read_text()))
+
+
+def test_stop_signals_no_process_it_only_ends_the_run_in_the_database(
+    conn: Any, card: Card, claim: Claim, kb: Any
+) -> None:
+    tid = card()
+    run = claim(tid)
+    sleeper = subprocess.Popen(["sleep", "60"])
+    try:
+        conn.execute(
+            "UPDATE task_runs SET runner_pid = ?, runner_started = ? WHERE id = ?",
+            (sleeper.pid, start_time(sleeper.pid), run),
+        )
+        assert kb("stop", tid)[0] == 0
+        time.sleep(0.5)
+        assert sleeper.poll() is None
+    finally:
+        sleeper.kill()
+    row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
+    assert row["outcome"] == "terminated" and row["stop_requested"] == 1
 
 
 def test_a_runner_signalled_by_something_else_is_interrupted_not_a_crash(

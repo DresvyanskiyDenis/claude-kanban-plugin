@@ -1,11 +1,11 @@
 import contextlib
+import fcntl
 import json
 import os
 import shutil
 import socket
 import stat
-import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -139,7 +139,23 @@ def test_a_secret_is_never_persisted_and_a_proxy_password_is_never_logged(
     log = (paths.dirs().home / "logs" / "upgrade.log").read_text()
     for text in (out, err, log):
         assert "pw4321" not in text and "t0ken" not in text
-    assert "http://***@proxy.invalid:3128" in log
+    assert "HTTPS_PROXY" in log
+
+
+def test_setup_names_the_captured_variables_and_never_prints_a_passthrough_value(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with contextlib.closing(store.connect()) as conn:
+        store.config_set(conn, "worker.env_passthrough", ["MY_API_TOKEN"])
+    monkeypatch.setenv("MY_API_TOKEN", "s3cr3t-passthrough")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    code, out, err = setup()
+    assert code == 0, err
+    log = (paths.dirs().home / "logs" / "upgrade.log").read_text()
+    for text in (out, err, log):
+        assert "s3cr3t-passthrough" not in text
+    assert "captured environment:" in err and "MY_API_TOKEN" in err and "HTTPS_PROXY" in err
+    assert "proxy.invalid" not in err
 
 
 def test_rerunning_setup_keeps_what_the_owner_configured(setup: Setup, kb: Kb, env: Path) -> None:
@@ -289,33 +305,56 @@ def test_an_upgrade_migrates_restarts_the_daemon_and_rewrites_the_stamp(
     ]
     assert len(claude_calls(env)) == 2
     assert f"{OLD} -> {__version__}" in (paths.dirs().home / "logs" / "upgrade.log").read_text()
-    assert not (paths.dirs().home / "upgrade.lock").exists()
+    assert upgrade_lock_is_free()
+
+
+@contextlib.contextmanager
+def held_upgrade_lock() -> Iterator[None]:
+    fd = os.open(paths.dirs().home / "upgrade.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def upgrade_lock_is_free() -> bool:
+    with install.upgrade_lock(paths.dirs().home) as held:
+        return held
 
 
 def test_an_upgrade_while_another_holds_the_lock_exits_zero_and_does_nothing(
     installed: Setup, launchctl_calls: Calls
 ) -> None:
-    (paths.dirs().home / "upgrade.lock").mkdir()
     before = launchctl_calls()
-    code, out, err = installed()
+    with held_upgrade_lock():
+        code, out, err = installed()
+        assert not upgrade_lock_is_free()
     assert code == 0 and "another" in err + out
     assert stamp()["version"] == OLD and launchctl_calls() == before
-    assert (paths.dirs().home / "upgrade.lock").is_dir()
 
 
-def test_a_stale_lock_is_removed_and_the_upgrade_goes_ahead(installed: Setup) -> None:
-    lock = paths.dirs().home / "upgrade.lock"
-    lock.mkdir()
-    old = time.time() - install.STALE_LOCK_S - 5
-    os.utime(lock, (old, old))
+def test_a_held_lock_is_never_taken_over_however_old_its_file_is(
+    installed: Setup, launchctl_calls: Calls
+) -> None:
+    before = launchctl_calls()
+    with held_upgrade_lock():
+        os.utime(paths.dirs().home / "upgrade.lock", (0, 0))
+        code, out, err = installed()
+    assert code == 0 and "another" in err + out
+    assert stamp()["version"] == OLD and launchctl_calls() == before
+
+
+def test_a_lock_file_left_by_a_crashed_setup_blocks_nothing(installed: Setup) -> None:
+    (paths.dirs().home / "upgrade.lock").write_text("")
     assert installed()[0] == 0
-    assert stamp()["version"] == __version__ and not lock.exists()
+    assert stamp()["version"] == __version__ and upgrade_lock_is_free()
 
 
 def test_a_failed_setup_still_releases_the_lock(setup: Setup, knobs: Callable[..., None]) -> None:
     knobs(FAKE_CLAUDE_FIXTURE="auth401")
     assert setup()[0] == 1
-    assert not (paths.dirs().home / "upgrade.lock").exists()
+    assert upgrade_lock_is_free()
 
 
 def test_a_plugin_older_than_the_stamp_is_refused_unless_confirmed(

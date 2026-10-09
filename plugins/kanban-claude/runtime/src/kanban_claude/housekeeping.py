@@ -28,19 +28,19 @@ def say(conn: sqlite3.Connection, t: Row, text: str) -> None:
 def precondition_failure(
     t: Row, approved: dict[str, Any], summary: str, pr: dict[str, Any], default: str
 ) -> str | None:
-    """REV-05 preconditions 1..7 in order; None means all hold."""
+    """REV-05 preconditions in order (the PR was fetched by its approved number); None means all hold."""
     if not store.APPROVED_RE.search(summary) or "PARTIAL REVIEW" in summary:
         return "approval_not_clean"
     if pr.get("state") != "OPEN":
         return "pr_not_open"
-    if pr.get("number") != approved["pr"]:
-        return "number_mismatch"
     if not default:
         return "default_branch_unknown"
     if pr.get("headRefName") != t["branch_name"]:
         return "head_branch_changed"
     if pr.get("baseRefName") == default:
         return "base_is_default"
+    if pr.get("baseRefName") != t["base_branch"]:
+        return "base_changed"
     if not str(pr.get("headRefOid", "")).startswith(approved["sha"]):
         return "head_moved"
     return None
@@ -61,6 +61,18 @@ def settle(
             store.event(conn, t, kind, "housekeeping", payload)
     if cur.rowcount == 1:
         say(conn, t, text)
+
+
+def claim_merge(conn: sqlite3.Connection, t: Row) -> bool:
+    """CAS on the row `run_due` selected, taken just before `gh pr merge`: false when the card left the
+    queue since (reopened, archived) or another claim holds it; a crash leaves the lease to lapse."""
+    with store.tx(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET merge_next_at = ? WHERE id = ? AND status = 'done' "
+            "AND merge_state = 'pending' AND merge_next_at = ?",
+            (store.now() + MERGE_RETRY_S, t["id"], t["merge_next_at"]),
+        )
+    return cur.rowcount == 1
 
 
 def merge_one(conn: sqlite3.Connection, t: Row) -> None:
@@ -107,6 +119,8 @@ def merge_one(conn: sqlite3.Connection, t: Row) -> None:
                     reason,
                     fix=f"the approval no longer covers the PR; run: kanban reopen-review {t['id']} --reason TEXT",
                 )
+            if not claim_merge(conn, t):
+                return
             ghops.merge(slug, n, pr["headRefOid"])
         merged(pr)
     except Exception as e:
@@ -118,11 +132,13 @@ def merge_one(conn: sqlite3.Connection, t: Row) -> None:
                     return merged(pr)
             return fail(f"failed after {attempts} attempts: {e}", error=str(e))
         with store.tx(conn):
-            conn.execute(
-                "UPDATE tasks SET merge_attempts = ?, merge_next_at = ? WHERE id = ?",
+            cur = conn.execute(
+                "UPDATE tasks SET merge_attempts = ?, merge_next_at = ? "
+                "WHERE id = ? AND merge_state = 'pending'",
                 (attempts, store.now() + MERGE_RETRY_S, t["id"]),
             )
-        say(conn, t, f"[merge] attempt {attempts} of {MERGE_MAX_ATTEMPTS} failed: {e}")
+        if cur.rowcount == 1:
+            say(conn, t, f"[merge] attempt {attempts} of {MERGE_MAX_ATTEMPTS} failed: {e}")
 
 
 def cleanup_card(conn: sqlite3.Connection, t: Row) -> None:
@@ -176,7 +192,8 @@ def run_due(conn: sqlite3.Connection, ts: int | None = None) -> None:
     """One housekeeping wake-up: every job that is due, one at a time; a job's failure stays its own."""
     ts = ts or int(time.time())
     for t in conn.execute(
-        "SELECT * FROM tasks WHERE merge_state = 'pending' AND merge_next_at <= ? ORDER BY merge_next_at",
+        "SELECT * FROM tasks WHERE status = 'done' AND merge_state = 'pending' AND merge_next_at <= ? "
+        "ORDER BY merge_next_at",
         (ts,),
     ).fetchall():
         try:

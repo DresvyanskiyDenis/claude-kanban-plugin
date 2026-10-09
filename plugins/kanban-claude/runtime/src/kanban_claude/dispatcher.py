@@ -90,14 +90,6 @@ def repair_running(conn: sqlite3.Connection) -> None:
                 store.event(conn, t, "repaired", "dispatcher", {"reason": "running without a run"})
 
 
-def stop(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
-    """RUN-17: the DB first, then SIGTERM to the runner, whose pid and start time are verified."""
-    data = store.stop(conn, task_id)
-    if Procs().alive(data["runner_pid"], data["runner_started"]):
-        os.kill(data["runner_pid"], signal.SIGTERM)
-    return data
-
-
 def expire_walls(conn: sqlite3.Connection, ts: int) -> None:
     """DSP-03, first half: a wall in the past is cleared, once, with an event."""
     for row in conn.execute("SELECT key FROM state WHERE key LIKE 'account:%'").fetchall():
@@ -133,6 +125,8 @@ def skip_reason(
     if t["assignee"] not in allowed:
         return "role_not_dispatchable"
     board = store.get_board(conn, t["board"])
+    if board["archived_at"] is not None:
+        return "board_archived"
     acct = store.account_get(conn, store.effective_config_dir(conn, board))
     if acct.get("auth_paused"):
         return "account_paused"

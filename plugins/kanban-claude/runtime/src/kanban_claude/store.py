@@ -145,6 +145,15 @@ DEFAULTS: dict[str, Any] = {
     "roles.atlassian.enabled": False,
 }
 
+BOUNDS: dict[str, tuple[int, int | None]] = {
+    "dispatch.max_in_progress": (1, None),
+    "dispatch.tick_seconds": (1, None),
+    "dispatch.failure_limit": (1, None),
+    "retention.stream_days": (1, None),
+    "worker.max_turns": (1, None),
+    "web.port": (1, 65535),
+}
+
 Row = sqlite3.Row
 
 
@@ -230,17 +239,21 @@ def connect(home: Path | None = None, *, upgrade: bool = True) -> sqlite3.Connec
 
 @contextlib.contextmanager
 def tx(conn: sqlite3.Connection) -> Iterator[None]:
-    """Inside an open transaction the block joins it, and the outermost `tx` commits or rolls back."""
+    """Inside an open transaction the block joins it, and the outermost `tx` commits or rolls back.
+
+    A COMMIT that fails (a deferred foreign key) leaves the transaction open, so it is rolled back here too.
+    """
     if conn.in_transaction:
         yield
         return
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield
+        conn.execute("COMMIT")
     except BaseException:
-        conn.execute("ROLLBACK")
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         raise
-    conn.execute("COMMIT")
 
 
 # --- config and state -----------------------------------------------------------------------
@@ -278,8 +291,11 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
     is_role_key = key in ("dispatch.default_assignee", "dispatch.reviewer")
     if is_role_key and not unset_ok and value not in roles:
         raise Refused(f"{key} must be one of dispatch.roles ({', '.join(roles)})")
-    if key == "dispatch.max_in_progress" and value < 1:
-        raise Refused("dispatch.max_in_progress must be at least 1")
+    if key in BOUNDS and value is not None:
+        low, high = BOUNDS[key]
+        if type(value) is not int or value < low or (high is not None and value > high):
+            span = f"from {low} to {high}" if high else f"of at least {low}"
+            raise Refused(f"{key} must be an integer {span}")
     if key == "budget.ceiling" and value <= 0:
         raise Refused("budget.ceiling must be positive")
     with tx(conn):
@@ -760,7 +776,9 @@ def edit(
     actor: str = OWNER,
     allow_empty_body: bool = False,
     expect_version: int | None = None,
+    assignee: str | None = None,
 ) -> dict[str, Any]:
+    """`assignee` reassigns in the same transaction, after every check that may call git or gh."""
     t = get_task(conn, task_id)
     if t["status"] == "running":
         raise Refused(f"card {task_id} is running; stop it first with: kanban stop {task_id}")
@@ -773,10 +791,14 @@ def edit(
     if not cols:
         raise Refused("nothing to change")
     if t["status"] in ("todo", "ready"):
-        _dispatchable(conn, {**dict(t), **cols}, b)
+        _dispatchable(conn, {**dict(t), **cols, **({"assignee": assignee} if assignee else {})}, b)
     previous = {k: t[k] for k in cols}
     version = t["version"] if expect_version is None else expect_version
     with tx(conn):
+        if assignee and not assign(
+            conn, task_id, assignee, actor=actor, expect_version=version
+        ).get("noop"):
+            version += 1  # a changed role is one version bump of its own
         sets = "".join(f"{k} = ?, " for k in cols)
         cur = conn.execute(
             f"UPDATE tasks SET {sets}updated_at = ?, version = version + 1 "
@@ -1061,7 +1083,7 @@ def unlink(
 
 
 def stop(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) -> dict[str, Any]:
-    """The DB half of `stop`; the caller signals the runner after this returns (RUN-17)."""
+    """RUN-17: stop is the row alone; the runner polls it and takes claude's process group down itself."""
     with tx(conn):
         t = get_task(conn, task_id)
         run = _running_run(conn, task_id)

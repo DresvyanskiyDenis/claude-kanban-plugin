@@ -862,6 +862,34 @@ def test_patch_edit_refused_after_the_assign_rolls_the_assign_back(
     assert conn.execute(q, (tid,)).fetchone()[0] == before
 
 
+def test_patch_asks_gh_for_the_default_branch_before_it_takes_the_write_lock(
+    call: Call, conn: sqlite3.Connection, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tid = str(
+        store.create(
+            conn, "main", "Work", body="b", assignee="smith", workspace=f"worktree:{repo}",
+            branch="feat/x",
+        )["id"]
+    )  # fmt: skip
+    locked: list[bool] = []
+
+    def lookup(_root: Any) -> str:
+        other = sqlite3.connect(paths.dirs().home / "kanban.db", timeout=0, isolation_level=None)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            locked.append(True)
+        finally:
+            other.close()
+        return "main"
+
+    monkeypatch.setattr(store.ghops, "default_branch", lookup)
+    body = {"version": version(conn, tid), "title": "x", "assignee": "designer"}
+    assert call("PATCH", f"/api/cards/{tid}", body)[0] == 200
+    assert locked == []
+
+
 def test_a_stale_version_is_a_409_even_when_the_card_also_changed_state(
     call: Call, conn: sqlite3.Connection, card: Card
 ) -> None:

@@ -148,6 +148,22 @@ def test_tx_inside_a_transaction_joins_it_and_the_outer_one_decides(conn: Any, c
     assert status(conn, tid) == "triage" and not conn.in_transaction
 
 
+def test_tx_rolls_back_when_the_commit_itself_fails(conn: Any) -> None:
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE c (pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
+    with pytest.raises(sqlite3.IntegrityError), store.tx(conn):
+        conn.execute("INSERT INTO c VALUES (1)")
+    assert not conn.in_transaction
+    with store.tx(conn):
+        conn.execute("INSERT INTO p VALUES (2)")
+    other = store.connect(upgrade=False)
+    try:
+        assert other.execute("SELECT id FROM p").fetchall()[0][0] == 2
+        assert other.execute("SELECT count(*) FROM c").fetchone()[0] == 0
+    finally:
+        other.close()
+
+
 @pytest.mark.parametrize("src", ALL)
 def test_s2_promote_only_from_todo_with_satisfied_parents(conn: Any, card: Card, src: str) -> None:
     tid = reach(conn, card, src)
@@ -628,6 +644,47 @@ def test_config_validation(conn: Any) -> None:
         store.config_set(conn, "dispatch.max_in_progress", "two")
     with pytest.raises(Refused):
         store.config_set(conn, "dispatch.reviewer", "nobody")
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("web.port", 0),
+        ("web.port", 65536),
+        ("web.port", -1),
+        ("web.port", True),
+        ("dispatch.tick_seconds", 0),
+        ("dispatch.tick_seconds", -5),
+        ("dispatch.failure_limit", 0),
+        ("retention.stream_days", 0),
+        ("retention.stream_days", -1),
+        ("worker.max_turns", 0),
+        ("worker.max_turns", -3),
+        ("worker.max_turns", "ten"),
+        ("worker.max_turns", True),
+        ("worker.max_turns", 2.5),
+    ],
+)
+def test_config_set_refuses_values_outside_the_bounds(conn: Any, key: str, value: Any) -> None:
+    before = store.cfg(conn, key)
+    with pytest.raises(Refused, match=key):
+        store.config_set(conn, key, value)
+    assert store.cfg(conn, key) == before
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("web.port", 1), ("web.port", 65535), ("dispatch.tick_seconds", 1), ("worker.max_turns", 1)],
+)
+def test_config_set_accepts_the_edges_of_the_bounds(conn: Any, key: str, value: Any) -> None:
+    store.config_set(conn, key, value)
+    assert store.cfg(conn, key) == value
+
+
+def test_worker_max_turns_can_be_unset(conn: Any) -> None:
+    store.config_set(conn, "worker.max_turns", 5)
+    store.config_set(conn, "worker.max_turns", None)
+    assert store.cfg(conn, "worker.max_turns") is None
 
 
 def test_specify_keeps_an_explicit_runtime_and_fills_a_missing_one(conn: Any, card: Card) -> None:
