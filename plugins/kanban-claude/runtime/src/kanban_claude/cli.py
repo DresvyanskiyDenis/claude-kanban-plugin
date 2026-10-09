@@ -12,24 +12,29 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import __version__, gitops, importer, store, views, worker
+from . import __version__, dispatcher, gitops, importer, runner, store, views, worker
 from .errors import Error, NotAllowed, NotFound, Refused, Usage
-from .paths import dirs
+from .paths import dirs, nudge
+from .procs import Procs
 
 Handler = Callable[[argparse.Namespace, sqlite3.Connection], tuple[dict[str, Any], str | None]]
 
 RUN_ONLY = {"block", "complete", "request-review", "request-changes"}
 NOT_BUILT = {
-    "dispatch": "P2",
-    "daemon": "P2",
-    "run": "P2",
-    "snapshot": "P3",
     "doctor": "P3",
     "setup": "P3",
     "uninstall": "P3",
     "board": "P4",
 }
 NEEDS_DAEMON = {"create", "specify", "promote", "unblock"}
+NUDGE = NEEDS_DAEMON | {
+    "assign", "reassign", "edit", "reopen", "reopen-review", "merge-retry", "mark-done", "resume",
+    "stop",
+}  # fmt: skip
+LONG_RUNNING: dict[str, Callable[[argparse.Namespace], int]] = {
+    "daemon": lambda a: dispatcher.serve(),
+    "run": lambda a: runner.run(a.run_id),
+}
 OWNER: dict[str, Handler] = {}
 
 
@@ -60,7 +65,8 @@ def build() -> argparse.ArgumentParser:
         for item in spec:
             arg, kind = (item, None) if isinstance(item, str) else item
             if not arg.startswith("--"):
-                p.add_argument(arg, nargs="?" if kind == "?" else None)
+                extra: dict[str, Any] = {"type": int} if kind is int else {}
+                p.add_argument(arg, nargs="?" if kind == "?" else None, **extra)
             elif kind == "flag":
                 p.add_argument(arg, action="store_true")
             elif kind == "append":
@@ -99,6 +105,10 @@ def build() -> argparse.ArgumentParser:
     add("link", "parent", "child")
     add("unlink", "parent", "child")
     add("stop", "id")
+    add("dispatch", ("--dry-run", "flag"))
+    add("daemon")
+    add("run", ("run_id", int))
+    add("snapshot", "repo")
     add("archive", "id", ("--rm", "flag"), ("--yes", "flag"))
     add("merge-retry", "id")
     add("grant", "id", ("--allow", "append"), "--approved", ("--revoke", "flag"))
@@ -340,7 +350,12 @@ def v_unlink(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
 
 @owner_verb("stop")
 def v_stop(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    return store.stop(conn, a.id), None
+    """RUN-17: the DB first, then SIGTERM to the runner, whose pid and start time are verified."""
+    data = store.stop(conn, a.id)
+    pid = data["runner_pid"]
+    if Procs().alive(pid, data["runner_started"]):
+        os.kill(pid, signal.SIGTERM)
+    return data, None
 
 
 @owner_verb("archive")
@@ -479,8 +494,49 @@ def v_pause(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, 
 
 @owner_verb("resume")
 def v_resume(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    """OBS-03: an auth pause clears only for an account whose login passes the probe."""
+    cleared: list[str] = []
+    failing: dict[str, str] = {}
+    for row in conn.execute("SELECT key FROM state WHERE key LIKE 'account:%'").fetchall():
+        config_dir = row["key"].removeprefix("account:")
+        if store.account_get(conn, config_dir).get("auth_paused"):
+            reason = runner.auth_probe(conn, config_dir)
+            if reason is None:
+                cleared.append(config_dir)
+            else:
+                failing[config_dir] = reason
+    with store.tx(conn):
+        for config_dir in cleared:
+            store.account_set(conn, config_dir, auth_paused=None)
+            store.event(conn, None, "account_resumed", store.OWNER, {"config_dir": config_dir})
     was = store.resume(conn)
-    return {"resumed": was}, "dispatch resumed" if was else "dispatch was not paused"
+    text = "dispatch resumed" if was else "dispatch was not paused"
+    if failing:
+        text += "; still paused: " + "; ".join(f"{d}: {why}" for d, why in failing.items())
+    return {"resumed": was, "accounts_cleared": cleared, "accounts_failing": failing}, text
+
+
+@owner_verb("dispatch")
+def v_dispatch(
+    a: argparse.Namespace, conn: sqlite3.Connection
+) -> tuple[dict[str, Any], str | None]:
+    """One tick in this process; `--dry-run` only shows what the tick would do."""
+    report = dispatcher.dispatch_once(conn, store.now(), Procs(), dry_run=a.dry_run)
+    lines = [f"slots={report.get('slots')} paused={report['paused']}"]
+    lines += [f"{'would claim' if a.dry_run else 'claimed'} {c['id']}" for c in report["claimed"]]
+    lines += [f"skipped {k}: {v}" for k, v in report["skipped"].items()]
+    return report, "\n".join(lines)
+
+
+@owner_verb("snapshot")
+def v_snapshot(
+    a: argparse.Namespace, conn: sqlite3.Connection
+) -> tuple[dict[str, Any], str | None]:
+    """CHK-03: print the path of a detached origin checkout; a warning goes to stderr."""
+    path, warning = gitops.snapshot(a.repo)
+    if warning:
+        print(f"kanban: {warning}", file=sys.stderr)
+    return {"path": str(path), "warning": warning}, str(path)
 
 
 @owner_verb("config")
@@ -577,11 +633,15 @@ def owner(a: argparse.Namespace) -> int:
             f"{a.verb} ends a worker's run, so only a worker can use it; "
             "the owner unblocks, reopens, marks done or stops a card instead"
         )
+    if a.verb in LONG_RUNNING:
+        return LONG_RUNNING[a.verb](a)
     conn = store.connect()
     try:
         data, text = OWNER[a.verb](a, conn)
     finally:
         conn.close()
+    if a.verb in NUDGE:
+        nudge()
     if text != "":
         present(a, data, text)
     if a.verb in NEEDS_DAEMON and not daemon_running():

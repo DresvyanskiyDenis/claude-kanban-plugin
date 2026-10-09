@@ -5,8 +5,8 @@ Spec version 0.3; build phases per spec section 24.
 | Phase | State |
 |---|---|
 | P1 store + CLI | done: schema, migrations, domain operations, CLI verbs, worker mode (`KANBAN_RUN_ID`, verbs run in-process on the run's card), `watch`, legacy-board importer (dry run and real import). Deferred: interactive grant activation on import (needs the role-frontmatter check), runner signalling on `stop` |
-| P2 dispatcher + runner | not started |
-| P3 web board | not started |
-| P4 plugin (agents, skills, hooks), setup | not started |
+| P2 dispatcher + runner | done: `daemon` (tick and housekeeping threads, singleton flock, nudge file), `run` (runner, stream classification, quota and auth walls, cost deltas), `dispatch --dry-run`, `pause`/`resume`, `snapshot`, worktree provisioning and cleanup, merge jobs, retention; the tick loop, each run and each card fail in isolation, and a provision that keeps failing for infrastructure reasons ends blocked after a few tries. Deferred: the web server slot in the daemon (P4), `doctor` and `setup` (P3), the smith to warden PR smoke on a real repository |
+| P3 plugin surface (agents, skills, hooks), setup | not started |
+| P4 web board | not started |
 
-Next: P2 (dispatcher and runner).
+Next: P3 (plugin surface and setup).

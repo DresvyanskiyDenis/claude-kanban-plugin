@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-x","permissionMode":"auto","claude_code_version":"2.1.0","plugins":[{"name":"kanban-claude"}]}
+{"type":"result","subtype":"error_max_budget_usd","is_error":true,"num_turns":9,"result":"","total_cost_usd":0.31}

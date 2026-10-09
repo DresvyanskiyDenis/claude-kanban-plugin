@@ -7,6 +7,7 @@ transaction; side effects on processes run after it. Status changes are compare-
 
 import contextlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -19,6 +20,8 @@ from typing import Any
 from . import ghops, validate
 from .errors import Error, NotFound, Refused
 from .paths import dirs, ensure_dir
+
+log = logging.getLogger("kanban.store")
 
 SCHEMA = """
 CREATE TABLE boards (
@@ -135,7 +138,6 @@ DEFAULTS: dict[str, Any] = {
     "worker.terminal_grace_s": 120,
     "worker.max_turns": None,
     "worker.env_passthrough": [],
-    "worker.extra_mcp_config": None,
     "web.enabled": True,
     "web.port": 9129,
     "web.jira_base_url": None,
@@ -331,6 +333,9 @@ def _ev(
     return cur.lastrowid
 
 
+event = _ev
+
+
 def events_since(
     conn: sqlite3.Connection,
     after: int,
@@ -348,7 +353,7 @@ def events_since(
         sql += f" AND e.kind IN ({','.join('?' * len(kinds))})"
         args += kinds
     if board:
-        sql += " AND e.board = ?"
+        sql += " AND (e.board = ? OR e.board IS NULL)"
         args.append(board)
     rows = conn.execute(sql + " ORDER BY e.id LIMIT ?", [*args, limit]).fetchall()
     return [dict(r) for r in rows]
@@ -514,6 +519,25 @@ def _claude_dirs(conn: sqlite3.Connection, board: Row | None = None) -> tuple[Pa
     if board is not None:
         found.append(board["claude_config_dir"])
     return tuple(Path(p) for p in found if p)
+
+
+claude_dirs = _claude_dirs
+
+
+def effective_config_dir(conn: sqlite3.Connection, board: Row) -> str:
+    """STO-08: the board's directory, else the global one, else Claude's own default."""
+    found = board["claude_config_dir"] or cfg(conn, "claude.config_dir")
+    return str(found or os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def account_get(conn: sqlite3.Connection, config_dir: str) -> dict[str, Any]:
+    """`hard_until`, `soft_until`, `last_rate_limit`, `auth_paused` of one Claude login (STO-08)."""
+    return state_get(conn, f"account:{config_dir}") or {}
+
+
+def account_set(conn: sqlite3.Connection, config_dir: str, **fields: Any) -> None:
+    """Merge `fields` into the account's state, inside the caller's transaction."""
+    state_put(conn, f"account:{config_dir}", {**account_get(conn, config_dir), **fields})
 
 
 def _columns(conn: sqlite3.Connection, fields: dict[str, Any], board: Row) -> dict[str, Any]:
@@ -1176,7 +1200,8 @@ def claim(
                 cur.lastrowid,
             )
             return cur.lastrowid
-    except (sqlite3.IntegrityError, Refused):
+    except (sqlite3.IntegrityError, Refused) as e:
+        log.warning("card %s not claimed: %s", task_id, e)
         return None
 
 
@@ -1195,11 +1220,13 @@ def end_run(
     retry_after: int | None = None,
     error: str | None = None,
     summary: str | None = None,
+    orphan_ok: bool = False,
 ) -> bool:
     """RUN-13: the only code that ends a run. Runs inside the caller's BEGIN IMMEDIATE.
 
     `card_to` is a status, or "retry" for the failure rule of RUN-12 (review for a review run,
-    ready otherwise). Returns False, changing nothing, when the run had already ended.
+    ready otherwise). Returns False, changing nothing, when the run had already ended. A card that
+    is not running although its run was refuses the end, unless `orphan_ok`: then only the run ends.
     """
     ts = now()
     run_set = {"status": "ended", "outcome": outcome, "ended_at": ts, **(run_fields or {})}
@@ -1226,7 +1253,7 @@ def end_run(
         "updated_at = ?, version = version + 1 WHERE id = ? AND status = 'running'",
         [*({**fields, "status": card_to}).values(), ts, t["id"]],
     )
-    if cas.rowcount != 1:
+    if cas.rowcount != 1 and not orphan_ok:
         raise Refused(
             f"card {t['id']} is not running although run {run_id} was; run: kanban doctor --fix"
         )
@@ -1238,9 +1265,49 @@ def end_run(
         {"run_id": run_id, "outcome": outcome, **(payload or {})},
         run_id,
     )
-    for kind, extra in events:
+    for kind, extra in events if cas.rowcount == 1 else ():
         _ev(conn, t, kind, actor, extra, run_id)
     return True
+
+
+def record_result(
+    conn: sqlite3.Connection, run: Row, exit_code: int | None, res: dict[str, Any]
+) -> None:
+    """RUN-15: Claude's exit and result facts. A resumed session reports its whole cost, so
+    `cost_usd` is the rise over the session's previous total. Runs inside the caller's BEGIN IMMEDIATE."""
+    total = res.get("total_cost_usd")
+    prev = conn.execute(
+        "SELECT session_cost_usd FROM task_runs WHERE session_id = ? AND id < ? "
+        "AND session_cost_usd IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (run["session_id"], run["id"]),
+    ).fetchone()
+    floor = prev[0] if prev else 0.0
+    conn.execute(
+        "UPDATE task_runs SET claude_exit_code = ?, exit_code = ?, subtype = ?, is_error = ?, "
+        "api_error_status = ?, num_turns = ?, session_cost_usd = ?, cost_usd = ? WHERE id = ?",
+        (
+            exit_code, exit_code, res.get("subtype"),
+            None if "is_error" not in res else int(bool(res["is_error"])),
+            res.get("api_error_status"), res.get("num_turns"), total,
+            None if total is None else (total - floor if total >= floor else total),
+            run["id"],
+        ),
+    )  # fmt: skip
+
+
+def infra_streak(conn: sqlite3.Connection, task_id: str, before_run: int, cap: int) -> int:
+    """How many of the card's latest runs before this one failed to provision for want of the
+    machine (network, credentials, a lock), unbroken by any other outcome; counted up to `cap`."""
+    streak = 0
+    for (infra,) in conn.execute(
+        "SELECT outcome = 'provision_failed' AND json_extract(metadata, '$.infrastructure') "
+        "FROM task_runs WHERE task_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+        (task_id, before_run, cap),
+    ):
+        if not infra:
+            break
+        streak += 1
+    return streak
 
 
 def _retry_rule(
@@ -1258,9 +1325,10 @@ def _retry_rule(
     retry_status = "review" if run["kind"] == "review" else "ready"
     events: list[tuple[str, dict[str, Any]]] = []
     count = outcome in COUNTED_OUTCOMES if counted is None else counted
-    if outcome == "crashed":
+    if outcome == "crashed" or (outcome == "interrupted" and run["runner_pid"] is None):
         recent = conn.execute(
-            "SELECT COUNT(*) FROM task_runs WHERE outcome = 'crashed' AND ended_at >= ?",
+            "SELECT COUNT(*) FROM task_runs WHERE ended_at >= ? AND "
+            "(outcome = 'crashed' OR (outcome = 'interrupted' AND runner_pid IS NULL))",
             (ts - SYSTEMIC_WINDOW_S,),
         ).fetchone()[0]
         if recent >= SYSTEMIC_CRASH_COUNT and state_get(conn, "dispatch_paused") is None:

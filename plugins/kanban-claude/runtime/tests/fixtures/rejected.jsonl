@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-x","permissionMode":"auto","claude_code_version":"2.1.295","plugins":[{"name":"kanban-claude"}]}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1900000000,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":1.0,"resetsAt":1900000000},"seven_day":{"utilization":0.31,"resetsAt":1900500000}}}}
+{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"num_turns":1,"result":"You've hit your session limit · resets 3pm","total_cost_usd":0}

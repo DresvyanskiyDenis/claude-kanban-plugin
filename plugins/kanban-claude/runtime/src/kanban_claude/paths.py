@@ -1,5 +1,6 @@
 """Directories and modes (spec 5.5, SEC-06)."""
 
+import contextlib
 import os
 from pathlib import Path
 from typing import NamedTuple
@@ -25,3 +26,18 @@ def ensure_dir(path: Path) -> Path:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.chmod(0o700)
     return path
+
+
+def run_files(board: str, task: str, n: int) -> tuple[Path, Path]:
+    """The runner log and the raw stream sidecar of run `n` (RUN-18); derived, never read back."""
+    home = dirs().home
+    return (
+        home / "runs" / board / task / f"run-{n}.log",
+        home / "streams" / board / task / f"run-{n}.jsonl",
+    )
+
+
+def nudge() -> None:
+    """Wake the dispatcher's tick early (DSP-01); a failure only costs one tick interval."""
+    with contextlib.suppress(OSError):
+        (dirs().home / "nudge").touch()

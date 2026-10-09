@@ -271,6 +271,22 @@ def test_l4_watch_replays_from_an_event_id(
     assert json.loads(lines[0])["schema"] == 1
 
 
+def test_l4_watch_shows_the_events_of_the_daemon_and_of_housekeeping(
+    kb: Kb, workdirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_BOARD", "alpha")
+    a = json.loads(kb("create", "A", "--body", "b", "--assignee", "smith", "--json")[1])["id"]
+    conn = store.connect()
+    with store.tx(conn):
+        t = store.get_task(conn, a)
+        store.event(conn, t, "repaired", "dispatcher", {"reason": "running without a run"})
+        store.event(conn, t, "worktree_kept", "housekeeping", {"state": "kept_dirty"})
+        store.event(conn, None, "account_resumed", "dispatcher", {"config_dir": "x"})
+    conn.close()
+    out = kb("watch", "--since-start")[1]
+    assert all(kind in out for kind in ("repaired", "worktree_kept", "account_resumed"))
+
+
 def test_l4_watch_follow_exits_0_on_sigterm(workdirs: tuple[Path, Path], kb: Kb) -> None:
     assert kb("create", "A", "--board", "alpha", "--body", "b", "--assignee", "smith")[0] == 0
     p = subprocess.Popen(
