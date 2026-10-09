@@ -459,9 +459,7 @@ def evaluate(c: Ctx) -> list[tuple[int, str, Result]]:
             r = fn(c)
         except Error as e:
             r = fail(str(e), fix)
-        except (
-            Exception
-        ) as e:  # a check that crashes is a check that failed, not a doctor that died
+        except Exception as e:  # a check that crashes failed; it must not kill the doctor
             r = fail(f"{type(e).__name__}: {e}", fix)
         out.append((n, name, r))
     return out
@@ -470,13 +468,12 @@ def evaluate(c: Ctx) -> list[tuple[int, str, Result]]:
 def restore_agent(c: Ctx) -> str:
     d = dirs()
     plist = launchd.plist_path()
-    if not plist.exists():
-        if not c.stamp.get("env"):
-            raise Error(f"the plist is gone and installed.json cannot rebuild it; run {SETUP}")
-        plist = launchd.install_plist(
-            launchd.render(install.kanban_entry(), c.stamp["env"], d.home, d.work)
-        )
-    launchd.bootstrap(plist)
+    if plist.exists():
+        launchd.bootstrap(plist)
+    elif c.stamp.get("env"):
+        plist = launchd.load(install.kanban_entry(), c.stamp["env"], d.home, d.work)
+    else:
+        raise Error(f"the plist is gone and installed.json cannot rebuild it; run {SETUP}")
     with contextlib.suppress(Error):
         install.wait_for_board(port(c), d.home)
     return f"loaded {launchd.LABEL} from {plist}"

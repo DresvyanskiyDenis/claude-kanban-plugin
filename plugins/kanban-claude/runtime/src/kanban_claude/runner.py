@@ -39,7 +39,7 @@ Row = sqlite3.Row
 
 
 def session_id(board: str, task: str, role: str) -> str:
-    """RUN-04. The `hermes-kanban:` prefix is kept so imported cards resume their sessions."""
+    """RUN-04. The `hermes-kanban:` prefix is kept so cards imported earlier still resume their sessions."""
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"hermes-kanban:{board}/{task}/{role}"))
 
 

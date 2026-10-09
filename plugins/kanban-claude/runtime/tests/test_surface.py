@@ -1,7 +1,7 @@
 """TST-A: the shipped surface (manifests, agents, skills, hooks, MCP config) keeps its contracts.
 
 Frontmatter is parsed by hand: every value sits on one line, so no YAML library is needed.
-A3 covers the files the surface owns; the setup skill and the runtime name Hermes on purpose.
+A3 covers the files the surface owns; the runtime names Hermes on purpose.
 """
 
 import argparse
@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 import kanban_claude
-from kanban_claude import cli, importer
+from kanban_claude import cli
 
 PLUGIN = Path(__file__).resolve().parents[2]
 REPO = PLUGIN.parents[1]
@@ -196,8 +196,7 @@ def test_cli_reference_documents_exactly_the_real_verbs():
     text = (PLUGIN / "skills/kanban/references/cli.md").read_text()
     mentioned = set(re.findall(r"`kanban (?:--board \S+ )?([a-z][a-z-]*)", text))
     assert mentioned <= kanban_verbs(), mentioned - kanban_verbs()
-    internal = {"run", importer.VERB}
-    assert kanban_verbs() - internal <= mentioned, kanban_verbs() - internal - mentioned
+    assert kanban_verbs() - {"run"} <= mentioned, kanban_verbs() - {"run"} - mentioned
 
 
 def test_no_hermes_in_the_shipped_surface():

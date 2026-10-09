@@ -479,15 +479,10 @@ def run_log(r: Req, run_id: str) -> Any:
     ).fetchone()
     if run is None or not run["log_path"]:
         raise NotFound(f"run {run_id} has no log yet")
-    path = Path(os.path.realpath(run["log_path"]))
-    if r.srv.dirs.home.resolve() / "runs" not in path.parents:
-        raise Refused("that log is outside the runs directory")
+    path = views.log_path(run["log_path"], r.srv.dirs.home, ("runs",))
     tail = min(max(qint(r.query, "tail", LOG_TAIL) or LOG_TAIL, 1), 1000)
     try:
-        with path.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - views.LOG_BYTES))
-            lines = f.read().decode(errors="replace").splitlines()
+        lines = views.log_lines(path)
     except OSError:
         raise NotFound("the log file is gone") from None
     return {"status": run["status"], "lines": [views.clean(x) for x in lines[-tail:]]}

@@ -1,6 +1,8 @@
 """Directories and modes (spec 5.5, SEC-06)."""
 
 import contextlib
+import logging
+import logging.handlers
 import os
 from pathlib import Path
 from typing import NamedTuple
@@ -26,6 +28,16 @@ def ensure_dir(path: Path) -> Path:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.chmod(0o700)
     return path
+
+
+def add_file_log(logger: logging.Logger, path: Path) -> logging.Handler:
+    """Log `logger` at INFO to a rotating file (10 MiB, 3 backups); its directory is made 0700."""
+    ensure_dir(path.parent)
+    handler = logging.handlers.RotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=3)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    return handler
 
 
 def write_private(path: Path, content: bytes) -> None:

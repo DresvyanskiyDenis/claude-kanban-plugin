@@ -1,7 +1,6 @@
 """The `kanban` command (CLI-01..11): argument parsing, mode gating and output."""
 
 import argparse
-import fcntl
 import json
 import os
 import signal
@@ -14,10 +13,10 @@ from typing import Any
 
 from . import (
     __version__,
+    daemon,
     dispatcher,
     doctor,
     gitops,
-    importer,
     install,
     runner,
     store,
@@ -38,7 +37,7 @@ NUDGE = NEEDS_DAEMON | {
     "stop",
 }  # fmt: skip
 LONG_RUNNING: dict[str, Callable[[argparse.Namespace], int]] = {
-    "daemon": lambda a: dispatcher.serve(),
+    "daemon": lambda a: daemon.serve(),
     "run": lambda a: runner.run(a.run_id),
 }
 OWNER: dict[str, Handler] = {}
@@ -50,6 +49,15 @@ def owner_verb(name: str) -> Callable[[Handler], Handler]:
         return fn
 
     return register
+
+
+def plain(fn: Callable[[argparse.Namespace, sqlite3.Connection], dict[str, Any]]) -> Handler:
+    """A verb whose store result is its whole output."""
+    return lambda a, conn: (fn(a, conn), None)
+
+
+def _reasoned(fn: Callable[..., dict[str, Any]]) -> Handler:
+    return plain(lambda a, conn: fn(conn, a.id, a.reason))
 
 
 # --- parser ---------------------------------------------------------------------------------
@@ -130,14 +138,10 @@ def build() -> argparse.ArgumentParser:
     add("resume")
     add("config", "action", ("key", "?"), ("value", "?"))
     add("migrate")
-    add(
-        importer.VERB, "--from", ("--all", "flag"), ("--dry-run", "flag"), ("--force", "flag"),
-        ("--yes", "flag"), "--default-workdir",
-    )  # fmt: skip
     add("board", ("--revoke", "flag"), ("--no-open", "flag"))
     add(
         "setup", "--claude-bin", "--claude-config-dir", ("--port", int), ("--no-daemon", "flag"),
-        ("--import-hermes", "flag"), ("--yes", "flag"),
+        ("--yes", "flag"),
     )  # fmt: skip
     add("doctor", ("--probe", "flag"), ("--fix", "flag"))
     add("uninstall", ("--purge", "flag"), ("--force", "flag"), ("--yes", "flag"))
@@ -205,21 +209,6 @@ def need_board(conn: sqlite3.Connection, a: argparse.Namespace) -> str:
             "no board: pass --board SLUG, set KANBAN_BOARD, or run inside a board's default workdir"
         )
     return board
-
-
-def daemon_running() -> bool:
-    """The daemon holds `daemon.lock` exclusively; a shared probe never blocks another probe."""
-    try:
-        fd = os.open(dirs().home / "daemon.lock", os.O_RDONLY)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-    except OSError:
-        return True
-    finally:
-        os.close(fd)
-    return False
 
 
 def stop_on_sigterm() -> None:
@@ -291,11 +280,6 @@ def v_create(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
     return got, None
 
 
-@owner_verb("specify")
-def v_specify(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    return store.specify(conn, a.id, fields(a)), None
-
-
 @owner_verb("list")
 def v_list(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
     board = need_board(conn, a)
@@ -311,57 +295,24 @@ def v_list(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, A
     return {"board": board, "cards": cards}, "\n".join(lines) or "(no cards)"
 
 
-@owner_verb("edit")
-def v_edit(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    return store.edit(conn, a.id, fields(a), allow_empty_body=a.allow_empty_body), None
-
-
-@owner_verb("assign")
-def v_assign(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    return store.assign(conn, a.id, a.role), None
-
-
-@owner_verb("reassign")
-def v_reassign(
-    a: argparse.Namespace, conn: sqlite3.Connection
-) -> tuple[dict[str, Any], str | None]:
-    return store.assign(conn, a.id, a.role, reclaim=a.reclaim), None
-
-
-@owner_verb("promote")
-def v_promote(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    return store.promote(conn, a.id, a.reason, ignore_merge=a.ignore_merge), None
-
-
-def _reasoned(fn: Callable[..., dict[str, Any]]) -> Handler:
-    def handler(
-        a: argparse.Namespace, conn: sqlite3.Connection
-    ) -> tuple[dict[str, Any], str | None]:
-        return fn(conn, a.id, a.reason), None
-
-    return handler
-
-
+OWNER["specify"] = plain(lambda a, conn: store.specify(conn, a.id, fields(a)))
+OWNER["edit"] = plain(
+    lambda a, conn: store.edit(conn, a.id, fields(a), allow_empty_body=a.allow_empty_body)
+)
+OWNER["assign"] = plain(lambda a, conn: store.assign(conn, a.id, a.role))
+OWNER["reassign"] = plain(lambda a, conn: store.assign(conn, a.id, a.role, reclaim=a.reclaim))
+OWNER["promote"] = plain(
+    lambda a, conn: store.promote(conn, a.id, a.reason, ignore_merge=a.ignore_merge)
+)
 OWNER["hold"] = _reasoned(store.hold)
 OWNER["unblock"] = _reasoned(store.unblock)
 OWNER["reopen-review"] = _reasoned(store.reopen_review)
 OWNER["reopen"] = _reasoned(store.reopen)
 OWNER["mark-done"] = _reasoned(store.mark_done)
-
-
-@owner_verb("link")
-def v_link(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    return store.link(conn, a.parent, a.child), None
-
-
-@owner_verb("unlink")
-def v_unlink(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    return store.unlink(conn, a.parent, a.child), None
-
-
-@owner_verb("stop")
-def v_stop(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    return store.stop(conn, a.id), None
+OWNER["link"] = plain(lambda a, conn: store.link(conn, a.parent, a.child))
+OWNER["unlink"] = plain(lambda a, conn: store.unlink(conn, a.parent, a.child))
+OWNER["stop"] = plain(lambda a, conn: store.stop(conn, a.id))
+OWNER["merge-retry"] = plain(lambda a, conn: store.merge_retry(conn, a.id))
 
 
 @owner_verb("archive")
@@ -369,13 +320,6 @@ def v_archive(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str
     if a.rm and not a.yes:
         raise Usage("archive --rm deletes the card and its history; add --yes to confirm")
     return store.archive(conn, a.id, rm=a.rm), None
-
-
-@owner_verb("merge-retry")
-def v_merge_retry(
-    a: argparse.Namespace, conn: sqlite3.Connection
-) -> tuple[dict[str, Any], str | None]:
-    return store.merge_retry(conn, a.id), None
 
 
 @owner_verb("grant")
@@ -446,21 +390,14 @@ def run_log(conn: sqlite3.Connection, task_id: str, n: int | None) -> tuple[Path
         raise NotFound(f"card {task_id} has no run{f' {n}' if n else ''}")
     if not row["log_path"]:
         raise NotFound("that run has no log yet")
-    path = Path(os.path.realpath(row["log_path"]))
-    roots = [dirs().home.resolve() / sub for sub in ("runs", "streams")]
-    if not any(root in path.parents for root in roots):
-        raise Refused(f"log path {row['log_path']!r} is outside {' and '.join(map(str, roots))}")
-    return path, row["status"]
+    return views.log_path(row["log_path"], dirs().home, ("runs", "streams")), row["status"]
 
 
 @owner_verb("log")
 def v_log(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
     path, _ = run_log(conn, a.id, a.run)
     try:
-        with path.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - views.LOG_BYTES))
-            lines = f.read().decode(errors="replace").splitlines()
+        lines = views.log_lines(path)
     except OSError as e:
         raise Error(f"cannot read {path}: {e.strerror}") from e
     return {"id": a.id, "path": str(path)}, "\n".join(lines[-a.tail :] if a.tail else lines)
@@ -565,23 +502,12 @@ def v_config(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
     raise Usage("usage: kanban config list | get KEY | set KEY VALUE")
 
 
-OWNER[importer.VERB] = importer.cli
 OWNER["board"] = web.cli
 
 
 def v_setup(a: argparse.Namespace) -> int:
-    """INS-05, then the one-time Hermes import if asked for; setup owns its store connection."""
+    """INS-05; setup owns its store connection."""
     data, text = install.setup(a)
-    if a.import_hermes and not data.get("locked"):
-        every = {**vars(a), "from": None, "all": True, "dry_run": False, "force": False}
-        conn = store.connect()
-        try:
-            imported, summary = importer.cli(
-                argparse.Namespace(**every, default_workdir=None), conn
-            )
-        finally:
-            conn.close()
-        data, text = {**data, "import": imported}, f"{text}\n{summary}"
     present(a, data, text)
     return 0
 
@@ -686,7 +612,7 @@ def owner(a: argparse.Namespace) -> int:
         nudge()
     if text != "":
         present(a, data, text)
-    if a.verb in NEEDS_DAEMON and not daemon_running():
+    if a.verb in NEEDS_DAEMON and not daemon.running():
         print(
             "kanban: daemon not running — cards will not dispatch; run: kanban doctor",
             file=sys.stderr,

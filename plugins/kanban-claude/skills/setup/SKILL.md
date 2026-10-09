@@ -7,7 +7,7 @@ disable-model-invocation: true
 # kanban-claude setup
 
 Run exactly this and nothing else, passing along any flags the user gave (`--port N`, `--no-daemon`,
-`--import-hermes`, `--yes`, `--claude-bin PATH`, `--claude-config-dir DIR`):
+`--yes`, `--claude-bin PATH`, `--claude-config-dir DIR`):
 
 ```sh
 sh "${CLAUDE_PLUGIN_ROOT}/skills/setup/scripts/bootstrap.sh"

@@ -97,10 +97,8 @@ function ask(title, { reason, required, confirm } = {}) {
 
 // --- board: lanes and strips -------------------------------------------------------------
 
-const laneNames = () => (S.archived ? [...STATUSES, "archived"] : STATUSES);
-
 function buildLanes() {
-  const names = laneNames();
+  const names = S.archived ? [...STATUSES, "archived"] : STATUSES;
   $("#lanes").style.setProperty("--cols", names.length);
   $("#lanes").replaceChildren(...names.map((s) =>
     el("section", { class: "lane", "data-s": s, "aria-labelledby": `h-${s}` },

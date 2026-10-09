@@ -78,7 +78,7 @@ CREATE TABLE task_runs (
   claude_version TEXT, permission_mode TEXT, config_dir TEXT, max_runtime_seconds INTEGER,
   started_at INTEGER NOT NULL, ended_at INTEGER, last_output_at INTEGER, num_turns INTEGER,
   cost_usd REAL, session_cost_usd REAL, subtype TEXT, is_error INTEGER, api_error_status INTEGER,
-  terminal_verb TEXT, stop_requested INTEGER NOT NULL DEFAULT 0, stream_path TEXT, log_path TEXT);
+  terminal_verb TEXT, stream_path TEXT, log_path TEXT);
 CREATE UNIQUE INDEX one_active_run ON task_runs(task_id) WHERE status = 'running';
 CREATE INDEX idx_runs_task ON task_runs(task_id, n);
 CREATE TABLE task_attachments (
@@ -97,6 +97,7 @@ MIGRATIONS: list[str] = [SCHEMA]
 BACKUPS_KEPT = 5
 
 STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "archived")
+NOT_RUNNING = tuple(s for s in STATUSES if s != "running")
 WORKER_BLOCK_KINDS = ("needs_input", "capability", "transient")
 BUILDERS = ("smith", "designer")
 APPROVED_RE = re.compile(r"WARDEN: APPROVED PR #(\d+) @\s*([0-9a-f]{7,40})\b")
@@ -138,7 +139,6 @@ DEFAULTS: dict[str, Any] = {
     "worker.terminal_grace_s": 120,
     "worker.max_turns": None,
     "worker.env_passthrough": [],
-    "web.enabled": True,
     "web.port": 9129,
     "web.jira_base_url": None,
     "retention.stream_days": 30,
@@ -300,7 +300,7 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         raise Refused("budget.ceiling must be positive")
     with tx(conn):
         config_put(conn, key, value)
-        _ev(conn, None, "config_changed", actor, {"key": key, "value": value})
+        event(conn, None, "config_changed", actor, {"key": key, "value": value})
 
 
 def config_put(conn: sqlite3.Connection, key: str, value: Any) -> None:
@@ -328,7 +328,7 @@ def state_put(conn: sqlite3.Connection, key: str, value: Any) -> None:
 # --- events ---------------------------------------------------------------------------------
 
 
-def _ev(
+def event(
     conn: sqlite3.Connection,
     t: Row | dict[str, Any] | None,
     kind: str,
@@ -351,9 +351,6 @@ def _ev(
     )
     assert cur.lastrowid is not None
     return cur.lastrowid
-
-
-event = _ev
 
 
 def events_since(
@@ -415,10 +412,6 @@ def parents_satisfied(
     return _all_done(conn, [r[0] for r in conn.execute(q, (task_id,))], ignore_merge)
 
 
-def _stale(task_id: str) -> Stale:
-    return Stale(f"card {task_id} changed elsewhere since it was read; re-read it and retry")
-
-
 def _cas(
     conn: sqlite3.Connection,
     task_id: str,
@@ -441,7 +434,7 @@ def _cas(
             "SELECT status, version FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if now_row and version is not None and now_row["version"] != version:
-            raise _stale(task_id)
+            raise Stale(f"card {task_id} changed elsewhere since it was read; re-read it and retry")
         raise Refused(
             f"card {task_id} is {now_row['status'] if now_row else 'gone'}; "
             f"this needs it in {' or '.join(expected)}"
@@ -454,7 +447,7 @@ def _comment(conn: sqlite3.Connection, t: Row, author: str, body: str, actor: st
         (t["id"], author, body, now()),
     )
     assert cur.lastrowid is not None
-    _ev(conn, t, "commented", actor, {"comment_id": cur.lastrowid, "author": author})
+    event(conn, t, "commented", actor, {"comment_id": cur.lastrowid, "author": author})
     return cur.lastrowid
 
 
@@ -486,7 +479,7 @@ def board_create(
             "VALUES (?, ?, ?, ?, ?)",
             (slug, name or slug, workdir, claude_config_dir, now()),
         )
-        _ev(conn, {"board": slug, "id": None}, "board_created", actor, {"slug": slug})
+        event(conn, {"board": slug, "id": None}, "board_created", actor, {"slug": slug})
     return {"slug": slug}
 
 
@@ -512,7 +505,7 @@ def board_edit(
         get_board(conn, slug)
         sets = ", ".join(f"{k} = ?" for k in fields)
         conn.execute(f"UPDATE boards SET {sets} WHERE slug = ?", [*fields.values(), slug])
-        _ev(conn, {"board": slug, "id": None}, "board_edited", actor, {"fields": sorted(fields)})
+        event(conn, {"board": slug, "id": None}, "board_edited", actor, {"fields": sorted(fields)})
     return {"slug": slug}
 
 
@@ -521,7 +514,7 @@ def board_archive(conn: sqlite3.Connection, slug: str, *, actor: str = OWNER) ->
         b = get_board(conn, slug)
         if b["archived_at"] is None:
             conn.execute("UPDATE boards SET archived_at = ? WHERE slug = ?", (now(), slug))
-            _ev(conn, {"board": slug, "id": None}, "board_archived", actor, {"slug": slug})
+            event(conn, {"board": slug, "id": None}, "board_archived", actor, {"slug": slug})
     return {"slug": slug}
 
 
@@ -547,7 +540,7 @@ FIELD_COLUMNS = {
 }
 
 
-def _claude_dirs(conn: sqlite3.Connection, board: Row | None = None) -> tuple[Path, ...]:
+def claude_dirs(conn: sqlite3.Connection, board: Row | None = None) -> tuple[Path, ...]:
     found = [
         cfg(conn, "claude.config_dir"),
         os.environ.get("CLAUDE_CONFIG_DIR"),
@@ -556,9 +549,6 @@ def _claude_dirs(conn: sqlite3.Connection, board: Row | None = None) -> tuple[Pa
     if board is not None:
         found.append(board["claude_config_dir"])
     return tuple(Path(p) for p in found if p)
-
-
-claude_dirs = _claude_dirs
 
 
 def effective_config_dir(conn: sqlite3.Connection, board: Row) -> str:
@@ -586,7 +576,7 @@ def _columns(conn: sqlite3.Connection, fields: dict[str, Any], board: Row) -> di
             kind, path = validate.parse_workspace(v)
             out["workspace_kind"] = kind
             out["workspace_path"] = validate.workspace(
-                kind, path, claude_dirs=_claude_dirs(conn, board), strict=False
+                kind, path, claude_dirs=claude_dirs(conn, board), strict=False
             )
             continue
         col = FIELD_COLUMNS[key]
@@ -630,7 +620,7 @@ def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> No
     kind = t["workspace_kind"]
     if kind == "scratch":
         return
-    validate.workspace(kind, t["workspace_path"], claude_dirs=_claude_dirs(conn, board))
+    validate.workspace(kind, t["workspace_path"], claude_dirs=claude_dirs(conn, board))
     if kind == "worktree":
         if not t["branch_name"]:
             raise Refused("a worktree card needs a branch; pass --branch feature/<slug>")
@@ -717,7 +707,7 @@ def create(
         )
         for p in parents:
             conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (p, tid))
-        _ev(
+        event(
             conn,
             row,
             "created",
@@ -764,7 +754,7 @@ def specify(
     with tx(conn):
         status = "ready" if parents_satisfied(conn, task_id) else "todo"
         _cas(conn, task_id, ["triage"], version=expect_version, **cols, status=status)
-        _ev(conn, t, "specified", actor, {"fields": sorted(cols), "status": status})
+        event(conn, t, "specified", actor, {"fields": sorted(cols), "status": status})
     return {"id": task_id, "status": status}
 
 
@@ -799,15 +789,8 @@ def edit(
             conn, task_id, assignee, actor=actor, expect_version=version
         ).get("noop"):
             version += 1  # a changed role is one version bump of its own
-        sets = "".join(f"{k} = ?, " for k in cols)
-        cur = conn.execute(
-            f"UPDATE tasks SET {sets}updated_at = ?, version = version + 1 "
-            "WHERE id = ? AND version = ? AND status <> 'running'",
-            [*cols.values(), now(), task_id, version],
-        )
-        if cur.rowcount != 1:
-            raise _stale(task_id)
-        _ev(conn, t, "edited", actor, {"fields": sorted(cols), "previous": previous})
+        _cas(conn, task_id, NOT_RUNNING, version=version, **cols)
+        event(conn, t, "edited", actor, {"fields": sorted(cols), "previous": previous})
     return {"id": task_id, "fields": sorted(cols)}
 
 
@@ -838,16 +821,13 @@ def assign(
             end_run(
                 conn, run["id"], "terminated", "retry", actor=actor, event_kind="assigned",
                 payload={**payload, "reclaim": True}, counted=False,
-                card_fields={"assignee": role, **reset}, run_fields={"stop_requested": 1},
+                card_fields={"assignee": role, **reset},
             )  # fmt: skip
             return {"id": task_id, "assignee": role, "run_id": run["id"]}
         if not changed:
             return {"id": task_id, "assignee": role, "noop": True}
-        _cas(
-            conn, task_id, [s for s in STATUSES if s != "running"], version=expect_version,
-            assignee=role, **reset,
-        )  # fmt: skip
-        _ev(conn, t, "assigned", actor, payload)
+        _cas(conn, task_id, NOT_RUNNING, version=expect_version, assignee=role, **reset)
+        event(conn, t, "assigned", actor, payload)
     return {"id": task_id, "assignee": role}
 
 
@@ -869,7 +849,7 @@ def promote(
                 "or for a stuck merge pass --ignore-merge"
             )
         _cas(conn, task_id, ["todo"], version=expect_version, status="ready", retry_after=None)
-        _ev(
+        event(
             conn,
             t,
             "promoted_manual",
@@ -886,7 +866,7 @@ def promote_auto(conn: sqlite3.Connection, task_id: str, *, actor: str = "dispat
         if t["status"] != "todo" or not parents_satisfied(conn, task_id):
             return False
         _cas(conn, task_id, ["todo"], status="ready")
-        _ev(conn, t, "promoted", actor)
+        event(conn, t, "promoted", actor)
     return True
 
 
@@ -902,11 +882,11 @@ def hold(
     with tx(conn):
         t = get_task(conn, task_id)
         _cas(conn, task_id, ["todo", "ready", "blocked"], version=expect_version, status="triage")
-        _ev(conn, t, "held", actor, {"reason": reason, "from": t["status"]})
+        event(conn, t, "held", actor, {"reason": reason, "from": t["status"]})
     return {"id": task_id, "status": "triage"}
 
 
-def _last_run_kind(conn: sqlite3.Connection, task_id: str) -> str | None:
+def last_run_kind(conn: sqlite3.Connection, task_id: str) -> str | None:
     row = conn.execute(
         "SELECT kind FROM task_runs WHERE task_id = ? ORDER BY n DESC LIMIT 1", (task_id,)
     ).fetchone()
@@ -924,7 +904,7 @@ def unblock(
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         t = get_task(conn, task_id)
-        if _last_run_kind(conn, task_id) == "review":
+        if last_run_kind(conn, task_id) == "review":
             target = "review"
         else:
             target = "ready" if parents_satisfied(conn, task_id) else "todo"
@@ -934,7 +914,7 @@ def unblock(
             retry_after=None,
         )  # fmt: skip
         _comment(conn, t, "owner", f"UNBLOCK: {reason}", actor)
-        _ev(conn, t, "unblocked", actor, {"reason": reason, "status": target})
+        event(conn, t, "unblocked", actor, {"reason": reason, "status": target})
     return {"id": task_id, "status": target}
 
 
@@ -969,7 +949,7 @@ def reopen_review(
             conn, task_id, expected, version=expect_version, status=target,
             assignee=t["implementer"], **merge_reset,
         )  # fmt: skip
-        _ev(conn, t, "review_reopened", actor, {"reason": reason, "status": target})
+        event(conn, t, "review_reopened", actor, {"reason": reason, "status": target})
     return {"id": task_id, "status": target}
 
 
@@ -989,7 +969,7 @@ def reopen(
             merge_state=None, merge_attempts=0, merge_next_at=None, merged_at=None,
             retry_after=None, assignee=t["implementer"] or t["assignee"],
         )  # fmt: skip
-        _ev(conn, t, "reopened", actor, {"reason": reason})
+        event(conn, t, "reopened", actor, {"reason": reason})
         children = conn.execute(
             "SELECT c.* FROM task_links l JOIN tasks c ON c.id = l.child_id WHERE l.parent_id = ?",
             (task_id,),
@@ -997,7 +977,7 @@ def reopen(
         for c in children:
             if c["status"] == "ready":
                 _cas(conn, c["id"], ["ready"], status="todo")
-                _ev(conn, c, "dependency_wait", actor, {"parent": task_id})
+                event(conn, c, "dependency_wait", actor, {"parent": task_id})
             elif c["status"] in ("running", "review", "done"):
                 _comment(conn, c, "kanban", f"parent {task_id} was reopened: {reason}", actor)
     return {"id": task_id, "status": "ready"}
@@ -1018,7 +998,7 @@ def mark_done(
             conn, task_id, ["review", "blocked"], version=expect_version, status="done",
             completed_at=now(),
         )  # fmt: skip
-        _ev(conn, t, "completed_by_owner", actor, {"reason": reason, "from": t["status"]})
+        event(conn, t, "completed_by_owner", actor, {"reason": reason, "from": t["status"]})
     return {"id": task_id, "status": "done"}
 
 
@@ -1058,10 +1038,10 @@ def link(
         if _reaches(conn, child, parent):
             raise Refused(f"linking {parent} -> {child} would create a cycle")
         conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, child))
-        _ev(conn, c, "linked", actor, {"parent": parent, "child": child})
+        event(conn, c, "linked", actor, {"parent": parent, "child": child})
         if c["status"] == "ready" and not parents_satisfied(conn, child):
             _cas(conn, child, ["ready"], status="todo")
-            _ev(conn, c, "dependency_wait", actor, {"parent": parent})
+            event(conn, c, "dependency_wait", actor, {"parent": parent})
     return {"parent": parent, "child": child}
 
 
@@ -1075,10 +1055,10 @@ def unlink(
         )
         if cur.rowcount == 0:
             return {"parent": parent, "child": child, "noop": True}
-        _ev(conn, c, "unlinked", actor, {"parent": parent, "child": child})
+        event(conn, c, "unlinked", actor, {"parent": parent, "child": child})
         if c["status"] == "todo" and parents_satisfied(conn, child):
             _cas(conn, child, ["todo"], status="ready")
-            _ev(conn, c, "promoted", actor, {"reason": "unlink"})
+            event(conn, c, "promoted", actor, {"reason": "unlink"})
     return {"parent": parent, "child": child}
 
 
@@ -1094,7 +1074,6 @@ def stop(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) -> dict[
                 "block_kind": "stopped", "consecutive_failures": 0, "protocol_violations": 0,
                 "last_failure_error": None, "retry_after": None,
             },
-            run_fields={"stop_requested": 1},
         )  # fmt: skip
     return {
         "id": task_id, "status": "blocked", "run_id": run["id"],
@@ -1124,7 +1103,7 @@ def archive(
             ):  # fmt: skip
                 conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (task_id,))
             conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            _ev(
+            event(
                 conn,
                 {"board": t["board"], "id": None},
                 "deleted",
@@ -1139,7 +1118,7 @@ def archive(
                 version=expect_version,
                 status="archived",
             )
-            _ev(conn, t, "archived", actor, {"from": t["status"]})
+            event(conn, t, "archived", actor, {"from": t["status"]})
     if rm and blobs.is_dir():
         for f in blobs.iterdir():
             f.unlink()
@@ -1154,12 +1133,8 @@ def merge_retry(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) -
             raise Refused(
                 f"card {task_id} has no failed merge to retry (status {t['status']}, merge {t['merge_state']})"
             )
-        conn.execute(
-            "UPDATE tasks SET merge_state = 'pending', merge_attempts = 0, merge_next_at = ?, "
-            "updated_at = ?, version = version + 1 WHERE id = ? AND merge_state = 'failed'",
-            (now(), now(), task_id),
-        )
-        _ev(conn, t, "merge_retry", actor)
+        _cas(conn, task_id, ["done"], merge_state="pending", merge_attempts=0, merge_next_at=now())
+        event(conn, t, "merge_retry", actor)
     return {"id": task_id, "merge_state": "pending"}
 
 
@@ -1229,7 +1204,7 @@ def attach(
                 "uploaded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (task_id, clean, str(stored), content_type, len(data), uploaded_by, now()),
             )
-            _ev(
+            event(
                 conn,
                 t,
                 "attached",
@@ -1270,7 +1245,7 @@ def claim(
                 return None
             if source == "ready" and not parents_satisfied(conn, task_id):
                 _cas(conn, task_id, ["ready"], status="todo")
-                _ev(conn, t, "claim_rejected", actor, {"reason": "parents_not_done"})
+                event(conn, t, "claim_rejected", actor, {"reason": "parents_not_done"})
                 return None
             _cas(conn, task_id, [source], status="running", started_at=t["started_at"] or now())
             n = conn.execute(
@@ -1282,7 +1257,7 @@ def claim(
                 (task_id, n, t["assignee"], "review" if source == "review" else "work",
                  t["max_runtime_seconds"], config_dir, now()),
             )  # fmt: skip
-            _ev(
+            event(
                 conn,
                 t,
                 "claimed",
@@ -1348,7 +1323,7 @@ def end_run(
         raise Refused(
             f"card {t['id']} is not running although run {run_id} was; run: kanban doctor --fix"
         )
-    _ev(
+    event(
         conn,
         t,
         event_kind,
@@ -1357,7 +1332,7 @@ def end_run(
         run_id,
     )
     for kind, extra in events if cas.rowcount == 1 else ():
-        _ev(conn, t, kind, actor, extra, run_id)
+        event(conn, t, kind, actor, extra, run_id)
     return True
 
 
@@ -1427,7 +1402,7 @@ def _retry_rule(
             state_put(
                 conn, "dispatch_paused", {"reason": "systemic", "since": ts, "detail": detail}
             )
-            _ev(conn, None, "dispatch_paused", "runner", {"reason": "systemic", "detail": detail})
+            event(conn, None, "dispatch_paused", "runner", {"reason": "systemic", "detail": detail})
             count = False
     limit_card = t["max_retries"]
     if outcome == "protocol_violation":
@@ -1546,7 +1521,7 @@ def complete(
             run_fields={"terminal_verb": "complete"}, summary=summary,
         )  # fmt: skip
         for kind, payload in extra:
-            _ev(conn, t, kind, _worker(run), payload, run_id)
+            event(conn, t, kind, _worker(run), payload, run_id)
     return {"id": t["id"], "status": "done", "merge_state": merge.get("merge_state")}
 
 
@@ -1636,7 +1611,7 @@ def grant_add(
             "INSERT INTO grants(task_id, rules, approved, created_at) VALUES (?, ?, ?, ?)",
             (task_id, json.dumps(list(rules)), approved, now()),
         )
-        _ev(conn, t, "grant_added", actor, {"grant_id": cur.lastrowid, "rules": list(rules)})
+        event(conn, t, "grant_added", actor, {"grant_id": cur.lastrowid, "rules": list(rules)})
     return {"id": task_id, "grant_id": cur.lastrowid}
 
 
@@ -1648,7 +1623,7 @@ def grant_revoke(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) 
             (now(), task_id),
         )
         if cur.rowcount:
-            _ev(conn, t, "grant_revoked", actor, {"count": cur.rowcount})
+            event(conn, t, "grant_revoked", actor, {"count": cur.rowcount})
     return {"id": task_id, "revoked": cur.rowcount}
 
 
@@ -1665,14 +1640,14 @@ def grants_list(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
 def pause(conn: sqlite3.Connection, reason: str = "", *, actor: str = OWNER) -> None:
     with tx(conn):
         state_put(conn, "dispatch_paused", {"reason": "manual", "since": now(), "detail": reason})
-        _ev(conn, None, "dispatch_paused", actor, {"reason": "manual", "detail": reason})
+        event(conn, None, "dispatch_paused", actor, {"reason": "manual", "detail": reason})
 
 
 def resume(conn: sqlite3.Connection, *, actor: str = OWNER) -> bool:
     with tx(conn):
         cur = conn.execute("DELETE FROM state WHERE key = 'dispatch_paused'")
         if cur.rowcount:
-            _ev(conn, None, "dispatch_resumed", actor)
+            event(conn, None, "dispatch_resumed", actor)
     return bool(cur.rowcount)
 
 

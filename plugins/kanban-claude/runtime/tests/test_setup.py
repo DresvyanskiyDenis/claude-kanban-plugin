@@ -272,11 +272,6 @@ def test_a_board_that_never_answers_is_reported_with_the_daemon_log(kb: Kb, boar
     assert code == 1 and f"127.0.0.1:{free}" in err and "daemon.log" in err
 
 
-def test_setup_hands_over_to_the_hermes_import_on_request(setup: Setup) -> None:
-    code, _, err = setup("--import-hermes")
-    assert code == 3 and "is not a directory" in err
-
-
 # --- upgrade (INS-09) -----------------------------------------------------------------------
 
 

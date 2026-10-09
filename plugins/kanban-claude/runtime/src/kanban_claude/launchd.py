@@ -121,6 +121,14 @@ def bootout() -> None:
         time.sleep(0.2)
 
 
+def load(entry: str, env: Mapping[str, str], home: Path, work: Path) -> Path:
+    """Write the plist for `env` and load it, replacing a loaded agent; returns the plist."""
+    plist = install_plist(render(entry, env, home, work))
+    bootout()
+    bootstrap(plist)
+    return plist
+
+
 def kickstart() -> None:
     checked("kickstart", "-k", target())
 

@@ -98,12 +98,8 @@ def test_r1_mcp_config_only_for_a_role_with_a_file_and_turns_and_resume(
     assert flag(smith, "--max-budget-usd") == "1.5"
 
 
-def test_r1_review_runs_always_use_the_review_model(conn: Any, board: str, claim: Claim) -> None:
-    tid = str(
-        store.create(conn, board, "r", body="b", assignee="smith", model="haiku", effort="low")[
-            "id"
-        ]
-    )
+def test_r1_review_runs_always_use_the_review_model(conn: Any, card: Card, claim: Claim) -> None:
+    tid = card("r", model="haiku", effort="low")
     run = claim(tid)
     t = store.get_task(conn, tid)
     row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
@@ -232,9 +228,8 @@ def test_the_ps_fork_never_runs_inside_the_write_transaction(
         return real(pid)
 
     monkeypatch.setattr(runner, "start_time", watched)
-    r = runner.Runner(conn, claim(card()))
-    r.config_dir = r.row()["config_dir"]
-    assert r.register(r.row(), r.task()) and r.launch(r.task(), env) == 0
+    r = registered(conn, claim(card()))
+    assert r.launch(r.task(), env) == 0
     assert inside == [False, False]
 
 
@@ -274,6 +269,20 @@ def test_the_log_says_when_the_worker_already_ended_the_run(
     assert "run already ended" in p.stdout and "classified=" not in p.stdout
 
 
+def start_runner(conn: Any, run: int) -> subprocess.Popen[str]:
+    """`kanban run` as a child process, returned once its claude has a pid."""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "kanban_claude", "run", str(run)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )  # fmt: skip
+    end = time.monotonic() + 30
+    while time.monotonic() < end:
+        if conn.execute("SELECT claude_pid FROM task_runs WHERE id = ?", (run,)).fetchone()[0]:
+            break
+        time.sleep(0.1)
+    return proc
+
+
 def test_r8_a_database_only_stop_is_enough_for_the_runner_to_take_the_group_down(
     conn: Any, card: Card, claim: Claim, go: Go, env: Path, kb: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -285,25 +294,17 @@ def test_r8_a_database_only_stop_is_enough_for_the_runner_to_take_the_group_down
         "FAKE_CLAUDE_FIXTURE": "success",
     }.items():  # fmt: skip
         monkeypatch.setenv(k, v)
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "kanban_claude", "run", str(run)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )  # fmt: skip
+    proc = start_runner(conn, run)
     end = time.monotonic() + 30
     while time.monotonic() < end and not (pidfile.exists() and pidfile.read_text()):
         time.sleep(0.1)
     assert pidfile.exists()
-    while time.monotonic() < end:
-        row = conn.execute("SELECT claude_pid FROM task_runs WHERE id = ?", (run,)).fetchone()
-        if row["claude_pid"]:
-            break
-        time.sleep(0.1)
     stopped = time.monotonic()
     assert kb("stop", tid)[0] == 0
     assert proc.wait(timeout=60) == 0
     assert time.monotonic() - stopped < runner.QUIET_POLL_S + 15
     row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
-    assert row["outcome"] == "terminated" and row["stop_requested"] == 1
+    assert row["outcome"] == "terminated"
     t = store.get_task(conn, tid)
     assert t["status"] == "blocked" and t["block_kind"] == "stopped"
     assert dead(int(pidfile.read_text()))
@@ -326,7 +327,7 @@ def test_stop_signals_no_process_it_only_ends_the_run_in_the_database(
     finally:
         sleeper.kill()
     row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
-    assert row["outcome"] == "terminated" and row["stop_requested"] == 1
+    assert row["outcome"] == "terminated"
 
 
 def test_a_runner_signalled_by_something_else_is_interrupted_not_a_crash(
@@ -335,15 +336,7 @@ def test_a_runner_signalled_by_something_else_is_interrupted_not_a_crash(
     tid = card()
     run = claim(tid)
     monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "300")
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "kanban_claude", "run", str(run)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )  # fmt: skip
-    end = time.monotonic() + 30
-    while time.monotonic() < end:
-        if conn.execute("SELECT claude_pid FROM task_runs WHERE id = ?", (run,)).fetchone()[0]:
-            break
-        time.sleep(0.1)
+    proc = start_runner(conn, run)
     proc.send_signal(signal.SIGTERM)
     assert proc.wait(timeout=60) == 0
     assert (
@@ -355,13 +348,11 @@ def test_a_runner_signalled_by_something_else_is_interrupted_not_a_crash(
 
 
 def test_a_missing_workspace_is_a_card_fault(
-    conn: Any, board: str, env: Path, execute: Execute
+    conn: Any, card: Card, env: Path, execute: Execute
 ) -> None:
     work = env / "repos" / "gone"
     work.mkdir()
-    tid = str(
-        store.create(conn, board, "d", body="b", assignee="smith", workspace=f"dir:{work}")["id"]
-    )
+    tid = card("d", workspace=f"dir:{work}")
     work.rmdir()
     run = execute(tid)
     assert run["outcome"] == "provision_failed" and "not a directory" in run["error"]

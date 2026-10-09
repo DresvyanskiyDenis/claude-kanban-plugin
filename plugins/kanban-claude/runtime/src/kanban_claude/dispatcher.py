@@ -1,27 +1,18 @@
-"""The dispatcher daemon (DSP): a tick thread and a housekeeping thread behind one flock."""
+"""The dispatcher's tick policy (DSP-02..08): reconcile, promote, order and claim."""
 
 import contextlib
-import fcntl
 import logging
-import logging.handlers
-import os
-import signal
 import sqlite3
-import threading
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from . import housekeeping, protection, store, validate, web
+from . import store, validate
 from .errors import Error
-from .paths import dirs, ensure_dir, run_files
+from .paths import run_files
 from .procs import Procs
 
 CRASH_GRACE_S = 30
-HOUSEKEEPING_S = 60
-LOCK_WAIT_S = 1.0
-FAILURE_WAIT_S = 5.0
 log = logging.getLogger("kanban.daemon")
 Row = sqlite3.Row
 Report = dict[str, Any]
@@ -73,21 +64,17 @@ def repair_running(conn: sqlite3.Connection) -> None:
         "SELECT * FROM tasks t WHERE status = 'running' AND NOT EXISTS "
         "(SELECT 1 FROM task_runs r WHERE r.task_id = t.id AND r.status = 'running')"
     ).fetchall():
-        with isolated(f"card {t['id']}"):
-            last = conn.execute(
-                "SELECT kind FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (t["id"],)
-            ).fetchone()
-            with store.tx(conn):
-                conn.execute(
-                    "UPDATE tasks SET status = ?, updated_at = ?, version = version + 1 "
-                    "WHERE id = ? AND status = 'running'",
-                    (
-                        "review" if last and last["kind"] == "review" else "ready",
-                        store.now(),
-                        t["id"],
-                    ),
-                )
-                store.event(conn, t, "repaired", "dispatcher", {"reason": "running without a run"})
+        with isolated(f"card {t['id']}"), store.tx(conn):
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ?, version = version + 1 "
+                "WHERE id = ? AND status = 'running'",
+                (
+                    "review" if store.last_run_kind(conn, t["id"]) == "review" else "ready",
+                    store.now(),
+                    t["id"],
+                ),
+            )
+            store.event(conn, t, "repaired", "dispatcher", {"reason": "running without a run"})
 
 
 def expire_walls(conn: sqlite3.Connection, ts: int) -> None:
@@ -244,115 +231,3 @@ def dispatch_once(
         with isolated(f"card {t['id']}"):
             claim_and_spawn(conn, t, procs, report)
     return report
-
-
-# --- the daemon -----------------------------------------------------------------------------
-
-
-def take_lock(path: Path) -> int | None:
-    """DSP-01: a non-blocking exclusive flock, retried for 1 s (a CLI probe holds it for an instant)."""
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    deadline = time.monotonic() + LOCK_WAIT_S
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except OSError:
-            if time.monotonic() >= deadline:
-                os.close(fd)
-                return None
-            time.sleep(0.05)
-
-
-def tick_loop(stop: threading.Event, memory: dict[str, str]) -> None:
-    """`memory` holds the current skip reasons; the board reads it from its own threads."""
-    conn, procs = store.connect(), Procs()
-    nudge = dirs().home / "nudge"
-
-    def stamp() -> int:
-        try:
-            return nudge.stat().st_mtime_ns
-        except OSError:
-            return 0
-
-    while not stop.is_set():
-        try:
-            seen = stamp()
-            dispatch_once(conn, store.now(), procs, memory=memory)
-            for _ in range(int(store.cfg(conn, "dispatch.tick_seconds"))):
-                if stop.wait(1) or stamp() != seen:
-                    break
-        except Exception:
-            log.exception("tick failed")
-            stop.wait(FAILURE_WAIT_S)
-
-
-def housekeeping_loop(stop: threading.Event, unprotected: dict[str, list[str]]) -> None:
-    """`unprotected` is the board's per-board list of repos without branch protection (GIT-08)."""
-    conn = store.connect()
-    while not stop.is_set():
-        try:
-            housekeeping.run_due(conn)
-            protection.publish(conn, unprotected)
-        except Exception:
-            log.exception("housekeeping failed")
-        stop.wait(HOUSEKEEPING_S)
-
-
-def serve() -> int:
-    """`kanban daemon`: 0 on SIGTERM and when another daemon already runs; 1 when a thread died
-    or the board port cannot be bound."""
-    home = ensure_dir(dirs().home)
-    handler = logging.handlers.RotatingFileHandler(
-        ensure_dir(home / "logs") / "daemon.log", maxBytes=10 * 1024 * 1024, backupCount=3
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logging.getLogger("kanban").addHandler(handler)
-    logging.getLogger("kanban").setLevel(logging.INFO)
-    lock = take_lock(home / "daemon.lock")
-    if lock is None:
-        log.info("another daemon holds %s; exiting", home / "daemon.lock")
-        return 0
-    memory: dict[str, str] = {}
-    unprotected: dict[str, list[str]] = {}
-    boot = store.connect()  # create and migrate once: two threads doing it together hit "locked"
-    protection.publish(boot, unprotected)
-    boot.close()
-    try:  # dict.copy() is atomic under the GIL, so a request never sees a half-updated map
-        board = web.make_server(
-            dirs(),
-            live=lambda slug: {"skips": memory.copy(), "unprotected": unprotected.get(slug, [])},
-        )
-    except OSError as e:
-        log.error("cannot serve the board: %s", e)
-        os.close(lock)
-        return 1
-    stop, signalled = threading.Event(), []
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: signalled.append(True))
-    threads = [
-        threading.Thread(target=tick_loop, args=(stop, memory), name="tick", daemon=True),
-        threading.Thread(
-            target=housekeeping_loop, args=(stop, unprotected), name="housekeeping", daemon=True
-        ),
-        threading.Thread(target=board.serve_forever, name="web", daemon=True),
-    ]
-    for t in threads:
-        t.start()
-    log.info("daemon started (pid %s); board on http://127.0.0.1:%s/", os.getpid(), board.port)
-    code = 0
-    while not signalled:  # a handler must not take a lock: Event.set() there can deadlock us
-        if dead := [t.name for t in threads if not t.is_alive()]:
-            log.error("thread %s died; exiting so the supervisor restarts the daemon", dead[0])
-            code = 1
-            break
-        time.sleep(0.2)
-    stop.set()
-    board.shutdown()
-    for t in threads:
-        t.join(timeout=5)
-    board.server_close()
-    log.info("daemon stopped; runners keep running")
-    with contextlib.suppress(OSError):
-        os.close(lock)
-    return code

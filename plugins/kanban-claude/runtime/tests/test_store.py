@@ -27,6 +27,12 @@ def kinds(conn: Any, tid: str) -> list[str]:
     return [r[0] for r in conn.execute(q, (tid,))]
 
 
+def claim_run(conn: Any, tid: str) -> int:
+    run = store.claim(conn, tid)
+    assert run
+    return run
+
+
 def review_request(conn: Any, run: int) -> None:
     store.request_review(conn, run, "PR #1", pr_number=1, pr_url=PR_URL)
 
@@ -40,8 +46,7 @@ def reach(conn: Any, card: Card, target: str) -> str:
     if target == "todo":
         store.link(conn, card("parent"), tid)
         return tid
-    run = store.claim(conn, tid)
-    assert run
+    run = claim_run(conn, tid)
     if target == "running":
         return tid
     if target == "blocked":
@@ -113,8 +118,7 @@ def test_a_stale_version_stops_a_guarded_write_and_the_current_one_passes(
 def test_a_stale_version_stops_a_manual_promote(conn: Any, card: Card) -> None:
     parent, child = card("p"), card("c")
     store.link(conn, parent, child)
-    run = store.claim(conn, parent)
-    assert run
+    run = claim_run(conn, parent)
     store.complete(conn, run, "ok")
     v = row(conn, child)["version"]
     with pytest.raises(Stale):
@@ -190,8 +194,7 @@ def test_s1_promote_manual_and_auto(conn: Any, card: Card) -> None:
 
 def test_s1_worker_path_review_and_changes(conn: Any, card: Card) -> None:
     tid = card()
-    run = store.claim(conn, tid)
-    assert run
+    run = claim_run(conn, tid)
     review_request(conn, run)
     t = row(conn, tid)
     assert (t["status"], t["assignee"], t["implementer"], t["pr_number"]) == (
@@ -211,12 +214,8 @@ def test_s1_worker_path_review_and_changes(conn: Any, card: Card) -> None:
 
 
 def test_s1_review_approval_complete(conn: Any, card: Card) -> None:
-    tid = card()
-    run = store.claim(conn, tid)
-    assert run
-    review_request(conn, run)
-    run2 = store.claim(conn, tid)
-    assert run2
+    tid = reach(conn, card, "review")
+    run2 = claim_run(conn, tid)
     with pytest.raises(Refused):
         store.complete(conn, run2, "looks fine to me")
     store.complete(conn, run2, APPROVED, default_branch="main")
@@ -228,11 +227,9 @@ def test_s1_review_approval_complete(conn: Any, card: Card) -> None:
 
 def test_review_approval_into_non_default_base_sets_merge_pending(conn: Any, card: Card) -> None:
     tid = card(branch="feature/x", base="feature/base")
-    run = store.claim(conn, tid)
-    assert run
+    run = claim_run(conn, tid)
     review_request(conn, run)
-    run2 = store.claim(conn, tid)
-    assert run2
+    run2 = claim_run(conn, tid)
     store.complete(conn, run2, APPROVED, default_branch="main")
     t = row(conn, tid)
     assert (t["merge_state"], t["merge_attempts"]) == ("pending", 0)
@@ -246,8 +243,7 @@ def test_review_approval_into_non_default_base_sets_merge_pending(conn: Any, car
 def test_parents_satisfied_requires_merge(conn: Any, card: Card) -> None:
     parent, child = card("p"), card("c")
     store.link(conn, parent, child)
-    run = store.claim(conn, parent)
-    assert run
+    run = claim_run(conn, parent)
     store.complete(conn, run, "ok")
     conn.execute("UPDATE tasks SET merge_state = 'pending' WHERE id = ?", (parent,))
     assert not store.parents_satisfied(conn, child)
@@ -259,12 +255,8 @@ def test_parents_satisfied_requires_merge(conn: Any, card: Card) -> None:
 
 
 def test_unblock_returns_review_card_to_review(conn: Any, card: Card) -> None:
-    tid = card()
-    run = store.claim(conn, tid)
-    assert run
-    review_request(conn, run)
-    run2 = store.claim(conn, tid)
-    assert run2
+    tid = reach(conn, card, "review")
+    run2 = claim_run(conn, tid)
     store.block(conn, run2, "needs_input", "need a call")
     assert status(conn, tid) == "blocked"
     store.unblock(conn, tid, "done that")
@@ -277,8 +269,7 @@ def test_unblock_returns_review_card_to_review(conn: Any, card: Card) -> None:
 def test_block_loop_goes_to_triage_on_third_same_kind(conn: Any, card: Card) -> None:
     tid = card()
     for expected in ("blocked", "blocked", "triage"):
-        run = store.claim(conn, tid)
-        assert run
+        run = claim_run(conn, tid)
         store.block(conn, run, "needs_input", "same reason")
         assert status(conn, tid) == expected
         if expected == "blocked":
@@ -291,8 +282,7 @@ def test_block_loop_goes_to_triage_on_third_same_kind(conn: Any, card: Card) -> 
 def test_block_kind_change_resets_recurrences(conn: Any, card: Card) -> None:
     tid = card()
     for kind in ("needs_input", "needs_input", "capability"):
-        run = store.claim(conn, tid)
-        assert run
+        run = claim_run(conn, tid)
         store.block(conn, run, kind, "why")
         store.unblock(conn, tid, "go")
     assert row(conn, tid)["block_recurrences"] == 0
@@ -343,15 +333,13 @@ def test_s5_idempotency_key(conn: Any, board: str, card: Card) -> None:
 
 def test_s6_complete_with_commits_refused_for_builders(conn: Any, card: Card) -> None:
     tid = card()
-    run = store.claim(conn, tid)
-    assert run
+    run = claim_run(conn, tid)
     with pytest.raises(Refused, match="request-review"):
         store.complete(conn, run, "all done", commits_ahead=2)
     assert status(conn, tid) == "running"
     store.complete(conn, run, "all done", commits_ahead=0)
     scout = card("scout card", assignee="scout")
-    run = store.claim(conn, scout)
-    assert run
+    run = claim_run(conn, scout)
     store.complete(conn, run, "report", commits_ahead=5)
     assert status(conn, scout) == "done"
     with pytest.raises(NotFound):
@@ -456,13 +444,11 @@ def end(conn: Any, run: int, outcome: str, **kw: Any) -> bool:
 
 def test_failure_rule_counts_then_gives_up(conn: Any, card: Card, clock: list[int]) -> None:
     tid = card()
-    run = store.claim(conn, tid)
-    assert run
+    run = claim_run(conn, tid)
     assert end(conn, run, "timed_out", error="took too long")
     t = row(conn, tid)
     assert (t["status"], t["consecutive_failures"], t["retry_after"]) == ("ready", 1, 1_000_060)
-    run = store.claim(conn, tid)
-    assert run
+    run = claim_run(conn, tid)
     assert end(conn, run, "budget_exceeded", error="e" * 800)
     t = row(conn, tid)
     assert t["status"] == "blocked" and t["block_kind"] == "gave_up"
@@ -473,25 +459,19 @@ def test_failure_rule_counts_then_gives_up(conn: Any, card: Card, clock: list[in
 def test_uncounted_outcomes_and_card_retry_limit(conn: Any, card: Card, clock: list[int]) -> None:
     tid = card(max_retries=3)
     for outcome in ("interrupted", "auth_lost", "quota"):
-        run = store.claim(conn, tid)
-        assert run
+        run = claim_run(conn, tid)
         assert end(conn, run, outcome)
         assert row(conn, tid)["consecutive_failures"] == 0
     for _ in range(2):
-        run = store.claim(conn, tid)
-        assert run
+        run = claim_run(conn, tid)
         end(conn, run, "crashed")
         clock[0] += 1000
     assert status(conn, tid) == "ready"
 
 
 def test_review_run_failure_returns_to_review(conn: Any, card: Card, clock: list[int]) -> None:
-    tid = card()
-    run = store.claim(conn, tid)
-    assert run
-    review_request(conn, run)
-    run2 = store.claim(conn, tid)
-    assert run2
+    tid = reach(conn, card, "review")
+    run2 = claim_run(conn, tid)
     end(conn, run2, "interrupted")
     assert status(conn, tid) == "review"
 
@@ -499,8 +479,7 @@ def test_review_run_failure_returns_to_review(conn: Any, card: Card, clock: list
 def test_protocol_violation_streak(conn: Any, card: Card, clock: list[int]) -> None:
     tid = card()
     for expected in ("ready", "ready", "blocked"):
-        run = store.claim(conn, tid)
-        assert run
+        run = claim_run(conn, tid)
         end(conn, run, "protocol_violation", error="no terminal verb")
         assert status(conn, tid) == expected
     assert row(conn, tid)["protocol_violations"] == 3
@@ -511,8 +490,7 @@ def test_systemic_crashes_pause_dispatch_without_counting(
 ) -> None:
     ids = [card(f"c{i}") for i in range(3)]
     for tid in ids:
-        run = store.claim(conn, tid)
-        assert run
+        run = claim_run(conn, tid)
         end(conn, run, "crashed", error="spawn exploded")
         clock[0] += 10
     assert store.state_get(conn, "dispatch_paused")["reason"] == "systemic"
@@ -523,8 +501,7 @@ def test_systemic_crashes_pause_dispatch_without_counting(
 
 def test_sec5_second_end_run_after_stop_is_a_noop(conn: Any, card: Card) -> None:
     tid = card()
-    run = store.claim(conn, tid)
-    assert run
+    run = claim_run(conn, tid)
     store.stop(conn, tid)
     t = row(conn, tid)
     assert (t["status"], t["block_kind"]) == ("blocked", "stopped")
@@ -535,13 +512,12 @@ def test_sec5_second_end_run_after_stop_is_a_noop(conn: Any, card: Card) -> None
         store.block(conn, run, "needs_input", "late")
     assert status(conn, tid) == "blocked"
     r = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
-    assert (r["outcome"], r["stop_requested"]) == ("terminated", 1)
+    assert r["outcome"] == "terminated"
 
 
 def test_sec5_terminal_verb_then_stop_and_double_verb(conn: Any, card: Card) -> None:
     tid = card()
-    run = store.claim(conn, tid)
-    assert run
+    run = claim_run(conn, tid)
     store.complete(conn, run, "done")
     assert store.complete(conn, run, "done").get("noop")
     with pytest.raises(Refused, match="run ended"):
@@ -554,8 +530,7 @@ def test_sec5_terminal_verb_then_stop_and_double_verb(conn: Any, card: Card) -> 
 
 def test_reassign_reclaim_ends_run_and_resets_counters(conn: Any, card: Card) -> None:
     tid = card()
-    run = store.claim(conn, tid)
-    assert run
+    claim_run(conn, tid)
     with pytest.raises(Refused, match="reclaim"):
         store.assign(conn, tid, "designer")
     store.assign(conn, tid, "designer", reclaim=True)
@@ -566,11 +541,9 @@ def test_reassign_reclaim_ends_run_and_resets_counters(conn: Any, card: Card) ->
 
 def test_reopen_demotes_ready_children_and_comments_on_others(conn: Any, card: Card) -> None:
     parent, ready_child, done_child = card("p"), card("c1"), card("c2")
-    run = store.claim(conn, done_child)
-    assert run
+    run = claim_run(conn, done_child)
     store.complete(conn, run, "ok")
-    run = store.claim(conn, parent)
-    assert run
+    run = claim_run(conn, parent)
     store.complete(conn, run, "ok")
     store.link(conn, parent, ready_child)
     assert status(conn, ready_child) == "ready"

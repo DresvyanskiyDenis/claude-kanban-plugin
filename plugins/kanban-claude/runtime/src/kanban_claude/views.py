@@ -1,13 +1,17 @@
 """Read-only renderings: `show`, `context`, `watch` lines, and inert output (CLI-02/06/09/11)."""
 
 import json
+import os
 import re
 import sqlite3
 import time
+from collections.abc import Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from . import store
+from .errors import Refused
 from .paths import dirs
 
 _OSC = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?")
@@ -37,6 +41,22 @@ def clean_obj(value: Any) -> Any:
     if isinstance(value, list | tuple):
         return [clean_obj(v) for v in value]
     return value
+
+
+def log_path(raw: str, home: Path, subs: Sequence[str]) -> Path:
+    """SEC: a run's `log_path` is data, read only when it resolves under `home/<sub>`."""
+    path = Path(os.path.realpath(raw))
+    if not any(home.resolve() / sub in path.parents for sub in subs):
+        raise Refused(f"that log is outside {' and '.join(subs)} under the kanban home")
+    return path
+
+
+def log_lines(path: Path) -> list[str]:
+    """The last `LOG_BYTES` of a log as lines; the caller words an `OSError`."""
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - LOG_BYTES))
+        return f.read().decode(errors="replace").splitlines()
 
 
 def iso(ts: int) -> str:

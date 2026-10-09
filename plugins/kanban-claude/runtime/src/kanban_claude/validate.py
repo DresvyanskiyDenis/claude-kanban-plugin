@@ -70,7 +70,7 @@ def duration(value: str | int) -> int:
 def branch(name: str, default: str | None = None) -> str:
     if not gitops.valid_branch(name):
         raise Refused(f"branch {name!r} is not a valid branch name (git check-ref-format)")
-    if name == "HEAD" or name == default:
+    if name in ("HEAD", default):
         raise Refused(
             f"branch {name!r} is the default branch or HEAD; pass --branch feature/<slug>"
         )

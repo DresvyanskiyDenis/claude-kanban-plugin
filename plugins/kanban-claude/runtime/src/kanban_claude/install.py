@@ -20,7 +20,7 @@ from typing import Any, NamedTuple
 
 from . import __version__, classify, gitops, launchd, runner, store, web
 from .errors import Error, Refused, Usage
-from .paths import dirs, ensure_dir, write_private
+from .paths import add_file_log, dirs, ensure_dir, write_private
 from .procs import Procs
 
 MIN_CLAUDE = (2, 1, 259)
@@ -92,12 +92,7 @@ def upgrade_lock(home: Path) -> Iterator[bool]:
 
 @contextlib.contextmanager
 def upgrade_log(home: Path) -> Iterator[None]:
-    handler = logging.handlers.RotatingFileHandler(
-        ensure_dir(home / "logs") / "upgrade.log", maxBytes=10 * 1024 * 1024, backupCount=3
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    log.addHandler(handler)
-    log.setLevel(logging.INFO)
+    handler = add_file_log(log, home / "logs" / "upgrade.log")
     try:
         yield
     finally:
@@ -362,9 +357,7 @@ def run_setup(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str
     if not a.no_daemon:
         entry = kanban_entry()
         ensure_dir(d.home / "logs")
-        plist = launchd.install_plist(launchd.render(entry, captured, d.home, d.work))
-        launchd.bootout()
-        launchd.bootstrap(plist)
+        plist = launchd.load(entry, captured, d.home, d.work)
         say(f"LaunchAgent {launchd.LABEL} loaded from {plist}")
     stamp(
         {
@@ -437,7 +430,7 @@ def purge_targets() -> list[Path]:
     home = Path.home().resolve()
     targets = [p.resolve() for p in dirs()]
     for p in targets:
-        if p == p.parent or p == home or p in home.parents:
+        if p in (p.parent, home, *home.parents):
             raise Refused(f"refusing to delete {p}: it is or contains your home directory")
     data, work = targets
     if data.exists() and not (data / "kanban.db").exists():

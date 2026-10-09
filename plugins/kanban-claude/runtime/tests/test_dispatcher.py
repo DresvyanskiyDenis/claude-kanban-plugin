@@ -1,23 +1,18 @@
-"""TST-D (dispatcher) plus the daemon, STO-06 repair and the owner verbs that touch the tick."""
+"""TST-D (dispatcher) plus STO-06 repair and the owner verbs that touch the tick."""
 
 import json
-import logging
 import os
-import signal
-import socket
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from kanban_claude import dispatcher, gitops, housekeeping, runner, store, web
+from kanban_claude import gitops, runner, store
 from kanban_claude.dispatcher import dispatch_once
 from kanban_claude.errors import Refused
 
@@ -59,6 +54,12 @@ def set_card(conn: Any, tid: str, **cols: Any) -> None:
     with store.tx(conn):
         for k, v in cols.items():
             conn.execute(f"UPDATE tasks SET {k} = ? WHERE id = ?", (v, tid))
+
+
+def set_run(conn: Any, run_id: int, **cols: Any) -> None:
+    with store.tx(conn):
+        for k, v in cols.items():
+            conn.execute(f"UPDATE task_runs SET {k} = ? WHERE id = ?", (v, run_id))
 
 
 def test_d2_ordering_priority_then_review_then_age(conn: Any, card: Card, procs: FakeProcs) -> None:
@@ -158,11 +159,7 @@ def test_d6_a_live_runner_with_stale_output_is_untouched(
     conn: Any, card: Card, claim: Callable[[str], int], procs: FakeProcs
 ) -> None:
     run = claim(card())
-    with store.tx(conn):
-        conn.execute(
-            "UPDATE task_runs SET runner_pid = 111, runner_started = 1, last_output_at = 1 WHERE id = ?",
-            (run,),
-        )
+    set_run(conn, run, runner_pid=111, runner_started=1, last_output_at=1)
     procs.live.add(111)
     assert tick(conn, procs)["reconciled"] == []
     assert run_row(conn, run)["status"] == "running"
@@ -172,11 +169,9 @@ def test_d6_a_null_pid_is_ended_only_past_the_grace(
     conn: Any, card: Card, claim: Callable[[str], int], procs: FakeProcs
 ) -> None:
     run = claim(card())
-    with store.tx(conn):
-        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (store.now() - 5, run))
+    set_run(conn, run, started_at=store.now() - 5)
     assert tick(conn, procs)["reconciled"] == []
-    with store.tx(conn):
-        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (store.now() - 60, run))
+    set_run(conn, run, started_at=store.now() - 60)
     done = tick(conn, procs)["reconciled"]
     assert done == [
         {"run_id": run, "task": run_row(conn, run)["task_id"], "outcome": "interrupted"}
@@ -188,12 +183,7 @@ def test_d7_a_dead_runner_is_crashed_and_its_claude_group_killed(
 ) -> None:
     tid = card()
     run = claim(tid)
-    with store.tx(conn):
-        conn.execute(
-            "UPDATE task_runs SET runner_pid = 222, runner_started = 1, claude_pid = 333, "
-            "claude_started = 1 WHERE id = ?",
-            (run,),
-        )
+    set_run(conn, run, runner_pid=222, runner_started=1, claude_pid=333, claude_started=1)
     procs.live.add(333)
     assert tick(conn, procs)["reconciled"][0]["outcome"] == "crashed"
     assert procs.killed == [333]
@@ -206,10 +196,7 @@ def test_d8_a_run_older_than_the_boot_is_interrupted(
 ) -> None:
     tid = card()
     run = claim(tid)
-    with store.tx(conn):
-        conn.execute(
-            "UPDATE task_runs SET runner_pid = 222, runner_started = 1 WHERE id = ?", (run,)
-        )
+    set_run(conn, run, runner_pid=222, runner_started=1)
     procs.boot = store.now() + 10
     assert tick(conn, procs)["reconciled"][0]["outcome"] == "interrupted"
     assert store.get_task(conn, tid)["consecutive_failures"] == 0
@@ -222,10 +209,7 @@ def test_d9_a_restarted_dispatcher_adopts_running_runners(
     first, second = card("a"), card("b")
     claimed = tick(conn, procs)["claimed"]
     run = claimed[0]["run_id"]
-    with store.tx(conn):
-        conn.execute(
-            "UPDATE task_runs SET runner_pid = 444, runner_started = 1 WHERE id = ?", (run,)
-        )
+    set_run(conn, run, runner_pid=444, runner_started=1)
     fresh = FakeProcs()
     fresh.live.add(444)
     report = tick(conn, fresh)
@@ -241,10 +225,8 @@ def test_d10_a_live_previous_run_blocks_the_card(
 ) -> None:
     tid = card()
     run = claim(tid)
+    set_run(conn, run, runner_pid=555, runner_started=1)
     with store.tx(conn):
-        conn.execute(
-            "UPDATE task_runs SET runner_pid = 555, runner_started = 1 WHERE id = ?", (run,)
-        )
         store.end_run(conn, run, "interrupted", "ready", actor="t", event_kind="interrupted")
     procs.live.add(555)
     assert tick(conn, procs)["skipped"] == {tid: "previous_run_alive"}
@@ -314,8 +296,7 @@ def test_a_dry_run_changes_nothing(
     ready = card()
     dead = claim(card("other"))
     before = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
-    with store.tx(conn):
-        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (store.now() - 99, dead))
+    set_run(conn, dead, started_at=store.now() - 99)
     report = tick(conn, procs, dry_run=True)
     assert [c["id"] for c in report["claimed"]] == [ready]
     assert run_row(conn, dead)["status"] == "running" and procs.spawned == []
@@ -339,10 +320,7 @@ def test_never_started_runners_trip_the_systemic_pause(
     store.config_set(conn, "dispatch.max_in_progress", 5)
     for i in range(3):
         run = claim(card(f"c{i}"))
-        with store.tx(conn):
-            conn.execute(
-                "UPDATE task_runs SET started_at = ? WHERE id = ?", (store.now() - 60, run)
-            )
+        set_run(conn, run, started_at=store.now() - 60)
     assert len(tick(conn, procs)["reconciled"]) == 3
     paused = store.state_get(conn, "dispatch_paused")
     assert paused and paused["reason"] == "systemic"
@@ -388,13 +366,8 @@ def test_a_failed_liveness_probe_skips_the_run_and_never_kills_it(
     store.config_set(conn, "dispatch.max_in_progress", 3)
     unsure, gone = claim(card("unsure")), claim(card("gone"))
     fresh = card("fresh")
-    with store.tx(conn):
-        conn.execute(
-            "UPDATE task_runs SET runner_pid = 111, runner_started = 1, claude_pid = 112, "
-            "claude_started = 1 WHERE id = ?",
-            (unsure,),
-        )
-        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (store.now() - 90, gone))
+    set_run(conn, unsure, runner_pid=111, runner_started=1, claude_pid=112, claude_started=1)
+    set_run(conn, gone, started_at=store.now() - 90)
     probes = ProbeFails(111)
     report = tick(conn, probes)
     assert run_row(conn, unsure)["status"] == "running" and probes.killed == []
@@ -408,10 +381,8 @@ def test_a_card_whose_probe_fails_is_skipped_and_the_others_dispatch(
 ) -> None:
     held = card("held")
     held_run = claim(held)
+    set_run(conn, held_run, runner_pid=777, runner_started=1)
     with store.tx(conn):
-        conn.execute(
-            "UPDATE task_runs SET runner_pid = 777, runner_started = 1 WHERE id = ?", (held_run,)
-        )
         store.end_run(conn, held_run, "interrupted", "ready", actor="t", event_kind="interrupted")
     fine = card("fine")
     report = tick(conn, ProbeFails(777))
@@ -455,8 +426,7 @@ def test_a_run_whose_card_is_not_running_is_ended_without_the_card(
     tid = card()
     run = claim(tid)
     set_card(conn, tid, status="blocked")
-    with store.tx(conn):
-        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (store.now() - 90, run))
+    set_run(conn, run, started_at=store.now() - 90)
     assert tick(conn, procs)["reconciled"][0]["run_id"] == run
     assert (
         run_row(conn, run)["status"] == "ended" and run_row(conn, run)["outcome"] == "interrupted"
@@ -471,211 +441,12 @@ def test_the_boot_time_is_read_only_when_a_dead_runner_needs_it(
     tick(conn, procs)
     assert procs.boot_calls == 0
     run = claim(card())
-    with store.tx(conn):
-        conn.execute("UPDATE task_runs SET runner_pid = 5, runner_started = 1 WHERE id = ?", (run,))
+    set_run(conn, run, runner_pid=5, runner_started=1)
     tick(conn, procs)
     assert procs.boot_calls == 1
 
 
-# --- the daemon threads (DSP-01) ------------------------------------------------------------
-
-
-def test_the_tick_thread_survives_a_failure_anywhere_in_its_body(
-    conn: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    stop, calls = threading.Event(), []
-
-    def once(*_a: Any, **_k: Any) -> dict[str, Any]:
-        calls.append(1)
-        if len(calls) == 4:
-            stop.set()
-        if len(calls) == 1:
-            raise sqlite3.OperationalError("database is locked")
-        return {}
-
-    real_cfg = store.cfg
-
-    def cfg(c: Any, key: str) -> Any:
-        if key == "dispatch.tick_seconds":
-            if len(calls) == 2:
-                raise sqlite3.OperationalError("database is locked")
-            return 0
-        return real_cfg(c, key)
-
-    real_exists = Path.exists
-    monkeypatch.setattr(
-        Path, "exists", lambda self: self.name == "nudge" or real_exists(self)
-    )  # the nudge file vanishes between exists() and stat()
-    monkeypatch.setattr(dispatcher, "dispatch_once", once)
-    monkeypatch.setattr(store, "cfg", cfg)
-    monkeypatch.setattr(dispatcher, "FAILURE_WAIT_S", 0.01)
-    dispatcher.tick_loop(stop, {})
-    assert len(calls) == 4
-
-
-def any_port() -> None:
-    """The daemon serves the board on `web.port`; 0 keeps tests off a real daemon's port."""
-    c = store.connect()
-    with store.tx(c):
-        store.config_put(c, "web.port", 0)
-    c.close()
-
-
-@pytest.fixture
-def in_process_daemon() -> Any:
-    """`serve()` takes SIGTERM/SIGINT and adds a log handler; both are put back afterwards."""
-    any_port()
-    old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
-    kanban_log = logging.getLogger("kanban")
-    before = list(kanban_log.handlers)
-    yield
-    for s, h in old.items():
-        signal.signal(s, h)
-    for h in kanban_log.handlers[:]:
-        if h not in before:
-            kanban_log.removeHandler(h)
-            h.close()
-
-
-def test_a_dead_thread_makes_the_daemon_exit_non_zero(
-    env: Path, in_process_daemon: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(dispatcher, "tick_loop", lambda stop, memory: None)
-    assert dispatcher.serve() == 1
-    assert "thread tick died" in (env / "kb-home" / "logs" / "daemon.log").read_text()
-
-
-def test_the_daemon_serves_the_board_with_the_tick_skip_reasons(
-    env: Path, in_process_daemon: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    seen: dict[str, Any] = {}
-    real = web.make_server
-    c = store.connect()
-    store.state_put(c, "protection", {"boards": {"any": ["host/acme/proj"]}})
-    c.close()
-
-    def make_server(*a: Any, **k: Any) -> web.WebServer:
-        seen["srv"] = real(*a, **k)
-        return seen["srv"]
-
-    def tick(stop: threading.Event, memory: dict[str, str]) -> None:
-        memory["t_1"] = "no_assignee"
-        srv = seen["srv"]
-        seen["live"] = srv.live("any")
-        url = f"http://127.0.0.1:{srv.port}/healthz?nonce=n"
-        with urllib.request.urlopen(url, timeout=5) as r:
-            seen["status"] = r.status
-
-    monkeypatch.setattr(web, "make_server", make_server)
-    monkeypatch.setattr(dispatcher, "tick_loop", tick)
-    assert dispatcher.serve() == 1  # the stub tick returns, so its thread "dies"
-    assert seen["status"] == 200
-    assert seen["live"] == {"skips": {"t_1": "no_assignee"}, "unprotected": ["host/acme/proj"]}
-    assert seen["srv"].socket.fileno() == -1, "the board socket outlived the daemon"
-
-
-def test_the_housekeeping_loop_publishes_the_fresh_protection_list_after_each_wakeup(
-    env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    stop, shared = threading.Event(), {"old": ["gone/x/y"]}
-
-    def wakeup(conn: Any) -> None:
-        store.state_put(conn, "protection", {"boards": {"main": ["host/acme/proj"]}})
-        stop.set()
-
-    monkeypatch.setattr(housekeeping, "run_due", wakeup)
-    dispatcher.housekeeping_loop(stop, shared)
-    assert shared == {"main": ["host/acme/proj"]}
-
-
-def test_a_daemon_that_cannot_bind_the_board_port_exits_non_zero(
-    env: Path, in_process_daemon: Any
-) -> None:
-    with socket.socket() as taken:
-        taken.bind(("127.0.0.1", 0))
-        taken.listen()
-        c = store.connect()
-        store.config_set(c, "web.port", taken.getsockname()[1])
-        c.close()
-        assert dispatcher.serve() == 1
-    assert "cannot serve the board" in (env / "kb-home" / "logs" / "daemon.log").read_text()
-
-
-def test_sigterm_in_the_middle_of_a_tick_finishes_the_tick_and_exits_0(env: Path) -> None:
-    started, finished = env / "tick-started", env / "tick-finished"
-    code = (
-        "import sys, time\n"
-        "from pathlib import Path\n"
-        "from kanban_claude import dispatcher\n"
-        "real = dispatcher.dispatch_once\n"
-        "def slow(*a, **k):\n"
-        "    Path(sys.argv[1]).touch(); time.sleep(2); out = real(*a, **k)\n"
-        "    Path(sys.argv[2]).touch(); return out\n"
-        "dispatcher.dispatch_once = slow\n"
-        "raise SystemExit(dispatcher.serve())\n"
-    )
-    any_port()
-    d = subprocess.Popen(
-        [sys.executable, "-c", code, str(started), str(finished)], env=os.environ.copy(),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )  # fmt: skip
-    wait_for(started.exists, "the tick to start")
-    d.send_signal(signal.SIGTERM)
-    assert d.wait(timeout=20) == 0
-    assert finished.exists(), "the tick was cut short"
-    assert "runners keep running" in (env / "kb-home" / "logs" / "daemon.log").read_text()
-
-
-# --- the daemon and the owner verbs ---------------------------------------------------------
-
-
-def daemon(**extra: str) -> subprocess.Popen[str]:
-    any_port()
-    return subprocess.Popen(
-        [sys.executable, "-m", "kanban_claude", "daemon"], env={**os.environ, **extra},
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )  # fmt: skip
-
-
-def wait_for(check: Callable[[], bool], what: str, timeout: float = 30) -> None:
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if check():
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"timed out waiting for {what}")
-
-
-def test_the_daemon_is_a_singleton_and_leaves_runners_alone(env: Path, conn: Any) -> None:
-    first = daemon()
-    log = env / "kb-home" / "logs" / "daemon.log"
-    wait_for(lambda: log.exists() and "daemon started" in log.read_text(), "the daemon to start")
-    second = subprocess.run(
-        [sys.executable, "-m", "kanban_claude", "daemon"],
-        capture_output=True,
-        timeout=20,
-        check=False,
-    )
-    assert second.returncode == 0 and "another daemon" in log.read_text()
-    first.send_signal(signal.SIGTERM)
-    assert first.wait(timeout=20) == 0
-    assert "runners keep running" in log.read_text()
-
-
-def test_the_daemon_dispatches_a_card_end_to_end(
-    env: Path, conn: Any, card: Card, fake_claude: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store.config_set(conn, "dispatch.tick_seconds", 1)
-    tid = card("e2e")
-    monkeypatch.setenv("FAKE_CLAUDE_TERMINAL", json.dumps(["complete", tid, "--summary", "ok"]))
-    d = daemon()
-    try:
-        wait_for(lambda: store.get_task(conn, tid)["status"] == "done", "the card to finish")
-    finally:
-        d.send_signal(signal.SIGTERM)
-        d.wait(timeout=20)
-    run = conn.execute("SELECT * FROM task_runs WHERE task_id = ?", (tid,)).fetchone()
-    assert run["outcome"] == "completed" and run["runner_pid"]
+# --- the owner verbs ------------------------------------------------------------------------
 
 
 def test_pause_resume_and_dry_run_verbs(kb: Kb, card: Card) -> None:

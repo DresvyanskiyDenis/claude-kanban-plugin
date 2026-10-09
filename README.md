@@ -42,7 +42,7 @@ The setup skill runs `skills/setup/scripts/bootstrap.sh`, which installs the run
 7. writes `$KANBAN_HOME/installed.json` (the version, the Claude binary and config directory, the port and the captured environment; data only, no hook executes it);
 8. waits up to 10 s for the board and then starts the scout agent once, the way a worker will, to prove that the plugin resolves. It finishes by printing `kanban board` and the URL.
 
-`--no-daemon` skips steps 6 and 8's board wait, `--port N` moves the board, `--import-hermes` runs the one-time import of the previous kanban tool afterwards, and `--yes` accepts the Sonnet fallback and a deliberate downgrade. Progress is also written to `$KANBAN_HOME/logs/upgrade.log`.
+`--no-daemon` skips steps 6 and 8's board wait, `--port N` moves the board, and `--yes` accepts the Sonnet fallback and a deliberate downgrade. Progress is also written to `$KANBAN_HOME/logs/upgrade.log`.
 
 Upgrading is the same skill on a newer plugin: when the recorded version is older, setup takes an exclusive `flock` on `$KANBAN_HOME/upgrade.lock` (a second run exits 0; the lock ends with its process, so a crashed setup leaves nothing to clear), migrates the database after a backup, restarts the daemon with `launchctl kickstart -k` and rewrites `installed.json`. Runs in flight are not touched. A plugin older than the recorded version is refused unless you pass `--yes`. Nothing upgrades itself: a new plugin only announces itself at the next session start, and the daemon changes when you run the skill. Third-party marketplaces do not auto-update by default; run `/plugin update` or enable auto-update for this marketplace.
 
@@ -130,8 +130,6 @@ uv run kanban --board demo create "First card" --assignee smith --body "do the t
 uv run kanban --board demo list
 uv run kanban watch --since-start
 ```
-
-Moving boards over from the previous kanban tool is a verb of its own (`uv run kanban --help` lists it). Run it with `--dry-run` first: it reads a read-only copy of the old databases, prints what would be created, dropped or renamed, and writes nothing. The real run applies everything in one transaction and refuses on conflicts unless `--force` overrides the blockers.
 
 The dispatcher runs as `uv run kanban daemon` (one per machine; a second one logs a line and exits 0, and a daemon whose thread died exits 1 so its supervisor restarts it). Each tick claims ready cards and starts one runner per card (`kanban run RUN_ID`, internal), which launches `claude -p` headless and ends the run from the stream. `kanban dispatch --dry-run --json` shows what the next tick would claim and why the rest are skipped; `kanban pause [--reason TEXT]` and `kanban resume` stop and restart dispatch; `kanban snapshot REPO` prints a detached checkout of the repo's `origin/HEAD`.
 

@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import cli, store
+from kanban_claude import store
 
 from .conftest import Kb, git
 
@@ -78,17 +78,6 @@ def test_cli_08_warning_follows_the_daemon_lock(
         fcntl.flock(f, fcntl.LOCK_EX)
         code, _, err = kb(*args)
     assert code == 0 and err == ""
-
-
-def test_a_daemon_probe_ignores_a_concurrent_probe(env: Path) -> None:
-    lock = env / "kb-home" / "daemon.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    with lock.open("w") as other_probe:
-        fcntl.flock(other_probe, fcntl.LOCK_SH)
-        assert cli.daemon_running() is False
-        fcntl.flock(other_probe, fcntl.LOCK_UN)
-        fcntl.flock(other_probe, fcntl.LOCK_EX)
-        assert cli.daemon_running() is True
 
 
 def test_lifecycle_verbs_and_exit_codes(

@@ -16,7 +16,7 @@ from kanban_claude.procs import Procs
 HERE = Path(__file__).resolve().parent
 PLUGIN = "kanban-claude@claude-kanban-plugin"
 
-GH_SCRIPT = """#!{python}
+GH_SCRIPT = """#!__PYTHON__
 import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["GH_FAKE_LOG"], "a") as f:
@@ -43,7 +43,7 @@ elif args[:2] == ["pr", "merge"]:
     pr["state"] = "MERGED"
     json.dump(prs, open(os.environ["GH_FAKE_PRS"], "w"))
 elif args[:2] == ["repo", "view"]:
-    print(json.dumps({{"defaultBranchRef": {{"name": os.environ.get("GH_FAKE_DEFAULT", "main")}}}}))
+    print(json.dumps({"defaultBranchRef": {"name": os.environ.get("GH_FAKE_DEFAULT", "main")}}))
 elif args[:2] == ["auth", "status"]:
     mode = os.environ.get("GH_FAKE_AUTH", "keyring")
     if mode == "out":
@@ -143,9 +143,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.setenv(f"GIT_{who}_EMAIL", "t@example.invalid")
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    gh = bindir / "gh"
-    gh.write_text(GH_SCRIPT.format(python=sys.executable))
-    gh.chmod(0o755)
+    install_fake(bindir / "gh", GH_SCRIPT)
     install_fake(bindir / "launchctl", LAUNCHCTL_SCRIPT)
     install_fake(bindir / "uv", UV_SCRIPT)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
