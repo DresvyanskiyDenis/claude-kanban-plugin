@@ -168,6 +168,14 @@ def _provision(root: str | Path, task_id: str, branch: str, base: str) -> Path:
     return path
 
 
+def worktree_risk(path: str | Path) -> str | None:
+    """What removing the worktree at `path` would lose: `dirty` (uncommitted changes) or `unpushed`
+    (commits no upstream has), else None."""
+    if run("status", "--porcelain", root=path)[1]:
+        return "dirty"
+    return None if run("rev-list", "--count", "@{u}..HEAD", root=path) == (0, "0") else "unpushed"
+
+
 def cleanup(root: str | Path, task_id: str, branch: str | None, *, merged: bool) -> str:
     """GIT-06: remove a finished card's worktree if clean and pushed (or merged); else say why not.
 
@@ -175,10 +183,10 @@ def cleanup(root: str | Path, task_id: str, branch: str | None, *, merged: bool)
     """
     path = Path(root) / ".worktrees" / task_id
     if path.is_dir():
-        if run("status", "--porcelain", root=path)[1]:
+        risk = worktree_risk(path)
+        if risk == "dirty":
             return "kept_dirty"
-        pushed = run("rev-list", "--count", "@{u}..HEAD", root=path) == (0, "0")
-        if not (merged or pushed):
+        if risk == "unpushed" and not merged:
             return "kept_unpushed"
         if run("worktree", "remove", "--", str(path), root=root)[0] != 0:
             return "kept_dirty"

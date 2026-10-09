@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from kanban_claude import store, views
-from kanban_claude.errors import Error, NotFound, Refused
+from kanban_claude.errors import Error, NotFound, Refused, Stale
 
 Card = Callable[..., str]
 PR_URL = "https://example.invalid/acme/proj/pull/1"
@@ -81,6 +81,71 @@ def test_s1_s2_owner_verbs_legal_and_illegal(conn: Any, card: Card, verb: str, s
         with pytest.raises(Refused) as e:
             fn(conn, tid)
         assert e.value.exit == 4
+
+
+VERSIONED: dict[str, tuple[str, Callable[..., Any]]] = {
+    "hold": ("ready", lambda c, t, v: store.hold(c, t, "r", expect_version=v)),
+    "unblock": ("blocked", lambda c, t, v: store.unblock(c, t, "r", expect_version=v)),
+    "reopen_review": ("review", lambda c, t, v: store.reopen_review(c, t, "r", expect_version=v)),
+    "reopen": ("done", lambda c, t, v: store.reopen(c, t, "r", expect_version=v)),
+    "mark_done": ("review", lambda c, t, v: store.mark_done(c, t, "r", expect_version=v)),
+    "specify": ("triage", lambda c, t, v: store.specify(c, t, {}, expect_version=v)),
+    "archive": ("ready", lambda c, t, v: store.archive(c, t, expect_version=v)),
+    "assign": ("ready", lambda c, t, v: store.assign(c, t, "designer", expect_version=v)),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("verb", sorted(VERSIONED))
+def test_a_stale_version_stops_a_guarded_write_and_the_current_one_passes(
+    conn: Any, card: Card, verb: str
+) -> None:
+    src, fn = VERSIONED[verb]
+    tid = reach(conn, card, src)
+    before = row(conn, tid)
+    with pytest.raises(Stale) as e:
+        fn(conn, tid, before["version"] + 1)
+    assert e.value.exit == 4 and isinstance(e.value, Refused)
+    assert tuple(row(conn, tid)) == tuple(before)
+    fn(conn, tid, before["version"])
+    assert row(conn, tid)["version"] > before["version"]
+
+
+def test_a_stale_version_stops_a_manual_promote(conn: Any, card: Card) -> None:
+    parent, child = card("p"), card("c")
+    store.link(conn, parent, child)
+    run = store.claim(conn, parent)
+    assert run
+    store.complete(conn, run, "ok")
+    v = row(conn, child)["version"]
+    with pytest.raises(Stale):
+        store.promote(conn, child, "r", expect_version=v + 1)
+    assert status(conn, child) == "todo"
+    store.promote(conn, child, "r", expect_version=v)
+    assert status(conn, child) == "ready"
+
+
+def test_a_stale_version_wins_over_a_status_that_also_changed(conn: Any, card: Card) -> None:
+    tid = card()
+    v = row(conn, tid)["version"]
+    assert store.claim(conn, tid)
+    with pytest.raises(Stale):
+        store.hold(conn, tid, "r", expect_version=v)
+    with pytest.raises(Refused) as e:
+        store.hold(conn, tid, "r", expect_version=row(conn, tid)["version"])
+    assert not isinstance(e.value, Stale)
+
+
+def test_tx_inside_a_transaction_joins_it_and_the_outer_one_decides(conn: Any, card: Card) -> None:
+    tid = card()
+    with pytest.raises(Refused), store.tx(conn):
+        store.hold(conn, tid, "r")
+        assert status(conn, tid) == "triage"
+        raise Refused("undo")
+    assert status(conn, tid) == "ready" and not conn.in_transaction
+    with store.tx(conn):
+        store.hold(conn, tid, "r")
+        assert conn.in_transaction
+    assert status(conn, tid) == "triage" and not conn.in_transaction
 
 
 @pytest.mark.parametrize("src", ALL)

@@ -117,8 +117,6 @@ def test_config_pause_stats_and_stubs(kb: Kb, workdirs: tuple[Path, Path]) -> No
     assert kb("pause", "--reason", "x")[0] == 0 and kb("resume")[1].strip() == "dispatch resumed"
     assert json.loads(kb("stats", "--json")[1])["schema"] == 1
     assert kb("migrate")[1].strip().startswith("schema version")
-    code, _, err = kb("doctor")
-    assert code == 1 and "not available" in err
     assert kb("block", "t_1", "--kind", "needs_input", "--reason", "x")[0] == 5
 
 

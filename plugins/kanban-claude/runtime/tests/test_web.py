@@ -844,6 +844,37 @@ def test_patch_assigns_first_and_a_refused_assign_saves_nothing(
     assert conn.execute("SELECT title FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "keep me"
 
 
+def test_patch_edit_refused_after_the_assign_rolls_the_assign_back(
+    call: Call, conn: sqlite3.Connection, card: Card
+) -> None:
+    tid = card("keep me")
+    v = version(conn, tid)
+    before = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[
+        0
+    ]
+    status, _, raw = call(
+        "PATCH", f"/api/cards/{tid}", {"version": v, "body": "", "assignee": "designer"}
+    )
+    assert status == 422 and "wipe the card body" in json.loads(raw)["error"]
+    row = conn.execute("SELECT assignee, version FROM tasks WHERE id = ?", (tid,)).fetchone()
+    assert (row["assignee"], row["version"]) == ("smith", v)
+    q = "SELECT COUNT(*) FROM task_events WHERE task_id = ?"
+    assert conn.execute(q, (tid,)).fetchone()[0] == before
+
+
+def test_a_stale_version_is_a_409_even_when_the_card_also_changed_state(
+    call: Call, conn: sqlite3.Connection, card: Card
+) -> None:
+    tid = card()
+    v = version(conn, tid)
+    assert store.claim(conn, tid)
+    stale = call("POST", f"/api/cards/{tid}/move", {"version": v, "to": "triage", "reason": "x"})
+    assert stale[0] == 409 and "changed elsewhere" in json.loads(stale[2])["error"]
+    assert call("PATCH", f"/api/cards/{tid}", {"version": v, "title": "x"})[0] == 409
+    assert call("PATCH", f"/api/cards/{tid}", {"version": v, "assignee": "designer"})[0] == 409
+    assert call("PATCH", f"/api/cards/{tid}", {"version": -(2**70), "title": "x"})[0] == 409
+
+
 def test_patch_with_a_new_role_and_fields_applies_both(
     call: Call, conn: sqlite3.Connection, card: Card
 ) -> None:

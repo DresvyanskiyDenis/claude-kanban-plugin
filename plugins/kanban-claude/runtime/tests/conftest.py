@@ -3,16 +3,18 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from kanban_claude import cli, store
+from kanban_claude import cli, install, launchd, paths, store, web
 from kanban_claude.procs import Procs
 
 HERE = Path(__file__).resolve().parent
+PLUGIN = "kanban-claude@claude-kanban-plugin"
 
 GH_SCRIPT = """#!{python}
 import json, os, sys
@@ -42,9 +44,80 @@ elif args[:2] == ["pr", "merge"]:
     json.dump(prs, open(os.environ["GH_FAKE_PRS"], "w"))
 elif args[:2] == ["repo", "view"]:
     print(json.dumps({{"defaultBranchRef": {{"name": os.environ.get("GH_FAKE_DEFAULT", "main")}}}}))
+elif args[:2] == ["auth", "status"]:
+    mode = os.environ.get("GH_FAKE_AUTH", "keyring")
+    if mode == "out":
+        sys.stderr.write("You are not logged into any GitHub hosts.\\n")
+        sys.exit(1)
+    host = args[args.index("--hostname") + 1]
+    print(host + "\\n  Logged in to " + host + " account t (" + mode + ")")
+elif args[0] == "api":
+    answers = json.load(open(os.environ["GH_FAKE_API"]))
+    if args[-1] not in answers:
+        sys.stderr.write("gh: Not Found (HTTP 404)\\n")
+        sys.exit(1)
+    print(json.dumps(answers[args[-1]]))
 else:
     sys.exit(2)
 """
+
+
+LAUNCHCTL_SCRIPT = """#!__PYTHON__
+import json, os, plistlib, sys
+args = sys.argv[1:]
+with open(os.environ["LAUNCHCTL_FAKE_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\\n")
+state_path = os.environ["LAUNCHCTL_FAKE_STATE"]
+loaded = open(state_path).read() if os.path.exists(state_path) else ""
+domain, label = f"gui/{os.getuid()}", "kanban-claude.daemon"
+
+
+def fail(code, message):
+    sys.stderr.write(message + "\\n")
+    sys.exit(code)
+
+
+def put(value):
+    with open(state_path, "w") as f:
+        f.write(value)
+
+
+if args == ["print", f"{domain}/{label}"]:
+    if not loaded:
+        fail(113, "Could not find service")
+elif args[:2] == ["bootstrap", domain] and len(args) == 3:
+    if loaded:
+        fail(5, "Bootstrap failed: 5: Input/output error")
+    with open(args[2], "rb") as f:
+        if plistlib.load(f)["Label"] != label:
+            fail(5, "Bootstrap failed: 5: Input/output error")
+    put(args[2])
+elif args == ["bootout", f"{domain}/{label}"]:
+    if not loaded:
+        fail(3, "Boot-out failed: 3: No such process")
+    put("")
+elif args == ["kickstart", "-k", f"{domain}/{label}"]:
+    if not loaded:
+        fail(113, "Could not find service")
+else:
+    fail(64, "fake launchctl: unexpected " + " ".join(args))
+"""
+
+UV_SCRIPT = """#!__PYTHON__
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["UV_FAKE_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\\n")
+if args == ["tool", "dir", "--bin"]:
+    print(os.environ["UV_FAKE_BIN"])
+elif args[:2] not in (["tool", "install"], ["tool", "uninstall"]):
+    sys.exit(2)
+"""
+
+
+def install_fake(path: Path, script: str) -> None:
+    path.write_text(script.replace("__PYTHON__", sys.executable))
+    path.chmod(0o755)
 
 
 @pytest.fixture(autouse=True)
@@ -55,7 +128,13 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HOME", str(user))
     monkeypatch.setenv("KANBAN_HOME", str(tmp_path / "kb-home"))
     monkeypatch.setenv("KANBAN_WORK", str(tmp_path / "kb-work"))
-    for var in ("KANBAN_RUN_ID", "KANBAN_BOARD", "KANBAN_TASK", "CLAUDE_CONFIG_DIR"):
+    for var in (
+        "KANBAN_RUN_ID",
+        "KANBAN_BOARD",
+        "KANBAN_TASK",
+        "CLAUDE_CONFIG_DIR",
+        *launchd.CAPTURED,
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
@@ -67,12 +146,53 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     gh = bindir / "gh"
     gh.write_text(GH_SCRIPT.format(python=sys.executable))
     gh.chmod(0o755)
+    install_fake(bindir / "launchctl", LAUNCHCTL_SCRIPT)
+    install_fake(bindir / "uv", UV_SCRIPT)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("LAUNCHCTL_FAKE_LOG", str(tmp_path / "launchctl.log"))
+    monkeypatch.setenv("LAUNCHCTL_FAKE_STATE", str(tmp_path / "launchctl.state"))
+    monkeypatch.setenv("UV_FAKE_LOG", str(tmp_path / "uv.log"))
+    monkeypatch.setenv("UV_FAKE_BIN", str(user / ".local" / "bin"))
     monkeypatch.setenv("GH_FAKE_LOG", str(tmp_path / "gh.log"))
     prs = tmp_path / "prs.json"
     prs.write_text("{}")
     monkeypatch.setenv("GH_FAKE_PRS", str(prs))
+    api = tmp_path / "api.json"
+    api.write_text("{}")
+    monkeypatch.setenv("GH_FAKE_API", str(api))
     return tmp_path
+
+
+class Calls:
+    """The argv lines a fake tool logged, one JSON list per call."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def __call__(self) -> list[list[str]]:
+        return (
+            [json.loads(line) for line in self.path.read_text().splitlines()]
+            if self.path.exists()
+            else []
+        )
+
+
+@pytest.fixture
+def launchctl_calls(env: Path) -> Calls:
+    return Calls(env / "launchctl.log")
+
+
+@pytest.fixture
+def uv_calls(env: Path) -> Calls:
+    return Calls(env / "uv.log")
+
+
+@pytest.fixture
+def agent_loaded(env: Path) -> Callable[[], bool]:
+    """Whether the fake launchd currently holds `kanban-claude.daemon`."""
+    return lambda: (
+        (env / "launchctl.state").exists() and bool((env / "launchctl.state").read_text())
+    )
 
 
 Kb = Callable[..., tuple[int, str, str]]
@@ -100,6 +220,16 @@ def git(*args: str, cwd: Path) -> str:
 def set_prs(env: Path) -> Callable[[dict[str, dict[str, Any]]], None]:
     def put(prs: dict[str, dict[str, Any]]) -> None:
         (env / "prs.json").write_text(json.dumps(prs))
+
+    return put
+
+
+@pytest.fixture
+def set_api(env: Path) -> Callable[[dict[str, Any]], None]:
+    """What `gh api PATH` answers, by path; a path that is absent fails with a 404."""
+
+    def put(answers: dict[str, Any]) -> None:
+        (env / "api.json").write_text(json.dumps(answers))
 
     return put
 
@@ -202,7 +332,39 @@ def fake_claude(env: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path.write_text(f"#!{sys.executable}\n{body}")
     path.chmod(0o755)
     monkeypatch.setenv("FAKE_CLAUDE_FIXTURES", str(HERE / "fixtures"))
+    path.with_name("claude.json").write_text(
+        json.dumps({"FAKE_CLAUDE_FIXTURES": str(HERE / "fixtures")})
+    )
     return path
+
+
+@pytest.fixture
+def knobs(fake_claude: Path) -> Callable[..., None]:
+    """Set FAKE_CLAUDE_* for calls that run under a scrubbed environment, as setup's probes do."""
+    conf = fake_claude.with_name("claude.json")
+
+    def put(**values: str) -> None:
+        conf.write_text(json.dumps({**json.loads(conf.read_text()), **values}))
+
+    return put
+
+
+@pytest.fixture
+def board_up(
+    env: Path, knobs: Callable[..., None], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[int]:
+    """What the daemon would serve once launchd starts it, plus the `kanban` entry point uv installs."""
+    entry = Path.home() / ".local" / "bin"
+    entry.mkdir(parents=True)
+    (entry / "kanban").write_text("#!/bin/sh\n")
+    (entry / "kanban").chmod(0o755)
+    knobs(FAKE_CLAUDE_LOG=str(env / "claude.log"))
+    monkeypatch.setattr(install, "HEALTH_WAIT_S", 0.5)
+    server = web.make_server(paths.dirs(), port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server.port
+    server.shutdown()
+    server.server_close()
 
 
 Go = Callable[..., "subprocess.CompletedProcess[str]"]
@@ -274,3 +436,19 @@ def execute(conn: Any, claim: Callable[[str], int], go: Go) -> Execute:
         return conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
 
     return do
+
+
+@pytest.fixture
+def healthy(kb: Kb, board_up: int, env: Path) -> int:
+    for tool in ("npx", "node"):
+        (env / "bin" / tool).write_text("#!/bin/sh\n")
+        (env / "bin" / tool).chmod(0o755)
+    enable(Path.home() / ".claude")
+    code, _, err = kb("setup", "--port", str(board_up))
+    assert code == 0, err
+    return board_up
+
+
+def enable(config_dir: Path, on: bool = True) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "settings.json").write_text(json.dumps({"enabledPlugins": {PLUGIN: on}}))

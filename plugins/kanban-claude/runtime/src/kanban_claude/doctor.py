@@ -1,0 +1,557 @@
+"""OBS-05: `kanban doctor`. Twenty checks, each alone, so one broken thing never hides the rest."""
+
+import contextlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import stat
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from . import (
+    __version__,
+    dispatcher,
+    ghops,
+    install,
+    launchd,
+    protection,
+    runner,
+    store,
+    views,
+    web,
+)
+from .errors import Error
+from .paths import dirs
+from .procs import Procs
+
+MIN_FREE_BYTES = 2 * 1024**3
+CA_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS")
+ENV_TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+PLUGIN_KEY = install.PLUGIN_INSTALL.split()[-1]
+SETUP = "/kanban-claude:setup"
+FIX = "kanban doctor --fix"
+RULESET_FIX = (
+    "needs admin rights: gh api --hostname <host> --method POST repos/<owner>/<repo>/rulesets "
+    "--input - (the ruleset bodies are in the README, section Branch protection)"
+)
+
+
+@dataclass
+class Result:
+    status: str  # ok | warn | fail | skip
+    detail: str
+    fix: str | None = None
+    auto: str | None = None  # which `--fix` repair covers it
+
+
+@dataclass
+class Ctx:
+    conn: sqlite3.Connection
+    stamp: dict[str, Any]
+    probe: bool
+    daemon: dict[str, Any] | None = None  # check 2's /healthz reply, for check 3
+
+
+def ok(detail: str) -> Result:
+    return Result("ok", detail)
+
+
+def warn(detail: str, fix: str | None = None) -> Result:
+    return Result("warn", detail, fix)
+
+
+def fail(detail: str, fix: str | None = None, auto: str | None = None) -> Result:
+    return Result("fail", detail, fix, auto)
+
+
+CHECKS: list[tuple[int, str, str | None, Callable[[Ctx], Result]]] = []
+
+
+def check(n: int, name: str, fix: str | None = None) -> Callable[[Callable[[Ctx], Result]], Any]:
+    """Register a check; `fix` is what an Error raised inside it points the owner at."""
+
+    def register(fn: Callable[[Ctx], Result]) -> Callable[[Ctx], Result]:
+        CHECKS.append((n, name, fix, fn))
+        return fn
+
+    return register
+
+
+def port(c: Ctx) -> int:
+    return int(c.stamp.get("port") or store.cfg(c.conn, "web.port"))
+
+
+def claude_path(c: Ctx) -> str:
+    found = store.cfg(c.conn, "claude.bin") or c.stamp.get("claude_bin") or shutil.which("claude")
+    if not found:
+        raise Error("claude is not on PATH and no setup recorded one")
+    return str(found)
+
+
+def plist_env() -> dict[str, str] | None:
+    plist = launchd.read_plist()
+    return None if plist is None else dict(plist.get("EnvironmentVariables") or {})
+
+
+def config_dirs(c: Ctx) -> dict[str, list[str]]:
+    """Every Claude config directory in use, with the boards that name it (none: the global one)."""
+    glob = c.stamp.get("claude_config_dir") or store.cfg(c.conn, "claude.config_dir")
+    found: dict[str, list[str]] = {str(Path(glob or "~/.claude").expanduser()): []}
+    for b in c.conn.execute("SELECT * FROM boards WHERE archived_at IS NULL ORDER BY slug"):
+        d = str(Path(store.effective_config_dir(c.conn, b)).expanduser())
+        found.setdefault(d, []).append(b["slug"])
+    return found
+
+
+def describe(d: str, boards: list[str]) -> str:
+    return f"{d} (board {', '.join(boards)})" if boards else d
+
+
+# --- 1-3: the daemon ------------------------------------------------------------------------
+
+
+@check(1, "LaunchAgent loaded")
+def launchagent(c: Ctx) -> Result:
+    if launchd.loaded():
+        return ok(launchd.target())
+    return fail(f"{launchd.LABEL} is not loaded in launchd", FIX, "agent")
+
+
+@check(2, "board answers /healthz")
+def healthz(c: Ctx) -> Result:
+    try:
+        _, c.daemon = web.ask_board(port(c), dirs().home)
+    except Error as e:
+        return fail(str(e), f"read {dirs().home / 'logs' / 'daemon.log'}, then rerun {SETUP}")
+    return ok(f"127.0.0.1:{port(c)} answers as this board")
+
+
+@check(3, "versions match", SETUP)
+def versions(c: Ctx) -> Result:
+    if not c.stamp:
+        return fail("installed.json is missing or unreadable: setup has not completed", SETUP)
+    seen = {"tool": __version__, "installed": c.stamp["version"]}
+    if c.daemon:
+        seen["daemon"] = str(c.daemon.get("version"))
+    if root := os.environ.get("CLAUDE_PLUGIN_ROOT"):
+        with contextlib.suppress(OSError, ValueError, KeyError):
+            seen["plugin"] = json.loads(
+                (Path(root) / ".claude-plugin" / "plugin.json").read_text()
+            )["version"]
+    detail = ", ".join(f"{k} {v}" for k, v in seen.items())
+    return fail(detail, SETUP) if len(set(seen.values())) > 1 else ok(detail)
+
+
+# --- 4-6: the database ----------------------------------------------------------------------
+
+
+@check(4, "database integrity", "restore the newest copy in the backups directory")
+def quick_check(c: Ctx) -> Result:
+    rows = [r[0] for r in c.conn.execute("PRAGMA quick_check")]
+    if rows == ["ok"]:
+        return ok("PRAGMA quick_check: ok")
+    return fail("; ".join(rows[:3]), f"restore the newest copy from {dirs().home / 'backups'}")
+
+
+@check(5, "schema version")
+def schema(c: Ctx) -> Result:
+    have, want = c.conn.execute("PRAGMA user_version").fetchone()[0], len(store.MIGRATIONS)
+    if have == want:
+        return ok(f"schema {have}")
+    if have < want:
+        return fail(f"schema {have}, this tool expects {want}", "kanban migrate")
+    return fail(f"schema {have} is newer than this tool's {want}", f"upgrade the tool: {SETUP}")
+
+
+@check(6, "running cards and runs agree (STO-06)")
+def invariant(c: Ctx) -> Result:
+    cards = [
+        r[0]
+        for r in c.conn.execute(
+            "SELECT id FROM tasks t WHERE status = 'running' AND NOT EXISTS "
+            "(SELECT 1 FROM task_runs r WHERE r.task_id = t.id AND r.status = 'running')"
+        )
+    ]
+    runs = [
+        r[0]
+        for r in c.conn.execute(
+            "SELECT r.id FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.status = 'running' AND t.status <> 'running'"
+        )
+    ]
+    if not (cards or runs):
+        return ok("every running card has a running run, and the other way round")
+    detail = [f"card {i} is running without a run" for i in cards]
+    detail += [f"run {i} is running but its card is not" for i in runs]
+    return fail("; ".join(detail), FIX, "state")
+
+
+# --- 7-9: claude ----------------------------------------------------------------------------
+
+
+@check(7, "claude binary", "kanban setup --claude-bin /absolute/path/to/claude")
+def claude(c: Ctx) -> Result:
+    path = claude_path(c)
+    return ok(f"{path} {install.claude_version(path)}")
+
+
+@check(8, "config directories exist")
+def config_exist(c: Ctx) -> Result:
+    dirs_ = config_dirs(c)
+    gone = [describe(d, b) for d, b in dirs_.items() if not Path(d).is_dir()]
+    if not gone:
+        return ok(", ".join(dirs_))
+    return fail(
+        f"missing: {'; '.join(gone)}",
+        "log in there once, which creates it: "
+        + runner.login_command(runner.with_config_dir({}, next(iter(dirs_)))),
+    )
+
+
+@check(9, "plugin enabled in every config directory")
+def plugin_enabled(c: Ctx) -> Result:
+    problems, fixes = [], []
+    for d, boards in config_dirs(c).items():
+        try:
+            enabled = json.loads((Path(d) / "settings.json").read_text())["enabledPlugins"]
+        except (OSError, ValueError, KeyError, TypeError):
+            enabled = {}
+        if not (isinstance(enabled, dict) and enabled.get(PLUGIN_KEY) is True):
+            problems.append(f"{describe(d, boards)}: {PLUGIN_KEY} is not enabled at user scope")
+            prefix = runner.login_command(runner.with_config_dir({}, d)).split(" claude")[0]
+            fixes.append(
+                f"{prefix + ' ' if prefix != 'claude /login' else ''}claude, then "
+                f"{install.PLUGIN_INSTALL}"
+            )
+            continue
+        if c.probe:
+            env = install.probe_env(c.stamp.get("env") or {}, d)
+            try:
+                install.check_agent(claude_path(c), env, d)
+            except Error as e:
+                problems.append(str(e))
+            if why := runner.auth_probe(c.conn, d):
+                problems.append(f"{d}: {why}")
+                fixes.append(runner.login_command(runner.with_config_dir({}, d)))
+    if problems:
+        return fail("; ".join(problems), "; ".join(dict.fromkeys(fixes)) or None)
+    return ok("enabled" + (", the scout resolves and the login passes" if c.probe else ""))
+
+
+# --- 10-14: the host ------------------------------------------------------------------------
+
+
+@check(10, "gh logged in per host")
+def gh_auth(c: Ctx) -> Result:
+    hosts = sorted(
+        {s.partition("/")[0] for mine in protection.repos(c.conn).values() for s in mine}
+    )
+    if not hosts:
+        return ok("no board uses a git remote")
+    out, tokens, down = [], [], []
+    for host in hosts:
+        try:
+            status = ghops.auth_status(host)
+        except Error as e:
+            down.append(f"{host}: {e}")
+            continue
+        out.append(host)
+        if (m := re.search(r"Logged in to \S+ account \S+ \(([^)]+)\)", status)) and m[
+            1
+        ] in ENV_TOKENS:
+            tokens.append(host)
+    login = f"gh auth login --hostname {(down or tokens or hosts)[0].split(':')[0]}"
+    if down:
+        return fail("; ".join(down), login)
+    if tokens:
+        return warn(
+            f"{', '.join(tokens)}: logged in through a token variable, not the keychain", login
+        )
+    return ok(f"logged in to {', '.join(out)}")
+
+
+@check(11, "uv on PATH", install.TOOL_FIX["uv"])
+def uv(c: Ctx) -> Result:
+    found = shutil.which("uv")
+    return ok(found) if found else fail("uv is not on PATH", install.TOOL_FIX["uv"])
+
+
+@check(12, "CA variables reach the daemon")
+def ca_variables(c: Ctx) -> Result:
+    env = plist_env()
+    if env is None:
+        return Result("skip", "no LaunchAgent plist to compare with")
+    lost = [v for v in CA_VARS if v in os.environ and v not in env]
+    if lost:
+        return warn(f"{', '.join(lost)} set in this shell but not in the plist", f"rerun {SETUP}")
+    return ok("every CA variable of this shell is in the plist")
+
+
+@check(13, "plist PATH resolves the tools")
+def plist_tools(c: Ctx) -> Result:
+    plist, env = launchd.read_plist(), plist_env()
+    if plist is None or env is None:
+        return Result("skip", "no LaunchAgent plist to read")
+    path = env.get("PATH", "")
+    lost = [t for t in ("claude", "gh", "git", "uv") if not shutil.which(t, path=path)]
+    entry = (plist.get("ProgramArguments") or [""])[0]
+    if not os.access(entry, os.X_OK):
+        lost.append(f"kanban ({entry})")
+    if lost:
+        return fail(f"not found: {', '.join(lost)}", f"rerun {SETUP}")
+    if soft := [t for t in ("npx", "node") if not shutil.which(t, path=path)]:
+        return warn(
+            f"not found: {', '.join(soft)} (only the designer needs them)", f"rerun {SETUP}"
+        )
+    return ok("claude, gh, git, uv, npx, node and kanban resolve")
+
+
+@check(14, "free disk space")
+def disk(c: Ctx) -> Result:
+    d, lows, seen = dirs(), [], []
+    for p in (d.home, d.work):
+        while not p.exists() and p != p.parent:
+            p = p.parent
+        free = shutil.disk_usage(p).free
+        seen.append(f"{p}: {free / 1024**3:.1f} GB free")
+        if free < MIN_FREE_BYTES:
+            lows.append(str(p))
+    if lows:
+        return fail("; ".join(seen), "free some space, or move the work directory")
+    return ok("; ".join(seen))
+
+
+# --- 15-18: state ---------------------------------------------------------------------------
+
+
+@check(15, "pauses and quota walls")
+def pauses(c: Ctx) -> Result:
+    notes, now = [], store.now()
+    if p := store.state_get(c.conn, "dispatch_paused"):
+        extra = f": {p['detail']}" if p.get("detail") else ""
+        notes.append(f"dispatch paused ({p['reason']}) since {views.iso(p['since'])}{extra}")
+    for row in c.conn.execute("SELECT key FROM state WHERE key LIKE 'account:%' ORDER BY key"):
+        d = row["key"].removeprefix("account:")
+        acct = store.account_get(c.conn, d)
+        if acct.get("auth_paused"):
+            notes.append(
+                f"{d} is logged out; {runner.login_command(runner.with_config_dir({}, d))}"
+            )
+        for field, label in (("hard_until", "quota wall"), ("soft_until", "soft limit")):
+            if (acct.get(field) or 0) > now:
+                notes.append(f"{d}: {label} until {views.iso(acct[field])}")
+    if notes:
+        return warn("; ".join(notes), "kanban resume")
+    return ok("dispatch is running; no account is paused or walled")
+
+
+@check(16, "kept worktrees")
+def kept(c: Ctx) -> Result:
+    rows = c.conn.execute(
+        "SELECT id, worktree_state, workspace_path FROM tasks "
+        "WHERE worktree_state IN ('kept_dirty', 'kept_unpushed') ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return ok("none")
+    shown = [
+        f"{r['id']} {r['worktree_state']} ({r['workspace_path']}/.worktrees/{r['id']})"
+        for r in rows
+    ]
+    return warn(
+        "; ".join(shown[:10]) + (f"; and {len(rows) - 10} more" if len(rows) > 10 else ""),
+        "push or discard each one, then git worktree remove it; kanban never deletes them",
+    )
+
+
+def mode_problems() -> list[tuple[Path, int, int]]:
+    d = dirs()
+    home = d.home
+    wanted = [(home, 0o700), (d.work, 0o700)] + [
+        (p, 0o600)
+        for p in (
+            home / "kanban.db", home / "kanban.db-wal", home / "kanban.db-shm",
+            home / "web.secret", install.stamp_path(), launchd.plist_path(),
+            *sorted(p for p in (home / "logs").rglob("*") if p.is_file()),
+        )
+    ]  # fmt: skip
+    wrong = []
+    for path, want in wanted:
+        with contextlib.suppress(OSError):
+            have = stat.S_IMODE(path.stat().st_mode)
+            if have != want:
+                wrong.append((path, have, want))
+    return wrong
+
+
+@check(17, "file modes (SEC-06)")
+def modes(c: Ctx) -> Result:
+    wrong = mode_problems()
+    if not wrong:
+        return ok("directories 0700; database, secret, stamp, logs and plist 0600")
+    return fail("; ".join(f"{p} is {h:04o}, want {w:04o}" for p, h, w in wrong), FIX, "modes")
+
+
+@check(18, "runners alive for running runs")
+def runners(c: Ctx) -> Result:
+    procs, ts, dead = Procs(), store.now(), []
+    for r in c.conn.execute("SELECT * FROM task_runs WHERE status = 'running'").fetchall():
+        young = r["runner_pid"] is None and ts - r["started_at"] < dispatcher.CRASH_GRACE_S
+        if not young and not procs.alive(r["runner_pid"], r["runner_started"]):
+            dead.append(f"run {r['id']} of {r['task_id']}")
+    if dead:
+        return fail(f"no runner process for {', '.join(dead)}", FIX, "state")
+    return ok("every running run has its runner")
+
+
+# --- 19-20: GitHub and Jira -----------------------------------------------------------------
+
+
+@check(19, "branch protection (GIT-08)")
+def branch_protection(c: Ctx) -> Result:
+    found = protection.refresh(c.conn)
+    flagged = sorted({s for slugs in found["boards"].values() for s in slugs})
+    notes = [f"{s}: the default branch or feature/* has no protection" for s in flagged]
+    if found["unknown"]:
+        notes.append(f"could not be read: {', '.join(found['unknown'])}")
+    if notes:
+        return warn("; ".join(notes), RULESET_FIX)
+    return ok(
+        "every repo a board uses is protected"
+        if protection.repos(c.conn)
+        else "no board uses a repo"
+    )
+
+
+@check(20, "Jira pairing")
+def jira(c: Ctx) -> Result:
+    paired = [r["key"].removeprefix("jira:") for r in c.conn.execute(
+        "SELECT key FROM state WHERE key LIKE 'jira:%' ORDER BY key"
+    )]  # fmt: skip
+    if not paired:
+        return ok("no board is paired")
+    row = c.conn.execute("SELECT value FROM config WHERE key = 'jira.assignee'").fetchone()
+    if not row or not json.loads(row["value"]):
+        return fail(
+            f"{', '.join(paired)} paired, but jira.assignee is not set",
+            "kanban config set jira.assignee <user>",
+        )
+    note = (
+        " (--probe of jira.mcp_command skipped: the Jira sync is not built yet)" if c.probe else ""
+    )
+    paused = [b for b in paired if (store.state_get(c.conn, f"jira:{b}") or {}).get("paused")]
+    if paused:
+        return warn(f"sync paused on {', '.join(paused)}{note}", "kanban resume")
+    return ok(f"{', '.join(paired)}: assignee set, sync running{note}")
+
+
+# --- running them, and --fix ----------------------------------------------------------------
+
+
+def evaluate(c: Ctx) -> list[tuple[int, str, Result]]:
+    c.daemon = None
+    out = []
+    for n, name, fix, fn in CHECKS:
+        try:
+            r = fn(c)
+        except Error as e:
+            r = fail(str(e), fix)
+        except (
+            Exception
+        ) as e:  # a check that crashes is a check that failed, not a doctor that died
+            r = fail(f"{type(e).__name__}: {e}", fix)
+        out.append((n, name, r))
+    return out
+
+
+def restore_agent(c: Ctx) -> str:
+    d = dirs()
+    plist = launchd.plist_path()
+    if not plist.exists():
+        if not c.stamp.get("env"):
+            raise Error(f"the plist is gone and installed.json cannot rebuild it; run {SETUP}")
+        plist = launchd.install_plist(
+            launchd.render(install.kanban_entry(), c.stamp["env"], d.home, d.work)
+        )
+    launchd.bootstrap(plist)
+    with contextlib.suppress(Error):
+        install.wait_for_board(port(c), d.home)
+    return f"loaded {launchd.LABEL} from {plist}"
+
+
+def repair(c: Ctx, results: list[tuple[int, str, Result]]) -> tuple[list[str], list[str]]:
+    """Only what is safe: file modes, a missing LaunchAgent, the STO-06 mismatch through reconcile."""
+    wanted = {r.auto for _, _, r in results if r.status != "ok" and r.auto}
+    fixed: list[str] = []
+    unfixed: list[str] = []
+    if "modes" in wanted:
+        for path, _, want in mode_problems():
+            os.chmod(path, want)
+            fixed.append(f"chmod {want:04o} {path}")
+    if "agent" in wanted:
+        try:
+            fixed.append(restore_agent(c))
+        except Error as e:
+            unfixed.append(str(e))
+    if "state" in wanted:
+        dispatcher.repair_running(c.conn)
+        ended = dispatcher.reconcile(c.conn, store.now(), Procs())
+        fixed.append(f"repaired running cards; ended {len(ended)} run(s) whose runner is gone")
+    return fixed, unfixed
+
+
+def report(
+    results: list[tuple[int, str, Result]], fixed: list[str], unfixed: list[str]
+) -> tuple[dict[str, Any], str]:
+    counts = {s: sum(r.status == s for _, _, r in results) for s in ("ok", "warn", "fail", "skip")}
+    data = {
+        "ok": counts["fail"] == 0,
+        "checks": [
+            {"n": n, "name": name, "status": r.status, "detail": r.detail, "fix": r.fix}
+            for n, name, r in results
+        ],
+        "fixed": fixed,
+        "unfixed": unfixed,
+    }
+    label = {"ok": "ok  ", "warn": "warn", "fail": "FAIL", "skip": "skip"}
+    lines = []
+    for n, name, r in results:
+        lines.append(f"{label[r.status]} {n:2}  {name}: {r.detail}")
+        if r.fix and r.status in ("warn", "fail"):
+            lines.append(f"         fix: {r.fix}")
+    lines += [f"fixed: {f}" for f in fixed] + [f"not fixed: {u}" for u in unfixed]
+    lines.append(
+        f"{len(results)} checks: {counts['ok']} ok, {counts['warn']} warn, {counts['fail']} fail"
+    )
+    return data, "\n".join(lines)
+
+
+def run(*, probe: bool, fix: bool) -> tuple[dict[str, Any], str]:
+    db = dirs().home / "kanban.db"
+    if not db.exists():
+        broken = Result("fail", f"no database in {dirs().home}: kanban is not set up", SETUP)
+        return report([(0, "set up", broken)], [], [])
+    try:
+        conn = store.connect(upgrade=False)
+    except sqlite3.DatabaseError as e:
+        broken = Result(
+            "fail",
+            f"{db} cannot be opened: {e}",
+            f"restore the newest copy from {dirs().home / 'backups'}",
+        )
+        return report([(0, "database opens", broken)], [], [])
+    try:
+        c = Ctx(conn, install.read_stamp() or {}, probe)
+        results = evaluate(c)
+        fixed: list[str] = []
+        unfixed: list[str] = []
+        if fix:
+            fixed, unfixed = repair(c, results)
+            if fixed or unfixed:
+                results = evaluate(c)
+        return report(results, fixed, unfixed)
+    finally:
+        conn.close()

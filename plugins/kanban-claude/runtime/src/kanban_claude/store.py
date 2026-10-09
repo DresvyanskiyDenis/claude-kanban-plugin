@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from . import ghops, validate
-from .errors import Error, NotFound, Refused
+from .errors import Error, NotFound, Refused, Stale
 from .paths import dirs, ensure_dir
 
 log = logging.getLogger("kanban.store")
@@ -230,6 +230,10 @@ def connect(home: Path | None = None, *, upgrade: bool = True) -> sqlite3.Connec
 
 @contextlib.contextmanager
 def tx(conn: sqlite3.Connection) -> Iterator[None]:
+    """Inside an open transaction the block joins it, and the outermost `tx` commits or rolls back."""
+    if conn.in_transaction:
+        yield
+        return
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield
@@ -395,18 +399,35 @@ def parents_satisfied(
     return _all_done(conn, [r[0] for r in conn.execute(q, (task_id,))], ignore_merge)
 
 
-def _cas(conn: sqlite3.Connection, task_id: str, expected: Sequence[str], **fields: Any) -> None:
-    """Status compare-and-swap (STO-02): any rowcount but 1 means the card moved under us."""
+def _stale(task_id: str) -> Stale:
+    return Stale(f"card {task_id} changed elsewhere since it was read; re-read it and retry")
+
+
+def _cas(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected: Sequence[str],
+    *,
+    version: int | None = None,
+    **fields: Any,
+) -> None:
+    """Status compare-and-swap (STO-02), and with `version` the card must still be at it (WEB-09).
+    Any rowcount but 1 means the card moved under us; a version mismatch is reported first."""
     sets = "".join(f"{k} = ?, " for k in fields)
+    guard = "" if version is None else " AND version = ?"
     cur = conn.execute(
         f"UPDATE tasks SET {sets}updated_at = ?, version = version + 1 "
-        f"WHERE id = ? AND status IN ({','.join('?' * len(expected))})",
-        [*fields.values(), now(), task_id, *expected],
+        f"WHERE id = ? AND status IN ({','.join('?' * len(expected))}){guard}",
+        [*fields.values(), now(), task_id, *expected, *([] if version is None else [version])],
     )
     if cur.rowcount != 1:
-        now_status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        now_row = conn.execute(
+            "SELECT status, version FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if now_row and version is not None and now_row["version"] != version:
+            raise _stale(task_id)
         raise Refused(
-            f"card {task_id} is {now_status['status'] if now_status else 'gone'}; "
+            f"card {task_id} is {now_row['status'] if now_row else 'gone'}; "
             f"this needs it in {' or '.join(expected)}"
         )
 
@@ -704,7 +725,12 @@ _EMPTY_CARD: dict[str, Any] = {
 
 
 def specify(
-    conn: sqlite3.Connection, task_id: str, fields: dict[str, Any], *, actor: str = OWNER
+    conn: sqlite3.Connection,
+    task_id: str,
+    fields: dict[str, Any],
+    *,
+    actor: str = OWNER,
+    expect_version: int | None = None,
 ) -> dict[str, Any]:
     t = get_task(conn, task_id)
     if t["status"] != "triage":
@@ -721,7 +747,7 @@ def specify(
     _dispatchable(conn, merged, b)
     with tx(conn):
         status = "ready" if parents_satisfied(conn, task_id) else "todo"
-        _cas(conn, task_id, ["triage"], **cols, status=status)
+        _cas(conn, task_id, ["triage"], version=expect_version, **cols, status=status)
         _ev(conn, t, "specified", actor, {"fields": sorted(cols), "status": status})
     return {"id": task_id, "status": status}
 
@@ -758,7 +784,7 @@ def edit(
             [*cols.values(), now(), task_id, version],
         )
         if cur.rowcount != 1:
-            raise Refused(f"card {task_id} changed since it was read; re-read it and retry")
+            raise _stale(task_id)
         _ev(conn, t, "edited", actor, {"fields": sorted(cols), "previous": previous})
     return {"id": task_id, "fields": sorted(cols)}
 
@@ -773,6 +799,7 @@ def assign(
     *,
     reclaim: bool = False,
     actor: str = OWNER,
+    expect_version: int | None = None,
 ) -> dict[str, Any]:
     roles = cfg(conn, "dispatch.roles")
     if role not in roles:
@@ -794,7 +821,10 @@ def assign(
             return {"id": task_id, "assignee": role, "run_id": run["id"]}
         if not changed:
             return {"id": task_id, "assignee": role, "noop": True}
-        _cas(conn, task_id, [s for s in STATUSES if s != "running"], assignee=role, **reset)
+        _cas(
+            conn, task_id, [s for s in STATUSES if s != "running"], version=expect_version,
+            assignee=role, **reset,
+        )  # fmt: skip
         _ev(conn, t, "assigned", actor, payload)
     return {"id": task_id, "assignee": role}
 
@@ -806,6 +836,7 @@ def promote(
     *,
     ignore_merge: bool = False,
     actor: str = OWNER,
+    expect_version: int | None = None,
 ) -> dict[str, Any]:
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
@@ -815,7 +846,7 @@ def promote(
                 f"card {task_id} still has an open parent; finish it, unlink it, "
                 "or for a stuck merge pass --ignore-merge"
             )
-        _cas(conn, task_id, ["todo"], status="ready", retry_after=None)
+        _cas(conn, task_id, ["todo"], version=expect_version, status="ready", retry_after=None)
         _ev(
             conn,
             t,
@@ -838,12 +869,17 @@ def promote_auto(conn: sqlite3.Connection, task_id: str, *, actor: str = "dispat
 
 
 def hold(
-    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    actor: str = OWNER,
+    expect_version: int | None = None,
 ) -> dict[str, Any]:
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         t = get_task(conn, task_id)
-        _cas(conn, task_id, ["todo", "ready", "blocked"], status="triage")
+        _cas(conn, task_id, ["todo", "ready", "blocked"], version=expect_version, status="triage")
         _ev(conn, t, "held", actor, {"reason": reason, "from": t["status"]})
     return {"id": task_id, "status": "triage"}
 
@@ -856,7 +892,12 @@ def _last_run_kind(conn: sqlite3.Connection, task_id: str) -> str | None:
 
 
 def unblock(
-    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    actor: str = OWNER,
+    expect_version: int | None = None,
 ) -> dict[str, Any]:
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
@@ -866,8 +907,9 @@ def unblock(
         else:
             target = "ready" if parents_satisfied(conn, task_id) else "todo"
         _cas(
-            conn, task_id, ["blocked"], status=target, consecutive_failures=0,
-            protocol_violations=0, last_failure_error=None, retry_after=None,
+            conn, task_id, ["blocked"], version=expect_version, status=target,
+            consecutive_failures=0, protocol_violations=0, last_failure_error=None,
+            retry_after=None,
         )  # fmt: skip
         _comment(conn, t, "owner", f"UNBLOCK: {reason}", actor)
         _ev(conn, t, "unblocked", actor, {"reason": reason, "status": target})
@@ -875,7 +917,12 @@ def unblock(
 
 
 def reopen_review(
-    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    actor: str = OWNER,
+    expect_version: int | None = None,
 ) -> dict[str, Any]:
     """review -> ready/todo for the implementer; also a done card whose merge failed (REV-05)."""
     reason = _need(reason, "reason", "pass --reason")
@@ -896,21 +943,29 @@ def reopen_review(
                 "completed_at": None,
             }
         target = "ready" if parents_satisfied(conn, task_id) else "todo"
-        _cas(conn, task_id, expected, status=target, assignee=t["implementer"], **merge_reset)
+        _cas(
+            conn, task_id, expected, version=expect_version, status=target,
+            assignee=t["implementer"], **merge_reset,
+        )  # fmt: skip
         _ev(conn, t, "review_reopened", actor, {"reason": reason, "status": target})
     return {"id": task_id, "status": target}
 
 
 def reopen(
-    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    actor: str = OWNER,
+    expect_version: int | None = None,
 ) -> dict[str, Any]:
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         t = get_task(conn, task_id)
         _cas(
-            conn, task_id, ["done"], status="ready", completed_at=None, merge_state=None,
-            merge_attempts=0, merge_next_at=None, merged_at=None, retry_after=None,
-            assignee=t["implementer"] or t["assignee"],
+            conn, task_id, ["done"], version=expect_version, status="ready", completed_at=None,
+            merge_state=None, merge_attempts=0, merge_next_at=None, merged_at=None,
+            retry_after=None, assignee=t["implementer"] or t["assignee"],
         )  # fmt: skip
         _ev(conn, t, "reopened", actor, {"reason": reason})
         children = conn.execute(
@@ -927,12 +982,20 @@ def reopen(
 
 
 def mark_done(
-    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    actor: str = OWNER,
+    expect_version: int | None = None,
 ) -> dict[str, Any]:
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         t = get_task(conn, task_id)
-        _cas(conn, task_id, ["review", "blocked"], status="done", completed_at=now())
+        _cas(
+            conn, task_id, ["review", "blocked"], version=expect_version, status="done",
+            completed_at=now(),
+        )  # fmt: skip
         _ev(conn, t, "completed_by_owner", actor, {"reason": reason, "from": t["status"]})
     return {"id": task_id, "status": "done"}
 
@@ -1019,7 +1082,12 @@ def stop(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) -> dict[
 
 
 def archive(
-    conn: sqlite3.Connection, task_id: str, *, rm: bool = False, actor: str = OWNER
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    rm: bool = False,
+    actor: str = OWNER,
+    expect_version: int | None = None,
 ) -> dict[str, Any]:
     blobs = dirs().home / "attachments" / task_id
     with tx(conn):
@@ -1046,6 +1114,7 @@ def archive(
                 conn,
                 task_id,
                 [s for s in STATUSES if s not in ("running", "archived")],
+                version=expect_version,
                 status="archived",
             )
             _ev(conn, t, "archived", actor, {"from": t["status"]})

@@ -19,6 +19,10 @@ class Refused(Error):
     exit = 4
 
 
+class Stale(Refused):
+    """The card changed after the caller read it (WEB-09); the web board answers 409."""
+
+
 class NotAllowed(Error):
     """Not allowed in this context (worker or owner gating)."""
 

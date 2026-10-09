@@ -104,6 +104,13 @@ def worker_env(
     return env
 
 
+def login_command(env: dict[str, str]) -> str:
+    """What the owner types to log in the account that `env` selects."""
+    if "CLAUDE_CONFIG_DIR" in env:
+        return f"CLAUDE_CONFIG_DIR={env['CLAUDE_CONFIG_DIR']} claude /login"
+    return "claude /login"
+
+
 def auth_probe(conn: sqlite3.Connection, config_dir: str) -> str | None:
     """OBS-03: one cheap `claude -p` under the account's own login. None when the login passes,
     else why not: only a login failure counts as one; a probe that could not run says so."""
@@ -121,12 +128,7 @@ def auth_probe(conn: sqlite3.Connection, config_dir: str) -> str | None:
             return None
     except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as e:
         return f"probe failed: {e}"
-    fix = (
-        f"CLAUDE_CONFIG_DIR={config_dir} claude /login"
-        if "CLAUDE_CONFIG_DIR" in env
-        else "claude /login"
-    )
-    return f"login failed ({line or out.get('api_error_status')}); run: {fix}"
+    return f"login failed ({line or out.get('api_error_status')}); run: {login_command(env)}"
 
 
 def skill_exists(config_dir: str, name: str) -> bool:

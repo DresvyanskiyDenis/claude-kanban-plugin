@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-x","permissionMode":"default","claude_code_version":"2.1.0","plugins":[]}
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"ok","total_cost_usd":0,"session_id":"s1"}

@@ -28,6 +28,15 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def write_private(path: Path, content: bytes) -> None:
+    """Write `path` 0600 from the first byte and swap it in whole, so no reader sees it half-written."""
+    tmp = path.with_name(path.name + ".new")
+    tmp.unlink(missing_ok=True)
+    with os.fdopen(os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as f:
+        f.write(content)
+    tmp.replace(path)
+
+
 def run_files(board: str, task: str, n: int) -> tuple[Path, Path]:
     """The runner log and the raw stream sidecar of run `n` (RUN-18); derived, never read back."""
     home = dirs().home

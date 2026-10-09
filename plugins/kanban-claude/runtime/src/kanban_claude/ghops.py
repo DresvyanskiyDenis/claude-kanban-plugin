@@ -19,6 +19,20 @@ def gh(*args: str, timeout: int = 60) -> str:
     return p.stdout
 
 
+def auth_status(host: str) -> str:
+    """What `gh auth status` says about `host` (stdout or stderr, depending on the gh version)."""
+    try:
+        p = subprocess.run(
+            ["gh", "auth", "status", "--hostname", host], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Error(f"gh failed: {e}") from e
+    out = (p.stdout + p.stderr).strip()
+    if p.returncode != 0:
+        raise Error(out[:300] or f"gh auth status failed for {host}")
+    return out
+
+
 def pr_view(
     repo: str, number: int, fields: str = "url,state,headRefName,baseRefName"
 ) -> dict[str, Any]:

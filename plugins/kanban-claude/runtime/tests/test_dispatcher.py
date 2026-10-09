@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import dispatcher, gitops, runner, store, web
+from kanban_claude import dispatcher, gitops, housekeeping, runner, store, web
 from kanban_claude.dispatcher import dispatch_once
 from kanban_claude.errors import Refused
 
@@ -539,6 +539,9 @@ def test_the_daemon_serves_the_board_with_the_tick_skip_reasons(
 ) -> None:
     seen: dict[str, Any] = {}
     real = web.make_server
+    c = store.connect()
+    store.state_put(c, "protection", {"boards": {"any": ["host/acme/proj"]}})
+    c.close()
 
     def make_server(*a: Any, **k: Any) -> web.WebServer:
         seen["srv"] = real(*a, **k)
@@ -556,8 +559,22 @@ def test_the_daemon_serves_the_board_with_the_tick_skip_reasons(
     monkeypatch.setattr(dispatcher, "tick_loop", tick)
     assert dispatcher.serve() == 1  # the stub tick returns, so its thread "dies"
     assert seen["status"] == 200
-    assert seen["live"] == {"skips": {"t_1": "no_assignee"}}
+    assert seen["live"] == {"skips": {"t_1": "no_assignee"}, "unprotected": ["host/acme/proj"]}
     assert seen["srv"].socket.fileno() == -1, "the board socket outlived the daemon"
+
+
+def test_the_housekeeping_loop_publishes_the_fresh_protection_list_after_each_wakeup(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stop, shared = threading.Event(), {"old": ["gone/x/y"]}
+
+    def wakeup(conn: Any) -> None:
+        store.state_put(conn, "protection", {"boards": {"main": ["host/acme/proj"]}})
+        stop.set()
+
+    monkeypatch.setattr(housekeeping, "run_due", wakeup)
+    dispatcher.housekeeping_loop(stop, shared)
+    assert shared == {"main": ["host/acme/proj"]}
 
 
 def test_a_daemon_that_cannot_bind_the_board_port_exits_non_zero(

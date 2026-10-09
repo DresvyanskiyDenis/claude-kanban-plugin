@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from . import housekeeping, store, validate, web
+from . import housekeeping, protection, store, validate, web
 from .errors import Error
 from .paths import dirs, ensure_dir, run_files
 from .procs import Procs
@@ -88,6 +88,14 @@ def repair_running(conn: sqlite3.Connection) -> None:
                     ),
                 )
                 store.event(conn, t, "repaired", "dispatcher", {"reason": "running without a run"})
+
+
+def stop(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """RUN-17: the DB first, then SIGTERM to the runner, whose pid and start time are verified."""
+    data = store.stop(conn, task_id)
+    if Procs().alive(data["runner_pid"], data["runner_started"]):
+        os.kill(data["runner_pid"], signal.SIGTERM)
+    return data
 
 
 def expire_walls(conn: sqlite3.Connection, ts: int) -> None:
@@ -285,11 +293,13 @@ def tick_loop(stop: threading.Event, memory: dict[str, str]) -> None:
             stop.wait(FAILURE_WAIT_S)
 
 
-def housekeeping_loop(stop: threading.Event) -> None:
+def housekeeping_loop(stop: threading.Event, unprotected: dict[str, list[str]]) -> None:
+    """`unprotected` is the board's per-board list of repos without branch protection (GIT-08)."""
     conn = store.connect()
     while not stop.is_set():
         try:
             housekeeping.run_due(conn)
+            protection.publish(conn, unprotected)
         except Exception:
             log.exception("housekeeping failed")
         stop.wait(HOUSEKEEPING_S)
@@ -309,10 +319,16 @@ def serve() -> int:
     if lock is None:
         log.info("another daemon holds %s; exiting", home / "daemon.lock")
         return 0
-    store.connect().close()  # create and migrate once: two threads doing it together hit "locked"
     memory: dict[str, str] = {}
+    unprotected: dict[str, list[str]] = {}
+    boot = store.connect()  # create and migrate once: two threads doing it together hit "locked"
+    protection.publish(boot, unprotected)
+    boot.close()
     try:  # dict.copy() is atomic under the GIL, so a request never sees a half-updated map
-        board = web.make_server(dirs(), live=lambda slug: {"skips": memory.copy()})
+        board = web.make_server(
+            dirs(),
+            live=lambda slug: {"skips": memory.copy(), "unprotected": unprotected.get(slug, [])},
+        )
     except OSError as e:
         log.error("cannot serve the board: %s", e)
         os.close(lock)
@@ -322,7 +338,9 @@ def serve() -> int:
         signal.signal(sig, lambda *_: signalled.append(True))
     threads = [
         threading.Thread(target=tick_loop, args=(stop, memory), name="tick", daemon=True),
-        threading.Thread(target=housekeeping_loop, args=(stop,), name="housekeeping", daemon=True),
+        threading.Thread(
+            target=housekeeping_loop, args=(stop, unprotected), name="housekeeping", daemon=True
+        ),
         threading.Thread(target=board.serve_forever, name="web", daemon=True),
     ]
     for t in threads:

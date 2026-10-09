@@ -15,7 +15,7 @@ import threading
 import time
 import webbrowser
 from argparse import Namespace
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,7 +25,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from . import __version__, paths, store, validate, views
-from .errors import Error, NotAllowed, NotFound, Refused, Usage
+from .errors import Error, NotAllowed, NotFound, Refused, Stale, Usage
 
 log = logging.getLogger("kanban.web")
 
@@ -98,7 +98,7 @@ RUN_COLS = (
     "id", "n", "kind", "role", "status", "outcome", "summary", "error", "started_at", "ended_at",
     "model", "effort", "cost_usd", "num_turns",
 )  # fmt: skip
-STATUS = {Usage: 400, NotFound: 404, NotAllowed: 403, Refused: 422}
+STATUS = {Usage: 400, NotFound: 404, NotAllowed: 403, Refused: 422, Stale: 409}
 TID = r"(t_[0-9a-f]{8})"
 SLUG = r"([a-z0-9][a-z0-9_-]{0,63})"
 
@@ -350,15 +350,20 @@ def need_version(body: dict[str, Any]) -> int:
     v = body.get("version")
     if isinstance(v, bool) or not isinstance(v, int):
         raise Usage("version is required: the card version you last read")
-    return v
+    return v if -(2**63) <= v < 2**63 else -1  # beyond SQLite's integers: no card has it, so stale
 
 
-def current(r: Req, task_id: str, version: int) -> sqlite3.Row:
-    """WEB-09. The verbs only compare status, so the page's version is checked here first."""
-    t = store.get_task(r.conn, task_id)
-    if t["version"] != version:
-        raise Fail(409, "this card changed elsewhere; reload it and retry")
-    return t
+@contextlib.contextmanager
+def versioned(r: Req, task_id: str, version: int) -> Iterator[None]:
+    """WEB-09. The store's version guard decides the write. A refusal for a card that has changed
+    since the page read it is reported as that change, so the page reloads instead of showing a
+    reason that no longer applies."""
+    try:
+        yield
+    except Refused as e:
+        if isinstance(e, Stale) or store.get_task(r.conn, task_id)["version"] == version:
+            raise
+        raise Stale("this card changed elsewhere; reload it and retry") from e
 
 
 def reason_of(body: dict[str, Any]) -> str:
@@ -505,7 +510,8 @@ def create(r: Req, slug: str) -> Any:
 
 @route("PATCH", f"/api/cards/{TID}")
 def patch(r: Req, task_id: str) -> Any:
-    t = current(r, task_id, need_version(r.body))
+    version = need_version(r.body)
+    t = store.get_task(r.conn, task_id)
     fields = card_fields(r.body, store.get_board(r.conn, t["board"]))
     assign = "assignee" in fields
     role = fields.pop("assignee", None)
@@ -515,41 +521,45 @@ def patch(r: Req, task_id: str) -> Any:
         raise Refused(f"assignee {role!r} must be one of the dispatchable roles")
     if not fields and not assign:
         raise Refused("nothing to change")
-    version = t["version"]
-    if assign and not store.assign(r.conn, task_id, role, actor=ACTOR).get("noop"):
-        version += 1  # a changed role is one version bump of its own
-    if fields:
-        store.edit(
-            r.conn, task_id, fields, actor=ACTOR, expect_version=version,
-            allow_empty_body=t["status"] == "triage",
-        )  # fmt: skip
+    # one transaction: an edit refused after the assign takes the new role back with it
+    with versioned(r, task_id, version), store.tx(r.conn):
+        if assign and not store.assign(
+            r.conn, task_id, role, actor=ACTOR, expect_version=version
+        ).get("noop"):
+            version += 1  # a changed role is one version bump of its own
+        if fields:
+            store.edit(
+                r.conn, task_id, fields, actor=ACTOR, expect_version=version,
+                allow_empty_body=t["status"] == "triage",
+            )  # fmt: skip
     return {"card": one(r, task_id)}
 
 
 @route("POST", f"/api/cards/{TID}/move")
 def move(r: Req, task_id: str) -> Any:
-    t, to = current(r, task_id, need_version(r.body)), r.body.get("to")
+    version, t, to = need_version(r.body), store.get_task(r.conn, task_id), r.body.get("to")
     if not isinstance(to, str):
         raise Usage("to must be a lane name")
-    step = MOVES.get((t["status"], to))
-    if step is None:
-        if t["status"] == "running":
-            raise Refused("this card is running; use Stop, the run then ends as blocked")
-        allowed = ", ".join(moves_from(t["status"])) or "nowhere"
-        hint = "; only the dispatcher starts runs" if to in ("running", "blocked") else ""
-        raise Refused(
-            f"cannot move a {t['status']} card to {to[:30]}{hint}; it can go to: {allowed}"
-        )
-    verb, ask = step
-    if "confirm" in ask:
-        confirmed(r.body)
-    reason = reason_of(r.body)
-    if verb in REASONED:
-        REASONED[verb](r.conn, task_id, reason, actor=ACTOR)
-    elif verb == "specify":
-        store.specify(r.conn, task_id, {}, actor=ACTOR)
-    else:
-        store.archive(r.conn, task_id, actor=ACTOR)
+    with versioned(r, task_id, version):
+        step = MOVES.get((t["status"], to))
+        if step is None:
+            if t["status"] == "running":
+                raise Refused("this card is running; use Stop, the run then ends as blocked")
+            allowed = ", ".join(moves_from(t["status"])) or "nowhere"
+            hint = "; only the dispatcher starts runs" if to in ("running", "blocked") else ""
+            raise Refused(
+                f"cannot move a {t['status']} card to {to[:30]}{hint}; it can go to: {allowed}"
+            )
+        verb, ask = step
+        if "confirm" in ask:
+            confirmed(r.body)
+        reason = reason_of(r.body)
+        if verb in REASONED:
+            REASONED[verb](r.conn, task_id, reason, actor=ACTOR, expect_version=version)
+        elif verb == "specify":
+            store.specify(r.conn, task_id, {}, actor=ACTOR, expect_version=version)
+        else:
+            store.archive(r.conn, task_id, actor=ACTOR, expect_version=version)
     return {"card": one(r, task_id)}
 
 
@@ -776,13 +786,9 @@ def make_server(
 # --- `kanban board` -------------------------------------------------------------------------
 
 
-def cli(a: Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    home = paths.dirs().home
-    if a.revoke:
-        write_secret(home)
-        message = "every board session is revoked; open a new one with: kanban board"
-        return {"revoked": True}, message
-    port = int(store.cfg(conn, "web.port"))
+def ask_board(port: int, home: Path) -> tuple[bytes, dict[str, Any]]:
+    """Ask `/healthz` on `port` for the HMAC proof (WEB-01) and check it; returns the web key and
+    the reply (`version` is the daemon's)."""
     nonce = secrets.token_hex(16)
     probe = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
     try:
@@ -799,6 +805,21 @@ def cli(a: Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | N
     got = str(reply.get("proof", "")) if isinstance(reply, dict) else ""
     if not hmac.compare_digest(got.encode(), proof(key, nonce).encode()):
         raise Error(f"the process on port {port} is not this board's server; no login link sent")
+    return key, reply
+
+
+def verify_board(port: int, home: Path) -> bytes:
+    return ask_board(port, home)[0]
+
+
+def cli(a: Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    home = paths.dirs().home
+    if a.revoke:
+        write_secret(home)
+        message = "every board session is revoked; open a new one with: kanban board"
+        return {"revoked": True}, message
+    port = int(store.cfg(conn, "web.port"))
+    key = verify_board(port, home)
     url = f"http://127.0.0.1:{port}/login#t={mint(key, 'login', LOGIN_TOKEN_S)}"
     if not a.no_open:
         webbrowser.open(url)

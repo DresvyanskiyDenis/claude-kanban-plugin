@@ -12,7 +12,19 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import __version__, dispatcher, gitops, importer, runner, store, views, web, worker
+from . import (
+    __version__,
+    dispatcher,
+    doctor,
+    gitops,
+    importer,
+    install,
+    runner,
+    store,
+    views,
+    web,
+    worker,
+)
 from .errors import Error, NotAllowed, NotFound, Refused, Usage
 from .paths import dirs, nudge
 from .procs import Procs
@@ -20,11 +32,6 @@ from .procs import Procs
 Handler = Callable[[argparse.Namespace, sqlite3.Connection], tuple[dict[str, Any], str | None]]
 
 RUN_ONLY = {"block", "complete", "request-review", "request-changes"}
-NOT_BUILT = {
-    "doctor": "P3",
-    "setup": "P3",
-    "uninstall": "P3",
-}
 NEEDS_DAEMON = {"create", "specify", "promote", "unblock"}
 NUDGE = NEEDS_DAEMON | {
     "assign", "reassign", "edit", "reopen", "reopen-review", "merge-retry", "mark-done", "resume",
@@ -128,8 +135,12 @@ def build() -> argparse.ArgumentParser:
         ("--yes", "flag"), "--default-workdir",
     )  # fmt: skip
     add("board", ("--revoke", "flag"), ("--no-open", "flag"))
-    for name in NOT_BUILT:
-        sub.add_parser(name, parents=[common]).add_argument("rest", nargs="*")
+    add(
+        "setup", "--claude-bin", "--claude-config-dir", ("--port", int), ("--no-daemon", "flag"),
+        ("--import-hermes", "flag"), ("--yes", "flag"),
+    )  # fmt: skip
+    add("doctor", ("--probe", "flag"), ("--fix", "flag"))
+    add("uninstall", ("--purge", "flag"), ("--force", "flag"), ("--yes", "flag"))
     return root
 
 
@@ -350,12 +361,7 @@ def v_unlink(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
 
 @owner_verb("stop")
 def v_stop(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
-    """RUN-17: the DB first, then SIGTERM to the runner, whose pid and start time are verified."""
-    data = store.stop(conn, a.id)
-    pid = data["runner_pid"]
-    if Procs().alive(pid, data["runner_started"]):
-        os.kill(pid, signal.SIGTERM)
-    return data, None
+    return dispatcher.stop(conn, a.id), None
 
 
 @owner_verb("archive")
@@ -563,6 +569,45 @@ OWNER[importer.VERB] = importer.cli
 OWNER["board"] = web.cli
 
 
+def v_setup(a: argparse.Namespace) -> int:
+    """INS-05, then the one-time Hermes import if asked for; setup owns its store connection."""
+    data, text = install.setup(a)
+    if a.import_hermes and not data.get("locked"):
+        every = {**vars(a), "from": None, "all": True, "dry_run": False, "force": False}
+        conn = store.connect()
+        try:
+            imported, summary = importer.cli(
+                argparse.Namespace(**every, default_workdir=None), conn
+            )
+        finally:
+            conn.close()
+        data, text = {**data, "import": imported}, f"{text}\n{summary}"
+    present(a, data, text)
+    return 0
+
+
+LONG_RUNNING["setup"] = v_setup
+
+
+def v_doctor(a: argparse.Namespace) -> int:
+    """OBS-05: exit 1 when any check fails; warnings leave it 0."""
+    data, text = doctor.run(probe=a.probe, fix=a.fix)
+    present(a, data, text)
+    return 0 if data["ok"] else 1
+
+
+LONG_RUNNING["doctor"] = v_doctor
+
+
+def v_uninstall(a: argparse.Namespace) -> int:
+    data, text = install.uninstall(a)
+    present(a, data, text)
+    return 0
+
+
+LONG_RUNNING["uninstall"] = v_uninstall
+
+
 @owner_verb("migrate")
 def v_migrate(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -625,10 +670,6 @@ def run_as_worker(a: argparse.Namespace) -> int:
 
 
 def owner(a: argparse.Namespace) -> int:
-    if a.verb in NOT_BUILT:
-        raise Error(
-            f"kanban {a.verb} is not available in this build (planned for {NOT_BUILT[a.verb]})"
-        )
     if a.verb in RUN_ONLY:
         raise NotAllowed(
             f"{a.verb} ends a worker's run, so only a worker can use it; "
