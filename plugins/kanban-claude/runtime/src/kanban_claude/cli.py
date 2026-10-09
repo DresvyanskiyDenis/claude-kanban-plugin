@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import __version__, dispatcher, gitops, importer, runner, store, views, worker
+from . import __version__, dispatcher, gitops, importer, runner, store, views, web, worker
 from .errors import Error, NotAllowed, NotFound, Refused, Usage
 from .paths import dirs, nudge
 from .procs import Procs
@@ -24,7 +24,6 @@ NOT_BUILT = {
     "doctor": "P3",
     "setup": "P3",
     "uninstall": "P3",
-    "board": "P4",
 }
 NEEDS_DAEMON = {"create", "specify", "promote", "unblock"}
 NUDGE = NEEDS_DAEMON | {
@@ -128,6 +127,7 @@ def build() -> argparse.ArgumentParser:
         importer.VERB, "--from", ("--all", "flag"), ("--dry-run", "flag"), ("--force", "flag"),
         ("--yes", "flag"), "--default-workdir",
     )  # fmt: skip
+    add("board", ("--revoke", "flag"), ("--no-open", "flag"))
     for name in NOT_BUILT:
         sub.add_parser(name, parents=[common]).add_argument("rest", nargs="*")
     return root
@@ -560,6 +560,7 @@ def v_config(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
 
 
 OWNER[importer.VERB] = importer.cli
+OWNER["board"] = web.cli
 
 
 @owner_verb("migrate")

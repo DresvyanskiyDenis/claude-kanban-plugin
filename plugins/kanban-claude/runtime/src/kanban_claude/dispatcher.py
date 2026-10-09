@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from . import housekeeping, store, validate
+from . import housekeeping, store, validate, web
 from .errors import Error
 from .paths import dirs, ensure_dir, run_files
 from .procs import Procs
@@ -262,9 +262,9 @@ def take_lock(path: Path) -> int | None:
             time.sleep(0.05)
 
 
-def tick_loop(stop: threading.Event) -> None:
+def tick_loop(stop: threading.Event, memory: dict[str, str]) -> None:
+    """`memory` holds the current skip reasons; the board reads it from its own threads."""
     conn, procs = store.connect(), Procs()
-    memory: dict[str, str] = {}
     nudge = dirs().home / "nudge"
 
     def stamp() -> int:
@@ -296,7 +296,8 @@ def housekeeping_loop(stop: threading.Event) -> None:
 
 
 def serve() -> int:
-    """`kanban daemon`: 0 on SIGTERM and when another daemon already runs; 1 when a thread died."""
+    """`kanban daemon`: 0 on SIGTERM and when another daemon already runs; 1 when a thread died
+    or the board port cannot be bound."""
     home = ensure_dir(dirs().home)
     handler = logging.handlers.RotatingFileHandler(
         ensure_dir(home / "logs") / "daemon.log", maxBytes=10 * 1024 * 1024, backupCount=3
@@ -309,17 +310,24 @@ def serve() -> int:
         log.info("another daemon holds %s; exiting", home / "daemon.lock")
         return 0
     store.connect().close()  # create and migrate once: two threads doing it together hit "locked"
+    memory: dict[str, str] = {}
+    try:  # dict.copy() is atomic under the GIL, so a request never sees a half-updated map
+        board = web.make_server(dirs(), live=lambda slug: {"skips": memory.copy()})
+    except OSError as e:
+        log.error("cannot serve the board: %s", e)
+        os.close(lock)
+        return 1
     stop, signalled = threading.Event(), []
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: signalled.append(True))
     threads = [
-        threading.Thread(target=tick_loop, args=(stop,), name="tick", daemon=True),
+        threading.Thread(target=tick_loop, args=(stop, memory), name="tick", daemon=True),
         threading.Thread(target=housekeeping_loop, args=(stop,), name="housekeeping", daemon=True),
+        threading.Thread(target=board.serve_forever, name="web", daemon=True),
     ]
-    # ponytail: phase P4 starts web.make_server(dirs()) here and serves it from a third thread
     for t in threads:
         t.start()
-    log.info("daemon started (pid %s)", os.getpid())
+    log.info("daemon started (pid %s); board on http://127.0.0.1:%s/", os.getpid(), board.port)
     code = 0
     while not signalled:  # a handler must not take a lock: Event.set() there can deadlock us
         if dead := [t.name for t in threads if not t.is_alive()]:
@@ -328,8 +336,10 @@ def serve() -> int:
             break
         time.sleep(0.2)
     stop.set()
+    board.shutdown()
     for t in threads:
         t.join(timeout=5)
+    board.server_close()
     log.info("daemon stopped; runners keep running")
     with contextlib.suppress(OSError):
         os.close(lock)

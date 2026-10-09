@@ -31,7 +31,19 @@ The dispatcher runs as `uv run kanban daemon` (one per machine; a second one log
 
 Per-run files live under `$KANBAN_HOME`: `runs/<board>/<task>/run-<n>.log` and `streams/<board>/<task>/run-<n>.jsonl`. The runner needs `claude` (and `gh` for review cards) on `PATH`, or `claude.bin` in the config. A worker inherits the daemon's environment except `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT` and, unless listed in `worker.env_passthrough`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL`, so a stray API key cannot switch it to metered billing.
 
-Verbs that belong to later phases (`doctor`, `setup`, `uninstall`, `board`) exit 1 with "not available in this build" until their phase lands.
+The daemon also serves the web board: a loopback page on `web.port` (stdlib `http.server`, plain JS and CSS, no build step). Ask the CLI for a login link:
+
+```sh
+uv run kanban board              # opens a single-use link, valid for 60 s
+uv run kanban board --no-open    # prints it instead
+uv run kanban board --revoke     # invalidates every login link and session at once
+```
+
+`uv run python -m kanban_claude.web` serves the page without the daemon, for development; it then shows no dispatch skip reasons.
+
+The link carries the token in the URL fragment, which the page exchanges for a 24 h session and then strips from the address bar. The server answers only to `127.0.0.1` and `localhost` Host headers and rejects cross-origin writes. Everything the board writes goes through the same domain functions as the CLI, as `owner:web`. Dragging a card runs the matching verb (specify, promote, hold, unblock, reopen, mark done, archive) and asks for a reason where the verb needs one; a card the dispatcher passes over shows why. The edit form can move a scratch or `dir:` card onto its board's git worktree, but a card cannot go back to scratch and `dir:` paths are set with the CLI only. Jira links, stopping a run and the worker-stream summary arrive with the Jira sync and later phases.
+
+Verbs that belong to later phases (`doctor`, `setup`, `uninstall`) exit 1 with "not available in this build" until their phase lands.
 
 With `KANBAN_RUN_ID` set the CLI is in worker mode: only the worker verbs work, each on the card of that run, and every owner verb exits 5.
 
