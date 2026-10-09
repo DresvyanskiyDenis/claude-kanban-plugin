@@ -1,0 +1,13 @@
+{
+  "name": "claude-kanban-plugin",
+  "owner": { "name": "DresvyanskiyDenis", "url": "https://github.com/DresvyanskiyDenis" },
+  "description": "A local kanban board whose cards are worked by headless Claude Code agents.",
+  "allowCrossMarketplaceDependenciesOn": ["claude-plugins-official"],
+  "plugins": [
+    {
+      "name": "kanban-claude",
+      "source": "./plugins/kanban-claude",
+      "description": "A local kanban board whose cards are worked by headless Claude Code agents: builder, designer, researcher and an independent PR reviewer."
+    }
+  ]
+}

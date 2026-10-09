@@ -1,0 +1,44 @@
+# Card template
+
+Every card body has these six sections, in this order. A role starts with nothing but this text, the repo and the board's context, so each section must stand on its own.
+
+```markdown
+## Goal
+One sentence: the single outcome this card delivers.
+
+## Context
+Absolute paths, links and keys the work needs. Name files and notes; do not state conclusions the
+role cannot check. Why the work matters, and anything the owner said that the repo does not show.
+
+## Acceptance gate
+An exact command that exits 0 (`uv run pytest -q && uv run ruff check`), or evidence a reviewer
+can check (a screenshot at 375 px, a report with sources). Never "works well".
+
+## Constraints / never do
+What bounds the work: files that must not change, interfaces that must stay, budgets, deadlines.
+
+## Out of scope
+What a reader might assume is included and is not. Paths in backticks are checked against the PR.
+
+## Deliverable
+Where the result lands: `PR against <repo>:<base branch>`, or a file at an absolute path, or a
+summary with sources.
+```
+
+## Rules of thumb
+
+- One outcome per card. If the Goal needs "and", it is two cards.
+- A single run must be able to finish it. If it cannot, split it and link the parts with `--parent`.
+- The gate is the repo's own (CI workflow, Makefile, `pyproject.toml`). Never invent one in the card.
+- Paths are absolute and use the real repo root, never a snapshot or worktree path.
+- A parent card's PR and summary reach the child in its run context; do not ask the child to look them up.
+- Do not add a constraint about push or PR approval. Roles push their own branch and open a PR; they never merge.
+- Put each `Out of scope` path in backticks, one per bullet, so the reviewer's pre-flight can match it against the changed files.
+
+## Role defaults
+
+| Role | Deliverable usually | Default runtime |
+|---|---|---|
+| smith, designer | `PR against <repo>:<base>` | 2h |
+| scout | `reports/<slug>.md` and a summary with sources | 30m |
+| warden | the verdict on a named PR | 45m |

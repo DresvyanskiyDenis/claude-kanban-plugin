@@ -1,0 +1,11 @@
+{
+  "name": "kanban-claude",
+  "version": "0.2.0.dev0",
+  "description": "A local kanban board whose cards are worked by headless Claude Code agents: builder, designer, researcher and an independent PR reviewer.",
+  "author": { "name": "DresvyanskiyDenis", "url": "https://github.com/DresvyanskiyDenis" },
+  "homepage": "https://github.com/DresvyanskiyDenis/claude-kanban-plugin",
+  "repository": "https://github.com/DresvyanskiyDenis/claude-kanban-plugin",
+  "license": "MIT",
+  "keywords": ["kanban", "agents", "code-review", "automation"],
+  "dependencies": ["frontend-design@claude-plugins-official"]
+}

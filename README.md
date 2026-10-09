@@ -2,18 +2,52 @@
 
 A local kanban board for Claude Code. Cards are dispatched to headless Claude workers (`claude -p`) under a macOS LaunchAgent; the board is a SQLite file and a loopback web page. No external service.
 
-Status: under construction. Nothing is installable yet.
+Status: pre-release (`0.2.0.dev0`). The plugin surface (agents, skills, hooks) is in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
+
+## Install
+
+You need macOS, Claude Code 2.1.275 or newer (the commands below were checked on 2.1.295), [`uv`](https://docs.astral.sh/uv/) (`brew install uv`) and the GitHub CLI (`brew install gh`) signed in to the host that holds your repos (`gh auth login`, or `gh auth login --hostname <your GHE host>`).
+
+In a Claude Code session:
+
+```text
+/plugin marketplace add DresvyanskiyDenis/claude-kanban-plugin
+/plugin install kanban-claude@claude-kanban-plugin
+/kanban-claude:setup
+```
+
+From a shell, the first two are `claude plugin marketplace add DresvyanskiyDenis/claude-kanban-plugin` and `claude plugin install kanban-claude@claude-kanban-plugin`. The plugin depends on `frontend-design@claude-plugins-official`; the marketplace lists that marketplace as an allowed dependency source, so Claude Code installs it along with the plugin.
+
+To install from a copy on GitHub Enterprise Server, the `owner/repo` shorthand always means github.com, so give the full clone URL:
+
+```text
+/plugin marketplace add https://<your GHE host>/<org>/claude-kanban-plugin.git
+```
+
+Claude Code clones with the git credentials already on the machine and never prompts. If the host is not signed in yet, run `gh auth login --hostname <your GHE host>` and `gh auth setup-git --hostname <your GHE host>` first. Behind a proxy that re-signs TLS, start `claude` with `NODE_EXTRA_CA_CERTS=<path to your CA bundle>`, and give `uv` and `gh` the same bundle with `SSL_CERT_FILE=<path to your CA bundle>`.
+
+## What the plugin ships
+
+- Agents `kanban-claude:smith`, `designer`, `scout` and `warden` run cards; `card-helper` and `review-helper` are their subagents; `card-checker` (tools `Read, Grep, Glob`) checks card bodies for the orchestrator. Each agent file lists its tools explicitly.
+- Skills: `kanban` (the orchestrator rulebook and CLI reference), `kanban-code-review` (warden's procedure and `preflight.py`), `simplify-code-card` (`slop_gate.py`).
+- Hooks: a lint check on the lines a builder just edited, and a session-start status check.
+- The designer runs Playwright MCP, pinned to an exact version in `runtime/src/kanban_claude/mcp/designer.json`.
+
+Agents cannot enforce a deny list for Bash commands; the runner's `--settings` carries the rules for `gh pr merge`, force pushes and `kanban grant`, and branch protection on the remote is the backstop.
+
 
 ## Development
 
 The runtime is a stdlib-only Python package in `plugins/kanban-claude/runtime/`, managed with `uv`. From that directory, all four must pass before a commit:
 
 ```sh
-uv run ruff format
-uv run ruff check
+uv run ruff format . ../skills ../hooks
+uv run ruff check . ../skills ../hooks
 uv run mypy src
 uv run pytest -q
 ```
+
+`pytest` also collects the script tests under `skills/` and `hooks/` and the frontmatter tests in `tests/test_surface.py`, so that one command is the whole suite.
 
 Try the CLI against a scratch board without touching a real one:
 

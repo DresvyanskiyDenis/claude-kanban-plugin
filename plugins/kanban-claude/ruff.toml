@@ -1,0 +1,4 @@
+extend = "runtime/pyproject.toml"
+
+[lint.per-file-ignores]
+"**/test_*.py" = ["S105", "S106", "S108", "S608"]
