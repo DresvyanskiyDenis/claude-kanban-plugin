@@ -35,7 +35,7 @@ Cards:
 | `kanban specify ID` | Same fields plus `--title`; takes a `triage` card to `todo` or `ready` |
 | `kanban edit ID` | The same fields; `--allow-empty-body` |
 | `kanban list` | `--status --assignee --sort created\|priority\|completed-desc --limit`; needs a resolvable board |
-| `kanban assign ID ROLE`, `kanban reassign ID ROLE [--reclaim]` | Roles: smith, designer, scout, warden |
+| `kanban assign ID ROLE`, `kanban reassign ID ROLE [--reclaim]` | Roles: smith, designer, scout, warden, and atlassian when `roles.atlassian.enabled` is set |
 | `kanban link PARENT CHILD`, `kanban unlink PARENT CHILD` | Dependencies |
 
 Moves, each with `--reason`:
@@ -75,7 +75,9 @@ Boards and system:
 
 | Command | Notes |
 |---|---|
-| `kanban boards list` | `kanban boards create\|edit\|archive SLUG [--default-workdir PATH] [--name NAME] [--claude-config-dir DIR]` |
+| `kanban boards list` | `kanban boards create\|edit\|archive SLUG [--default-workdir PATH] [--name NAME] [--claude-config-dir DIR]`; `create` and `edit` also take `--jira-project KEY [--jira-jql JQL]` to pair the board with a Jira project, and `edit` takes `--jira-off` to unpair it |
+| `kanban jira import ISSUE [--board B]`, `kanban jira link ID ISSUE`, `kanban jira unlink ID` | Bring an issue in as a triage card (also one that is Done or was unlinked); tie a card to an issue (Jira's text wins field by field, the card's goes into a conflict comment); cut the tie. A paired board syncs every `jira.poll_s` seconds; the owner's own Atlassian MCP server does the talking |
+| `kanban jira sync [--board B]`, `kanban jira status` | Run one sync pass now (prints `<board>: synced` per board; exit 1 while a board is paused); list paired boards, their pause and the cards with a conflict or error |
 | `kanban pause [--reason TEXT]`, `kanban resume` | Global dispatch switch; `resume` also re-probes sign-in |
 | `kanban config list`, `kanban config get KEY`, `kanban config set KEY VALUE` | Settings; values are JSON |
 | `kanban daemon` | The dispatcher and housekeeping; started by the service the setup skill installs |

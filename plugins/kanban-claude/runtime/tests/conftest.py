@@ -13,6 +13,8 @@ import pytest
 from kanban_claude import cli, install, launchd, paths, store, web
 from kanban_claude.procs import Procs
 
+from .fake_jira_mcp import Fake
+
 HERE = Path(__file__).resolve().parent
 PLUGIN = "kanban-claude@claude-kanban-plugin"
 
@@ -276,6 +278,30 @@ def card(conn: Any, board: str) -> Callable[..., str]:
         return str(store.create(conn, board, title, **kw)["id"])
 
     return make
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Callable[[int], None]:
+    """Frozen time, so a card edit and a sync are never in the same second by accident."""
+    now = [1_800_000_000]
+    monkeypatch.setattr(store, "now", lambda: now[0])
+
+    def advance(seconds: int = 60) -> None:
+        now[0] += seconds
+
+    return advance
+
+
+@pytest.fixture
+def jira_fake(
+    env: Path, conn: Any, board: str, clock: Callable[[int], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> Fake:  # fmt: skip
+    monkeypatch.setenv("FAKE_JIRA_STATE", str(env / "jira.json"))
+    store.config_set(conn, "jira.assignee", "me@example.com")
+    store.config_set(conn, "jira.mcp_command", [sys.executable, str(HERE / "fake_jira_mcp.py")])
+    store.board_edit(conn, "main", jira_project="KAN")
+    return Fake(env / "jira.json")
 
 
 @pytest.fixture

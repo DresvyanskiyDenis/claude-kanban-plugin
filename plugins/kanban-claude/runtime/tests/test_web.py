@@ -1056,3 +1056,37 @@ def test_concurrent_requests(call: Call, card: Card, board: str) -> None:
 def test_server_shape() -> None:
     assert issubclass(web.WebServer, ThreadingHTTPServer) and web.WebServer.daemon_threads
     assert web.Handler.protocol_version == "HTTP/1.0" and web.Handler.sys_version == ""
+
+
+def test_cards_carry_their_jira_key_and_badges_and_the_header_its_pause(
+    call: Call, conn: sqlite3.Connection, card: Card, board: str
+) -> None:
+    a, b, c = card("linked"), card("conflicted"), card("plain")
+    for tid, key, error, conflict in ((a, "KAN-1", "no transition", None), (b, "KAN-2", None, "x")):
+        conn.execute(
+            "INSERT INTO jira_links(task_id, jira_key, base_title, base_body, card_title, card_body, "
+            "synced_status, synced_version, error, conflict, created_at) "
+            "VALUES (?, ?, '', '', '', '', 'triage', 1, ?, ?, 1)",
+            (tid, key, error, conflict),
+        )
+    snap = ok(call("GET", f"/api/boards/{board}"))
+    rows = {r["id"]: r for r in snap["cards"]}
+    assert (rows[a]["jira_key"], rows[a]["jira_error"], rows[a]["jira_conflict"]) == ("KAN-1", 1, 0)
+    assert (rows[b]["jira_key"], rows[b]["jira_error"], rows[b]["jira_conflict"]) == ("KAN-2", 0, 1)
+    assert rows[c]["jira_key"] is None
+    h = snap["header"]
+    assert h["jira_paused"] is None and h["jira_base"] is None
+    with store.tx(conn):
+        store.state_put(conn, f"jira:{board}", {"paused": {"since": 1, "detail": "401"}})
+        store.config_set(conn, "web.jira_base_url", "https://jira.example.com/browse/")
+    h = ok(call("GET", f"/api/boards/{board}"))["header"]
+    assert (
+        h["jira_paused"]["detail"] == "401" and h["jira_base"] == "https://jira.example.com/browse/"
+    )
+
+
+def test_a_jira_base_url_that_is_not_https_is_never_handed_to_the_page(
+    call: Call, conn: sqlite3.Connection, board: str
+) -> None:
+    store.config_set(conn, "web.jira_base_url", "javascript:alert(1)//")
+    assert ok(call("GET", f"/api/boards/{board}"))["header"]["jira_base"] is None

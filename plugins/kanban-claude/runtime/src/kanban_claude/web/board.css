@@ -109,6 +109,7 @@ textarea { resize: vertical; width: 100%; }
   color: var(--ink-2);
 }
 .tag.bad { color: var(--blocked); border-color: var(--blocked); }
+.tag a { color: inherit; }
 .run { display: flex; align-items: center; gap: 7px; margin-top: 2px; }
 .elapsed { font: 600 13px var(--mono); font-variant-numeric: tabular-nums; }
 .cap {

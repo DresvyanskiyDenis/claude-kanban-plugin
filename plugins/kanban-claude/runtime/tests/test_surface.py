@@ -26,7 +26,7 @@ BUILTIN = {
     "Grep", "Glob", "ListMcpResourcesTool", "ReadMcpResourceTool",
     "TaskCreate", "TaskGet", "TaskList", "TaskUpdate",
 }  # fmt: skip
-MCP_SERVERS = {"context7", "lightpanda", "playwright"}
+MCP_SERVERS = {"atlassian", "context7", "lightpanda", "playwright"}
 MCP_NAME = re.compile(r"mcp__([a-z0-9-]+)(?:__[a-z0-9_]+)?")
 IGNORED_FOR_PLUGIN_AGENTS = {"permissionMode", "hooks", "mcpServers"}
 MODEL_EFFORT = {
@@ -37,6 +37,7 @@ MODEL_EFFORT = {
     "card-helper": ("sonnet", "high"),
     "review-helper": ("sonnet", "high"),
     "card-checker": ("sonnet", "medium"),
+    "atlassian": ("sonnet", "medium"),
 }
 SPAWNS = {
     "smith": {"card-helper"},
@@ -45,6 +46,11 @@ SPAWNS = {
     "warden": {"review-helper"},
 }
 WRITERS = {"Edit", "Write"}
+ATLASSIAN_WRITES = {
+    "jira_create_issue", "jira_update_issue", "jira_add_comment", "jira_transition_issue",
+    "jira_create_issue_link", "confluence_create_page", "confluence_update_page",
+    "confluence_add_comment",
+}  # fmt: skip
 
 
 def frontmatter(path: Path) -> dict[str, str]:
@@ -66,7 +72,7 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def test_the_seven_agents_exist():
+def test_the_eight_agents_exist():
     assert set(AGENTS) == set(MODEL_EFFORT)
 
 
@@ -124,9 +130,24 @@ def test_only_the_designer_gets_the_browser():
     assert with_browser == {"designer"}
 
 
-def test_no_worker_role_has_atlassian():
-    for role in AGENTS:
-        assert not [t for t in tools(role) if "atlassian" in t], role
+def test_only_the_atlassian_role_has_atlassian():
+    with_atlassian = {r for r in AGENTS if [t for t in tools(r) if "atlassian" in t]}
+    assert with_atlassian == {"atlassian"}
+
+
+def test_the_atlassian_role_names_its_tools_exactly_and_has_no_destructive_one():
+    mcp = [t for t in tools("atlassian") if t.startswith("mcp__atlassian")]
+    assert all(t.startswith("mcp__atlassian__") for t in mcp)
+    names = {t.removeprefix("mcp__atlassian__") for t in mcp}
+    assert {n for n in names if "_get_" not in n and "_search" not in n} == ATLASSIAN_WRITES
+    assert not [n for n in names if re.search(r"delete|move|remove|sprint|batch|assign", n)]
+
+
+def test_the_atlassian_role_writes_only_where_a_grant_says_so():
+    text = AGENTS["atlassian"].read_text()
+    assert not WRITERS & set(tools("atlassian"))
+    assert "grant line" in text and "mcp__atlassian__<tool>" in text
+    assert "kanban complete" in text and "kanban block" in text
 
 
 def test_lint_hook_builders_are_real_agents():

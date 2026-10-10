@@ -14,9 +14,10 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import __version__, install, launchd, paths, store, views
+from kanban_claude import __version__, install, jira, launchd, paths, store, views
 
 from .conftest import PLUGIN, Kb, enable
+from .fake_jira_mcp import Fake
 
 Report = dict[str, Any]
 Doctor = Callable[..., Report]
@@ -437,20 +438,40 @@ def test_an_unreadable_protection_state_warns_as_unknown(doctor: Doctor, used: P
     assert check["status"] == "warn" and "could not be read" in check["detail"]
 
 
-def test_a_paired_board_without_an_assignee_fails_check_20(doctor: Doctor, conn: Any) -> None:
-    with store.tx(conn):
-        store.state_put(conn, "jira:main", {})
-    check = got(doctor(), 20)
-    assert check["status"] == "fail" and "jira.assignee" in check["detail"]
+def test_check_20_is_ok_while_no_board_is_paired(doctor: Doctor) -> None:
+    assert got(doctor(), 20)["detail"] == "no board is paired"
 
 
-def test_a_paused_jira_sync_warns_and_probe_says_the_sync_is_not_there_yet(
-    doctor: Doctor, conn: Any
+def test_a_paired_board_needs_an_assignee_and_a_server_command_for_check_20(
+    doctor: Doctor, conn: Any, board: str
 ) -> None:
     with store.tx(conn):
-        conn.execute(
-            "INSERT INTO config(key, value, updated_at) VALUES ('jira.assignee', '\"me\"', 1)"
-        )
-        store.state_put(conn, "jira:main", {"paused": True})
-    assert got(doctor(), 20)["status"] == "warn"
-    assert "not built" in got(doctor("--probe"), 20)["detail"]
+        conn.execute("UPDATE boards SET jira_project = 'KAN'")
+    check = got(doctor(), 20)
+    assert check["status"] == "fail" and "jira.assignee" in check["detail"]
+    store.config_set(conn, "jira.assignee", "me@example.com")
+    check = got(doctor(), 20)
+    assert check["status"] == "fail" and "jira.mcp_command" in check["detail"]
+
+
+def test_a_paused_jira_sync_warns_with_its_reason(
+    doctor: Doctor, conn: Any, jira_fake: Fake
+) -> None:
+    assert got(doctor(), 20)["status"] == "ok"
+    jira_fake.mode(auth=True)
+    jira.sync_all(conn)
+    check = got(doctor(), 20)
+    assert check["status"] == "warn" and "main: " in check["detail"] and "401" in check["detail"]
+
+
+def test_probe_starts_the_server_and_wants_the_seven_tools(
+    doctor: Doctor, conn: Any, jira_fake: Fake
+) -> None:
+    assert "seven tools" in got(doctor("--probe"), 20)["detail"]
+    assert "seven tools" not in got(doctor(), 20)["detail"]
+    jira_fake.mode(tools=["jira_search", "jira_get_issue"])
+    check = got(doctor("--probe"), 20)
+    assert check["status"] == "fail" and "jira_add_comment" in check["detail"]
+    jira_fake.mode(start=True)
+    check = got(doctor("--probe"), 20)
+    assert check["status"] == "fail" and "did not start" in check["detail"]

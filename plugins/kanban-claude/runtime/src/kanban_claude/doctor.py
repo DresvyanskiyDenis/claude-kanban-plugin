@@ -17,6 +17,7 @@ from . import (
     dispatcher,
     ghops,
     install,
+    jira,
     launchd,
     protection,
     runner,
@@ -34,6 +35,7 @@ ENV_TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPR
 PLUGIN_KEY = install.PLUGIN_INSTALL.split()[-1]
 SETUP = "/kanban-claude:setup"
 FIX = "kanban doctor --fix"
+JIRA_FIX = "run jira.mcp_command from kanban config get jira.mcp_command by hand and read its error"
 RULESET_FIX = (
     "needs admin rights: gh api --hostname <host> --method POST repos/<owner>/<repo>/rulesets "
     "--input - (the ruleset bodies are in the README, section Branch protection)"
@@ -427,25 +429,36 @@ def branch_protection(c: Ctx) -> Result:
 
 
 @check(20, "Jira pairing")
-def jira(c: Ctx) -> Result:
-    paired = [r["key"].removeprefix("jira:") for r in c.conn.execute(
-        "SELECT key FROM state WHERE key LIKE 'jira:%' ORDER BY key"
-    )]  # fmt: skip
-    if not paired:
+def jira_pairing(c: Ctx) -> Result:
+    boards = [b["slug"] for b in jira.paired(c.conn)]
+    command = store.cfg(c.conn, "jira.mcp_command")
+    if not boards and not store.cfg(c.conn, "roles.atlassian.enabled"):
         return ok("no board is paired")
-    row = c.conn.execute("SELECT value FROM config WHERE key = 'jira.assignee'").fetchone()
-    if not row or not json.loads(row["value"]):
+    if boards and not store.cfg(c.conn, "jira.assignee"):
         return fail(
-            f"{', '.join(paired)} paired, but jira.assignee is not set",
+            f"{', '.join(boards)} paired, but jira.assignee is not set",
             "kanban config set jira.assignee <user>",
         )
-    note = (
-        " (--probe of jira.mcp_command skipped: the Jira sync is not built yet)" if c.probe else ""
-    )
-    paused = [b for b in paired if (store.state_get(c.conn, f"jira:{b}") or {}).get("paused")]
+    if not command:
+        return fail(
+            "jira.mcp_command is not set",
+            "add the atlassian MCP server to Claude, then run /kanban-claude:setup",
+        )
+    if c.probe:
+        try:
+            missing = sorted(set(jira.TOOLS) - set(jira.probe(command)))
+        except Error as e:
+            return fail(f"{command[0]} did not start as an MCP server: {e}", JIRA_FIX)
+        if missing:
+            return fail(f"the server does not list {', '.join(missing)}", JIRA_FIX)
+    paused = {
+        b: p for b in boards if (p := (store.state_get(c.conn, f"jira:{b}") or {}).get("paused"))
+    }
     if paused:
-        return warn(f"sync paused on {', '.join(paused)}{note}", "kanban resume")
-    return ok(f"{', '.join(paired)}: assignee set, sync running{note}")
+        why = "; ".join(f"{b}: {p['detail']}" for b, p in paused.items())
+        return warn(f"sync paused on {why}", "kanban jira sync")
+    probed = ", the server lists the seven tools" if c.probe else ""
+    return ok(f"{', '.join(boards) or 'no board'}: assignee set, sync running{probed}")
 
 
 # --- running them, and --fix ----------------------------------------------------------------

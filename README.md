@@ -48,7 +48,7 @@ Upgrading is the same skill on a newer plugin: when the recorded version is olde
 
 ## What the plugin ships
 
-- Agents `kanban-claude:smith`, `designer`, `scout` and `warden` run cards; `card-helper` and `review-helper` are their subagents; `card-checker` (tools `Read, Grep, Glob`) checks card bodies for the orchestrator. Each agent file lists its tools explicitly.
+- Agents `kanban-claude:smith`, `designer`, `scout` and `warden` run cards; `card-helper` and `review-helper` are their subagents; `card-checker` (tools `Read, Grep, Glob`) checks card bodies for the orchestrator. The optional `atlassian` role makes one exact Jira or Confluence write per card (see Jira sync). Each agent file lists its tools explicitly.
 - Skills: `kanban` (the orchestrator rulebook and CLI reference), `kanban-code-review` (warden's procedure and `preflight.py`), `simplify-code-card` (`slop_gate.py`).
 - Hooks: a lint check on the lines a builder just edited, and a session-start status check.
 - The designer runs Playwright MCP, pinned to an exact version in `runtime/src/kanban_claude/mcp/designer.json`.
@@ -61,9 +61,9 @@ Agents cannot enforce a deny list for Bash commands; the runner's `--settings` c
 
 ## Doctor
 
-`kanban doctor` runs twenty independent checks and exits 1 when any one fails (a warning leaves it at 0); `--json` gives the same list as data. Each line names what is wrong and the command that fixes it. `--probe` adds the two checks that start `claude` (the scout agent resolves and the login passes, in every config directory a board uses; this costs a few cents). `--fix` repairs only what is safe: file modes (`$KANBAN_HOME` and `$KANBAN_WORK` 0700, the database, `web.secret`, `installed.json`, logs and the plist 0600), a LaunchAgent that is not loaded (it rebuilds a missing plist from `installed.json`), and a `running` card or run that disagrees with the other through the dispatcher's reconcile step. Everything else is yours to repair.
+`kanban doctor` runs twenty independent checks and exits 1 when any one fails (a warning leaves it at 0); `--json` gives the same list as data. Each line names what is wrong and the command that fixes it. `--probe` adds the two checks that start `claude` (the scout agent resolves and the login passes, in every config directory a board uses; this costs a few cents) and, for check 20, starts `jira.mcp_command` and confirms it lists the seven Jira tools. `--fix` repairs only what is safe: file modes (`$KANBAN_HOME` and `$KANBAN_WORK` 0700, the database, `web.secret`, `installed.json`, logs and the plist 0600), a LaunchAgent that is not loaded (it rebuilds a missing plist from `installed.json`), and a `running` card or run that disagrees with the other through the dispatcher's reconcile step. Everything else is yours to repair.
 
-The checks, in order: 1 LaunchAgent loaded; 2 `/healthz` answers as this board; 3 tool, `installed.json`, daemon and (inside a Claude session) plugin versions match; 4 `PRAGMA quick_check`; 5 schema version; 6 a `running` card has a running run and the other way round; 7 `claude` path and version; 8 every config directory exists; 9 the plugin is enabled at user scope in each (read from `settings.json`; `--probe` proves it); 10 `gh auth status` per host the boards use, with a warning when the login is a `GH_TOKEN` variable instead of the keychain; 11 `uv`; 12 CA variables of your shell are in the plist; 13 the plist `PATH` still finds `claude`, `gh`, `git`, `uv` and the `kanban` entry point (`npx` and `node` only warn); 14 at least 2 GB free; 15 dispatch pause, logged-out accounts and quota walls with their times; 16 kept worktrees; 17 file modes; 18 a live runner for every running run; 19 branch protection; 20 Jira pairing (no board is paired until the Jira sync exists, and `--probe` does not start `jira.mcp_command` yet).
+The checks, in order: 1 LaunchAgent loaded; 2 `/healthz` answers as this board; 3 tool, `installed.json`, daemon and (inside a Claude session) plugin versions match; 4 `PRAGMA quick_check`; 5 schema version; 6 a `running` card has a running run and the other way round; 7 `claude` path and version; 8 every config directory exists; 9 the plugin is enabled at user scope in each (read from `settings.json`; `--probe` proves it); 10 `gh auth status` per host the boards use, with a warning when the login is a `GH_TOKEN` variable instead of the keychain; 11 `uv`; 12 CA variables of your shell are in the plist; 13 the plist `PATH` still finds `claude`, `gh`, `git`, `uv` and the `kanban` entry point (`npx` and `node` only warn); 14 at least 2 GB free; 15 dispatch pause, logged-out accounts and quota walls with their times; 16 kept worktrees; 17 file modes; 18 a live runner for every running run; 19 branch protection; 20 Jira pairing (a paired board needs `jira.assignee` and `jira.mcp_command`; a paused sync is a warning that names the reason).
 
 ### Branch protection
 
@@ -103,6 +103,26 @@ gh api --method POST repos/<owner>/<repo>/rulesets --input - <<'JSON'
 }
 JSON
 ```
+
+## Jira sync (optional)
+
+Pair a board with one Jira project and its cards and issues stay in step both ways, with no model in the loop. **Jira owns the text, the board owns execution.** The sync talks to the `atlassian` MCP server (`mcp-atlassian`) that you add to Claude yourself; `kanban setup` copies only its `command` and `args` into `jira.mcp_command`, never its `env` or a token.
+
+```sh
+kanban config set jira.assignee you@example.com
+kanban boards edit main --jira-project KAN       # optional: --jira-jql 'project = KAN AND sprint in openSprints()'
+kanban config set web.jira_base_url https://jira.example.com/browse/
+kanban jira sync                                 # one pass now; the daemon runs one every jira.poll_s (120 s)
+```
+
+- **Membership.** Issues that match the board's JQL (default `project = KAN AND labels = "kanban-claude" AND assignee = currentUser()`) become triage cards, Done ones excepted; a new card gets an issue with the `jira.label`, a `kanban-<card id>` label, `jira.issue_type` and `jira.assignee`; the id label lets a pass that timed out after creating the issue adopt it instead of making a second. Done and archived cards are not exported. `kanban jira import|link|unlink` do the same by hand, and an unlinked issue stays out until you import it.
+- **Text.** Title and body are merged per field, each side against its own last synced value: Jira against what it read back, the card against its own text then. So a server that rewrites the markup never looks like an edit, and a card touched for any other reason sends nothing. One side changed: that side wins. Both changed: Jira wins, and the card's text goes into a `[jira] conflict` comment. Jira's text on an approved card (todo, ready, blocked) puts it back in triage with a `[jira]` comment; a running or review card waits until it has left that state.
+- **Status.** Only a change of the card's own status moves its issue, by one direct transition to the status in `jira.status_map`; `blocked` and `archived` leave Jira alone, and a colleague's move in Jira is not undone by an unrelated card edit. A missing transition, or one that needs fields, is a `jira error` badge and is tried again every pass until it passes. A Jira Done closes a card in triage, todo, ready or blocked; on a running or review card, or one whose `todo` child waits on it, it is a `jira conflict` badge instead. Leaving Done in Jira puts a done card back in triage.
+- **Comments.** Jira comments become card comments by `jira:<name>`; your own comments and the summary of every finished run go to Jira, and a comment that was being sent when the call's answer never came is found by its text and adopted, not sent twice (an equal text with no send under way is someone else's and stays theirs). Workers read them as quoted data.
+- **Failures.** An unreachable server, a rejected login, a timeout or a server that exits pauses that board's sync only: a bar on the board, `kanban jira status`, doctor check 20. Dispatch never waits on it, and the next pass retries. One failing card or link is an error on that card and the others go on. Each board gets its own server process for the pass, and the pass runs inside the daemon's housekeeping tick, so a slow server delays the other housekeeping jobs by up to `JIRA_CALL_S` per call.
+- **The `atlassian` role.** `kanban config set roles.atlassian.enabled true` makes cards assignable to it once `jira.mcp_command` is set too; `dispatch.roles` is not rewritten. Its agent lists nine read tools and the eight write tools by exact name, pinned to `mcp-atlassian` 0.23.1 (a denylist is complete only for a pinned version), and writes only with a grant naming the exact tool (`kanban grant ID --allow mcp__atlassian__jira_add_comment --approved "..."`), and the card body must give the exact key or page and the exact content.
+
+The tool and argument names, the result shapes and the description round trip come from the `mcp-atlassian` version you run. Run `kanban doctor --probe`, then pair one board with a test project before a real one.
 
 ## Uninstall
 
@@ -145,7 +165,7 @@ uv run kanban board --revoke     # invalidates every login link and session at o
 
 `uv run python -m kanban_claude.web` serves the page without the daemon, for development; it then shows no dispatch skip reasons.
 
-The link carries the token in the URL fragment, which the page exchanges for a 24 h session and then strips from the address bar. The server answers only to `127.0.0.1` and `localhost` Host headers and rejects cross-origin writes. Everything the board writes goes through the same domain functions as the CLI, as `owner:web`. Dragging a card runs the matching verb (specify, promote, hold, unblock, reopen, mark done, archive) and asks for a reason where the verb needs one; a card the dispatcher passes over shows why. The edit form can move a scratch or `dir:` card onto its board's git worktree, but a card cannot go back to scratch and `dir:` paths are set with the CLI only. Jira links, stopping a run and the worker-stream summary arrive with the Jira sync and later phases.
+The link carries the token in the URL fragment, which the page exchanges for a 24 h session and then strips from the address bar. The server answers only to `127.0.0.1` and `localhost` Host headers and rejects cross-origin writes. Everything the board writes goes through the same domain functions as the CLI, as `owner:web`. Dragging a card runs the matching verb (specify, promote, hold, unblock, reopen, mark done, archive) and asks for a reason where the verb needs one; a card the dispatcher passes over shows why. The edit form can move a scratch or `dir:` card onto its board's git worktree, but a card cannot go back to scratch and `dir:` paths are set with the CLI only. A card linked to a Jira issue shows its key (a link when `web.jira_base_url` is set) and a `jira error` or `jira conflict` badge, and a paused sync is a note under the header. Stopping a run and the worker-stream summary arrive in later phases.
 
 With `KANBAN_RUN_ID` set the CLI is in worker mode: only the worker verbs work, each on the card of that run, and every owner verb exits 5.
 

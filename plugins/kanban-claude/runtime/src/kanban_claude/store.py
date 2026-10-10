@@ -92,8 +92,25 @@ CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEG
 CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
+# JIR: the pairing, the id of every comment that crossed, and one link per card. A link keeps what
+# each side held at the last sync (`base_*` Jira's read-back, `card_*` the card's own text), so a
+# round trip that rewrites the markup is never mistaken for an edit, and the card's status and
+# version then, so only a change since decides what goes out.
+# SQLite cannot add a UNIQUE column, so the comment id gets a unique index of its own.
+JIRA_SCHEMA = """
+ALTER TABLE boards ADD COLUMN jira_project TEXT;
+ALTER TABLE boards ADD COLUMN jira_jql TEXT;
+ALTER TABLE task_comments ADD COLUMN jira_comment_id TEXT;
+CREATE UNIQUE INDEX idx_comments_jira ON task_comments(jira_comment_id);
+CREATE TABLE jira_links (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id), jira_key TEXT NOT NULL UNIQUE,
+  base_title TEXT NOT NULL, base_body TEXT NOT NULL, card_title TEXT NOT NULL,
+  card_body TEXT NOT NULL, base_jira_status TEXT, jira_updated TEXT, synced_status TEXT NOT NULL,
+  synced_version INTEGER NOT NULL, conflict TEXT, error TEXT, created_at INTEGER NOT NULL);
+"""
+
 # Forward-only: MIGRATIONS[i] takes user_version i to i + 1 (STO-03).
-MIGRATIONS: list[str] = [SCHEMA]
+MIGRATIONS: list[str] = [SCHEMA, JIRA_SCHEMA]
 BACKUPS_KEPT = 5
 
 STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "archived")
@@ -143,9 +160,19 @@ DEFAULTS: dict[str, Any] = {
     "web.jira_base_url": None,
     "retention.stream_days": 30,
     "roles.atlassian.enabled": False,
-}
+    "jira.mcp_command": None,
+    "jira.assignee": None,
+    "jira.issue_type": "Task",
+    "jira.label": "kanban-claude",
+    "jira.poll_s": 120,
+    "jira.status_map": {
+        "triage": "To Do", "todo": "To Do", "ready": "To Do",
+        "running": "In Progress", "review": "In Progress", "done": "Done",
+    },
+}  # fmt: skip
 
 BOUNDS: dict[str, tuple[int, int | None]] = {
+    "jira.poll_s": (1, None),
     "dispatch.max_in_progress": (1, None),
     "dispatch.tick_seconds": (1, None),
     "dispatch.failure_limit": (1, None),
@@ -266,6 +293,14 @@ def cfg(conn: sqlite3.Connection, key: str) -> Any:
     return json.loads(json.dumps(DEFAULTS[key]))
 
 
+def active_roles(conn: sqlite3.Connection, roles: list[str] | None = None) -> list[str]:
+    """The roles a card may be assigned to: `dispatch.roles`, plus `atlassian` once it is enabled and
+    the server it talks to is known (JIR-01)."""
+    roles = cfg(conn, "dispatch.roles") if roles is None else roles
+    on = cfg(conn, "roles.atlassian.enabled") and cfg(conn, "jira.mcp_command")
+    return [*roles, "atlassian"] if on and "atlassian" not in roles else roles
+
+
 def config_all(conn: sqlite3.Connection) -> dict[str, Any]:
     return {k: cfg(conn, k) for k in sorted(DEFAULTS)}
 
@@ -280,7 +315,7 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         ok_number = isinstance(default, float) and type(value) is int
         if not ok_number:
             raise Refused(f"{key} must be {type(default).__name__}, got {value!r}")
-    roles = value if key == "dispatch.roles" else cfg(conn, "dispatch.roles")
+    roles = active_roles(conn, value if key == "dispatch.roles" else None)
     if key == "dispatch.roles":
         if not value or not all(isinstance(r, str) for r in value):
             raise Refused("dispatch.roles must be a non-empty list of role names")
@@ -298,6 +333,17 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
             raise Refused(f"{key} must be an integer {span}")
     if key == "budget.ceiling" and value <= 0:
         raise Refused("budget.ceiling must be positive")
+    if (
+        key == "jira.mcp_command"
+        and value is not None
+        and not (isinstance(value, list) and value and all(isinstance(a, str) for a in value))
+    ):
+        raise Refused("jira.mcp_command must be a non-empty list of strings (argv)")
+    if key == "jira.status_map" and not (
+        isinstance(value, dict)
+        and all(k in STATUSES and isinstance(v, str) and v for k, v in value.items())
+    ):
+        raise Refused(f"jira.status_map maps card statuses ({', '.join(STATUSES)}) to status names")
     with tx(conn):
         config_put(conn, key, value)
         event(conn, None, "config_changed", actor, {"key": key, "value": value})
@@ -441,10 +487,13 @@ def _cas(
         )
 
 
-def _comment(conn: sqlite3.Connection, t: Row, author: str, body: str, actor: str) -> int:
+def _comment(
+    conn: sqlite3.Connection, t: Row, author: str, body: str, actor: str, jira_id: str | None = None
+) -> int:
     cur = conn.execute(
-        "INSERT INTO task_comments(task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
-        (t["id"], author, body, now()),
+        "INSERT INTO task_comments(task_id, author, body, created_at, jira_comment_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (t["id"], author, body, now(), jira_id),
     )
     assert cur.lastrowid is not None
     event(conn, t, "commented", actor, {"comment_id": cur.lastrowid, "author": author})
@@ -460,6 +509,32 @@ def _need(text: str | None, what: str, fix: str) -> str:
 # --- boards ---------------------------------------------------------------------------------
 
 
+def _jira_fields(
+    conn: sqlite3.Connection, current: str | None, project: str | None, jql: str | None, off: bool
+) -> dict[str, Any]:
+    """JIR-01: `--jira-off` unpairs and keeps the links. A pairing names the account new issues go to."""
+    if off:
+        if project or jql is not None:
+            raise Refused("--jira-off cannot be combined with --jira-project or --jira-jql")
+        return {"jira_project": None, "jira_jql": None}
+    fields: dict[str, Any] = {}
+    if project is not None:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", project):
+            raise Refused(f"Jira project key {project!r} must be upper case, like KAN")
+        if not cfg(conn, "jira.assignee"):
+            raise Refused(
+                "set the account new issues go to first: kanban config set jira.assignee ACCOUNT"
+            )
+        fields["jira_project"] = project
+        if project != current:
+            fields["jira_jql"] = None
+    if jql is not None:
+        if not (project or current):
+            raise Refused("--jira-jql needs a paired board; pass --jira-project KEY")
+        fields["jira_jql"] = jql
+    return fields
+
+
 def board_create(
     conn: sqlite3.Connection,
     slug: str,
@@ -467,6 +542,8 @@ def board_create(
     default_workdir: str,
     name: str | None = None,
     claude_config_dir: str | None = None,
+    jira_project: str | None = None,
+    jira_jql: str | None = None,
     actor: str = OWNER,
 ) -> dict[str, Any]:
     validate.slug(slug)
@@ -474,11 +551,13 @@ def board_create(
     with tx(conn):
         if conn.execute("SELECT 1 FROM boards WHERE slug = ?", (slug,)).fetchone():
             raise Refused(f"board {slug!r} already exists; edit it with: kanban boards edit {slug}")
+        jira = _jira_fields(conn, None, jira_project, jira_jql, False)
         conn.execute(
-            "INSERT INTO boards(slug, name, default_workdir, claude_config_dir, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (slug, name or slug, workdir, claude_config_dir, now()),
-        )
+            "INSERT INTO boards(slug, name, default_workdir, claude_config_dir, jira_project, "
+            "jira_jql, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (slug, name or slug, workdir, claude_config_dir, jira.get("jira_project"),
+             jira.get("jira_jql"), now()),
+        )  # fmt: skip
         event(conn, {"board": slug, "id": None}, "board_created", actor, {"slug": slug})
     return {"slug": slug}
 
@@ -490,6 +569,9 @@ def board_edit(
     default_workdir: str | None = None,
     name: str | None = None,
     claude_config_dir: str | None = None,
+    jira_project: str | None = None,
+    jira_jql: str | None = None,
+    jira_off: bool = False,
     actor: str = OWNER,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {}
@@ -499,10 +581,14 @@ def board_edit(
         fields["name"] = name
     if claude_config_dir is not None:
         fields["claude_config_dir"] = claude_config_dir
-    if not fields:
-        raise Refused("nothing to change; pass --default-workdir, --name or --claude-config-dir")
+    if not (fields or jira_project or jira_jql is not None or jira_off):
+        raise Refused(
+            "nothing to change; pass --default-workdir, --name, --claude-config-dir, "
+            "--jira-project, --jira-jql or --jira-off"
+        )
     with tx(conn):
-        get_board(conn, slug)
+        b = get_board(conn, slug)
+        fields |= _jira_fields(conn, b["jira_project"], jira_project, jira_jql, jira_off)
         sets = ", ".join(f"{k} = ?" for k in fields)
         conn.execute(f"UPDATE boards SET {sets} WHERE slug = ?", [*fields.values(), slug])
         event(conn, {"board": slug, "id": None}, "board_edited", actor, {"fields": sorted(fields)})
@@ -570,7 +656,7 @@ def account_set(conn: sqlite3.Connection, config_dir: str, **fields: Any) -> Non
 def _columns(conn: sqlite3.Connection, fields: dict[str, Any], board: Row) -> dict[str, Any]:
     """Field-level validation (SEC-12) of the provided fields, as DB columns."""
     out: dict[str, Any] = {}
-    roles = cfg(conn, "dispatch.roles")
+    roles = active_roles(conn)
     for key, v in fields.items():
         if key == "workspace":
             kind, path = validate.parse_workspace(v)
@@ -609,7 +695,7 @@ def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> No
     _need(
         t["body"], "body", "pass --body-file - with the card contract, or keep the card in --triage"
     )
-    roles = cfg(conn, "dispatch.roles")
+    roles = active_roles(conn)
     if not t["assignee"]:
         raise Refused("no assignee given; pass --assignee or keep the card in --triage")
     if t["assignee"] not in roles:
@@ -806,7 +892,7 @@ def assign(
     actor: str = OWNER,
     expect_version: int | None = None,
 ) -> dict[str, Any]:
-    roles = cfg(conn, "dispatch.roles")
+    roles = active_roles(conn)
     if role not in roles:
         raise Refused(f"assignee {role!r} is not a dispatchable role ({', '.join(roles)})")
     with tx(conn):
@@ -960,12 +1046,14 @@ def reopen(
     *,
     actor: str = OWNER,
     expect_version: int | None = None,
+    expected: Sequence[str] = ("done",),
+    status: str = "ready",
 ) -> dict[str, Any]:
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         t = get_task(conn, task_id)
         _cas(
-            conn, task_id, ["done"], version=expect_version, status="ready", completed_at=None,
+            conn, task_id, expected, version=expect_version, status=status, completed_at=None,
             merge_state=None, merge_attempts=0, merge_next_at=None, merged_at=None,
             retry_after=None, assignee=t["implementer"] or t["assignee"],
         )  # fmt: skip
@@ -980,7 +1068,7 @@ def reopen(
                 event(conn, c, "dependency_wait", actor, {"parent": task_id})
             elif c["status"] in ("running", "review", "done"):
                 _comment(conn, c, "kanban", f"parent {task_id} was reopened: {reason}", actor)
-    return {"id": task_id, "status": "ready"}
+    return {"id": task_id, "status": status}
 
 
 def mark_done(
@@ -990,13 +1078,13 @@ def mark_done(
     *,
     actor: str = OWNER,
     expect_version: int | None = None,
+    expected: Sequence[str] = ("review", "blocked"),
 ) -> dict[str, Any]:
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         t = get_task(conn, task_id)
         _cas(
-            conn, task_id, ["review", "blocked"], version=expect_version, status="done",
-            completed_at=now(),
+            conn, task_id, expected, version=expect_version, status="done", completed_at=now()
         )  # fmt: skip
         event(conn, t, "completed_by_owner", actor, {"reason": reason, "from": t["status"]})
     return {"id": task_id, "status": "done"}
@@ -1096,10 +1184,28 @@ def archive(
         if t["status"] == "running":
             raise Refused(f"card {task_id} is running; stop it first with: kanban stop {task_id}")
         if rm:
+            # the issue stays out of the board for good: its tombstone outlives the card
+            linked = conn.execute(
+                "SELECT jira_key FROM jira_links WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if linked:
+                key = linked["jira_key"]
+                event(
+                    conn,
+                    {"board": t["board"], "id": None},
+                    "jira_unlinked",
+                    actor,
+                    {"key": key, "reason": "deleted"},
+                )
+            conn.execute(
+                "UPDATE task_events SET task_id = NULL WHERE task_id = ? AND kind = 'jira_unlinked'",
+                (task_id,),
+            )
             conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
             for table, col in (
                 ("task_attachments", "task_id"), ("task_comments", "task_id"), ("grants", "task_id"),
                 ("task_runs", "task_id"), ("task_links", "parent_id"), ("task_links", "child_id"),
+                ("jira_links", "task_id"),
             ):  # fmt: skip
                 conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (task_id,))
             conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -1158,11 +1264,12 @@ def comment(
     author: str = "owner",
     actor: str = OWNER,
     run_id: int | None = None,
+    jira_id: str | None = None,
 ) -> dict[str, Any]:
     body = _need(body, "comment text", "pass the text")
     with tx(conn):
         _require_running(conn, run_id)
-        cid = _comment(conn, get_task(conn, task_id), author, body, actor)
+        cid = _comment(conn, get_task(conn, task_id), author, body, actor, jira_id)
     return {"id": task_id, "comment_id": cid}
 
 
@@ -1536,7 +1643,7 @@ def request_review(
 ) -> dict[str, Any]:
     summary = _need(summary, "summary", "name the PR as 'PR #<n>' or its URL")
     reviewer = reviewer or cfg(conn, "dispatch.reviewer")
-    if reviewer not in cfg(conn, "dispatch.roles"):
+    if reviewer not in active_roles(conn):
         raise Refused(f"reviewer {reviewer!r} is not a dispatchable role")
     with tx(conn):
         found = _verb_run(conn, run_id, "request-review")
@@ -1586,6 +1693,7 @@ def request_changes(conn: sqlite3.Connection, run_id: int, reason: str) -> dict[
 # --- grants, pause, stats -------------------------------------------------------------------
 
 _RULE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*\((.+)\)$")
+_MCP_RULE_RE = re.compile(r"^mcp__[A-Za-z0-9-]+__[A-Za-z0-9_]+$")
 
 
 def grant_add(
@@ -1601,6 +1709,8 @@ def grant_add(
         raise Refused("pass at least one --allow RULE")
     for r in rules:
         m = _RULE_RE.match(r)
+        if _MCP_RULE_RE.match(r):
+            continue
         if not m or m[1].strip() in ("*", ":*") or m[1].endswith(":*"):
             raise Refused(
                 f"grant rule {r!r} must name the exact action, not a wildcard or a tool prefix"

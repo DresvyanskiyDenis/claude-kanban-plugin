@@ -105,7 +105,8 @@ SLUG = r"([a-z0-9][a-z0-9_-]{0,63})"
 CARD_SQL = """
 SELECT t.id, t.title, t.status, t.assignee, t.priority, t.pr_url, t.pr_number, t.version,
   t.block_kind, t.merge_state, t.worktree_state, t.retry_after, t.created_at, t.updated_at,
-  t.completed_at, r.started_at AS run_started,
+  t.completed_at, r.started_at AS run_started, jl.jira_key, jl.error IS NOT NULL AS jira_error,
+  jl.conflict IS NOT NULL AS jira_conflict,
   COALESCE(r.max_runtime_seconds, t.max_runtime_seconds) AS run_max,
   (SELECT SUM(cost_usd) FROM task_runs WHERE task_id = t.id) AS cost,
   (SELECT COUNT(*) FROM task_links l JOIN tasks p ON p.id = l.parent_id
@@ -114,6 +115,7 @@ SELECT t.id, t.title, t.status, t.assignee, t.priority, t.pr_url, t.pr_number, t
      WHERE l.child_id = t.id AND p.status IN ('done', 'archived')
        AND p.merge_state IN ('pending', 'failed')) AS merge_wait
 FROM tasks t LEFT JOIN task_runs r ON r.task_id = t.id AND r.status = 'running'
+  LEFT JOIN jira_links jl ON jl.task_id = t.id
 """
 
 
@@ -258,6 +260,7 @@ def header(r: Req, slug: str) -> dict[str, Any]:
         (int(midnight.timestamp()), slug, now - 7 * 86400),
     ).fetchone()
     running = r.conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+    jira_base = store.cfg(r.conn, "web.jira_base_url")
     return {
         "paused": store.state_get(r.conn, "dispatch_paused"),
         "running": running,
@@ -265,6 +268,8 @@ def header(r: Req, slug: str) -> dict[str, Any]:
         "cost_today": today,
         "cost_7d": week,
         "accounts": accounts(r.conn, now),
+        "jira_paused": (store.state_get(r.conn, f"jira:{slug}") or {}).get("paused"),
+        "jira_base": jira_base if str(jira_base).startswith("https://") else None,
         "version": __version__,
         "installed": installed_version(r.srv.dirs.home),
     }
@@ -409,7 +414,7 @@ def boards(r: Req) -> Any:
             }
             for b in store.boards_list(r.conn)
         ],
-        "roles": store.cfg(r.conn, "dispatch.roles"),
+        "roles": store.active_roles(r.conn),
         "efforts": list(validate.EFFORTS),
         "template": BODY_TEMPLATE,
     }
@@ -512,7 +517,7 @@ def patch(r: Req, task_id: str) -> Any:
     role = fields.pop("assignee", None)
     if "workspace" in fields and fields["workspace"] is None:
         raise Refused("an existing card cannot go back to scratch")
-    if assign and role not in store.cfg(r.conn, "dispatch.roles"):
+    if assign and role not in store.active_roles(r.conn):
         raise Refused(f"assignee {role!r} must be one of the dispatchable roles")
     if not fields and not assign:
         raise Refused("nothing to change")

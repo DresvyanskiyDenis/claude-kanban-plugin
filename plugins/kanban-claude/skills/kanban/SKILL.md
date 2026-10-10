@@ -30,6 +30,7 @@ You run the owner's board. You write cards, route them to roles, answer what the
   | UI and UX | `designer` |
   | research, comparison, "find out" | `scout` |
   | review of an existing PR nobody's card produced | `warden` |
+  | one exact write to a named Jira issue or Confluence page, only when `kanban config get roles.atlassian.enabled` is true | `atlassian` |
   | machine operations | no role; do it with the owner |
 
 - Every card body follows `references/card-template.md`. One card, one outcome that a single run can finish. Code cards need `--workspace worktree:<abs repo root>` and `--branch feature/<slug>` or `fix/<slug>`.

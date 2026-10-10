@@ -107,6 +107,11 @@ function buildLanes() {
       el("ol"))));
 }
 
+function jiraLink(c) {
+  const base = S.header?.jira_base;
+  return base ? el("a", { href: base + c.jira_key, target: "_blank", rel: "noopener noreferrer" }, c.jira_key) : c.jira_key;
+}
+
 function tags(c) {
   const t = [];
   if (c.block_kind) t.push([c.block_kind.replace("_", " "), true]);
@@ -119,6 +124,9 @@ function tags(c) {
   if (c.pr_number) t.push([`PR #${c.pr_number}`]);
   if (c.worktree_state?.startsWith("kept")) t.push([`worktree ${c.worktree_state.replace("_", " ")}`, true]);
   if (c.cost) t.push([money(c.cost)]);
+  if (c.jira_key) t.push([jiraLink(c)]);
+  if (c.jira_conflict) t.push(["jira conflict", true]);
+  if (c.jira_error) t.push(["jira error", true]);
   return t.map(([text, bad]) => el("span", { class: bad ? "tag bad" : "tag" }, text));
 }
 
@@ -191,6 +199,7 @@ function renderHeader() {
     if (a.logged_out) notes.push(["bad", "Logged out", `${a.name} needs a login before its cards can run.`]);
     else if (a.soft_until) notes.push(["warn", "Slowing down", `${a.name} is near its limit until ${when(a.soft_until)}.`]);
   }
+  if (h.jira_paused) notes.push(["warn", "Jira sync paused", `${h.jira_paused.detail}. It retries on its own; kanban jira sync tries now.`]);
   for (const r of S.live.unprotected) notes.push(["warn", "Unprotected branch", `${r} has no branch protection; merges are not gated.`]);
   if (h.installed && h.installed !== h.version) notes.push(["warn", "Version mismatch", `Plugin ${h.installed}, runtime ${h.version}. Run kanban doctor.`]);
   $("#notices").replaceChildren(...notes.map(([kind, lead, text]) =>
@@ -268,7 +277,7 @@ async function move(c, to) {
 const lanes = $("#lanes");
 lanes.addEventListener("click", (e) => {
   const s = e.target.closest(".strip");
-  if (s) openCard(s.dataset.id);
+  if (s && !e.target.closest("a")) openCard(s.dataset.id);
 });
 lanes.addEventListener("keydown", (e) => {
   const s = e.target.closest(".strip");
@@ -370,7 +379,7 @@ function drawerView(d) {
       ["Workspace", `${t.workspace_kind}${t.workspace_path ? `: ${t.workspace_path}` : ""}`],
       ["Branch", t.branch_name], ["Base", t.base_branch],
       ["PR", t.pr_url?.startsWith("https://") ? el("a", { href: t.pr_url, rel: "noreferrer noopener" }, `#${t.pr_number}`) : null],
-      ["Block", t.block_kind], ["Merge", t.merge_state],
+      ["Block", t.block_kind], ["Merge", t.merge_state], ["Jira", c.jira_key && jiraLink(c)],
       ["Max runtime", durText(t.max_runtime_seconds)], ["Model", t.model_override],
       ["Effort", t.reasoning_effort], ["Budget", t.budget_usd && money(t.budget_usd)],
       ["Cost", money(c.cost)], ["Created", when(t.created_at)], ["Updated", when(t.updated_at)]])),

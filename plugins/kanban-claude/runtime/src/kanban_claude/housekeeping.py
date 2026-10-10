@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from . import ghops, gitops, protection, store
+from . import ghops, gitops, jira, protection, store
 from .errors import Error
 from .paths import dirs
 
@@ -205,6 +205,7 @@ def run_due(conn: sqlite3.Connection, ts: int | None = None) -> None:
         ("sweep", SWEEP_S, lambda: sweep(conn)),
         ("retention", RETENTION_S, lambda: retention(conn, ts)),
         ("protection", protection.PROTECTION_S, lambda: protection.refresh(conn)),
+        ("jira", store.cfg(conn, "jira.poll_s"), lambda: jira.poll(conn)),
     )
     for name, every, job in jobs:
         if ts >= due.get(name, 0) + every:

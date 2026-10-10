@@ -402,20 +402,38 @@ def test_s9_migration_with_backup(
 ) -> None:
     tid = card()
     conn.close()
+    before = len(store.MIGRATIONS)
     monkeypatch.setattr(
         store, "MIGRATIONS", [*store.MIGRATIONS, "ALTER TABLE tasks ADD COLUMN x TEXT;"]
     )
     c = store.connect()
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert c.execute("PRAGMA user_version").fetchone()[0] == before + 1
     assert c.execute("SELECT x FROM tasks WHERE id = ?", (tid,)).fetchone()[0] is None
-    backups = list((env / "kb-home" / "backups").glob("kanban-s1-*.db"))
+    backups = list((env / "kb-home" / "backups").glob(f"kanban-s{before}-*.db"))
     assert len(backups) == 1
     old = sqlite3.connect(backups[0])
-    assert old.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert old.execute("PRAGMA user_version").fetchone()[0] == before
     assert old.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
     old.close()
-    assert store.migrate(c, env / "kb-home" / "backups") == 2
+    assert store.migrate(c, env / "kb-home" / "backups") == before + 1
     assert len(list((env / "kb-home" / "backups").glob("*.db"))) == 1
+    c.close()
+
+
+def test_jira_migration_keeps_a_version_1_database_and_adds_the_link_tables(env: Path) -> None:
+    home = env / "kb-home"
+    home.mkdir(exist_ok=True)
+    old = sqlite3.connect(home / "kanban.db")
+    old.executescript(store.SCHEMA)
+    old.execute("INSERT INTO boards(slug, name, created_at) VALUES ('main', 'main', 1)")
+    old.execute("PRAGMA user_version = 1")
+    old.commit()
+    old.close()
+    c = store.connect()
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert dict(c.execute("SELECT * FROM boards").fetchone())["jira_project"] is None
+    assert c.execute("SELECT COUNT(*) FROM jira_links").fetchone()[0] == 0
+    assert list((home / "backups").glob("kanban-s1-*.db"))
     c.close()
 
 
@@ -431,23 +449,22 @@ def test_database_file_modes(env: Path, conn: Any) -> None:
     assert (env / "kb-home").stat().st_mode & 0o777 == 0o700
 
 
-@pytest.fixture
-def clock(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    t = [1_000_000]
-    monkeypatch.setattr(store, "now", lambda: t[0])
-    return t
-
-
 def end(conn: Any, run: int, outcome: str, **kw: Any) -> bool:
     return store.end_run(conn, run, outcome, "retry", actor="runner", event_kind="run_ended", **kw)
 
 
-def test_failure_rule_counts_then_gives_up(conn: Any, card: Card, clock: list[int]) -> None:
+def test_failure_rule_counts_then_gives_up(
+    conn: Any, card: Card, clock: Callable[[int], None]
+) -> None:
     tid = card()
     run = claim_run(conn, tid)
     assert end(conn, run, "timed_out", error="took too long")
     t = row(conn, tid)
-    assert (t["status"], t["consecutive_failures"], t["retry_after"]) == ("ready", 1, 1_000_060)
+    assert (t["status"], t["consecutive_failures"], t["retry_after"]) == (
+        "ready",
+        1,
+        store.now() + 60,
+    )
     run = claim_run(conn, tid)
     assert end(conn, run, "budget_exceeded", error="e" * 800)
     t = row(conn, tid)
@@ -456,7 +473,9 @@ def test_failure_rule_counts_then_gives_up(conn: Any, card: Card, clock: list[in
     assert "gave_up" in kinds(conn, tid)
 
 
-def test_uncounted_outcomes_and_card_retry_limit(conn: Any, card: Card, clock: list[int]) -> None:
+def test_uncounted_outcomes_and_card_retry_limit(
+    conn: Any, card: Card, clock: Callable[[int], None]
+) -> None:
     tid = card(max_retries=3)
     for outcome in ("interrupted", "auth_lost", "quota"):
         run = claim_run(conn, tid)
@@ -465,18 +484,20 @@ def test_uncounted_outcomes_and_card_retry_limit(conn: Any, card: Card, clock: l
     for _ in range(2):
         run = claim_run(conn, tid)
         end(conn, run, "crashed")
-        clock[0] += 1000
+        clock(1000)
     assert status(conn, tid) == "ready"
 
 
-def test_review_run_failure_returns_to_review(conn: Any, card: Card, clock: list[int]) -> None:
+def test_review_run_failure_returns_to_review(
+    conn: Any, card: Card, clock: Callable[[int], None]
+) -> None:
     tid = reach(conn, card, "review")
     run2 = claim_run(conn, tid)
     end(conn, run2, "interrupted")
     assert status(conn, tid) == "review"
 
 
-def test_protocol_violation_streak(conn: Any, card: Card, clock: list[int]) -> None:
+def test_protocol_violation_streak(conn: Any, card: Card, clock: Callable[[int], None]) -> None:
     tid = card()
     for expected in ("ready", "ready", "blocked"):
         run = claim_run(conn, tid)
@@ -486,13 +507,13 @@ def test_protocol_violation_streak(conn: Any, card: Card, clock: list[int]) -> N
 
 
 def test_systemic_crashes_pause_dispatch_without_counting(
-    conn: Any, board: str, card: Card, clock: list[int]
+    conn: Any, board: str, card: Card, clock: Callable[[int], None]
 ) -> None:
     ids = [card(f"c{i}") for i in range(3)]
     for tid in ids:
         run = claim_run(conn, tid)
         end(conn, run, "crashed", error="spawn exploded")
-        clock[0] += 10
+        clock(10)
     assert store.state_get(conn, "dispatch_paused")["reason"] == "systemic"
     assert [row(conn, t)["consecutive_failures"] for t in ids] == [1, 1, 0]
     assert store.resume(conn) is True

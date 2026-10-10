@@ -18,6 +18,7 @@ from . import (
     doctor,
     gitops,
     install,
+    jira,
     runner,
     store,
     views,
@@ -103,7 +104,11 @@ def build() -> argparse.ArgumentParser:
     add("complete", "id", "--summary", "--summary-file")
     add("request-review", "id", "--reviewer", "--summary", "--summary-file")
     add("request-changes", "id", ("--reason", "required"))
-    add("boards", "action", ("slug", "?"), "--default-workdir", "--name", "--claude-config-dir")
+    add(
+        "boards", "action", ("slug", "?"), "--default-workdir", "--name", "--claude-config-dir",
+        "--jira-project", "--jira-jql", ("--jira-off", "flag"),
+    )  # fmt: skip
+    add("jira", "action", ("ref", "?"), ("issue", "?"))
     add(
         "create", "title", *card, *text, "--idempotency-key", ("--parent", "append"),
         ("--triage", "flag"),
@@ -261,12 +266,65 @@ def v_boards(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
         "default_workdir": a.default_workdir,
         "name": a.name,
         "claude_config_dir": a.claude_config_dir,
+        "jira_project": a.jira_project,
+        "jira_jql": a.jira_jql,
     }
     if a.action == "edit":
-        return store.board_edit(conn, a.slug, **opts), None
-    if not a.default_workdir:
-        raise Usage("boards create needs --default-workdir PATH")
+        return store.board_edit(conn, a.slug, **opts, jira_off=a.jira_off), None
+    if not a.default_workdir or a.jira_off:
+        raise Usage("boards create needs --default-workdir PATH and cannot take --jira-off")
     return store.board_create(conn, a.slug, **opts), None
+
+
+@owner_verb("jira")
+def v_jira(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    """JIR-03, JIR-07, JIR-09. `sync` runs a pass now, in this process, under the daemon's lock."""
+    match a.action, a.ref, a.issue:
+        case "import", ref, None if ref:
+            got = jira.import_issue(conn, need_board(conn, a), ref)
+            return got, f"card {got['id']} created for {got['key']}"
+        case "link", ref, issue if ref and issue:
+            got = jira.link_card(conn, ref, issue)
+            return got, f"card {got['id']} linked to {got['key']}"
+        case "unlink", ref, None if ref:
+            got = jira.unlink_card(conn, ref)
+            return got, f"card {got['id']} unlinked from {got['key']}"
+        case "sync", None, None:
+            return jira_sync(conn, find_board(conn, a))
+        case "status", None, None:
+            return jira_status(conn)
+    raise Usage("usage: kanban jira import ISSUE | link ID ISSUE | unlink ID | sync | status")
+
+
+def jira_sync(conn: sqlite3.Connection, board: str | None) -> tuple[dict[str, Any], str | None]:
+    done = jira.sync_all(conn, board)
+    stuck = [
+        b
+        for b in jira.status(conn)["boards"]
+        if b["board"] not in done and board in (None, b["board"])
+    ]
+    lines = [f"{slug}: synced" for slug in done]
+    lines += [f"{b['board']}: paused: {b['paused']['detail']}" for b in stuck]
+    if stuck:
+        raise Error("\n".join(lines))
+    return {"boards": done}, "\n".join(lines) or "no board is paired with a Jira project"
+
+
+def jira_status(conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    data = jira.status(conn)
+    lines = []
+    for b in data["boards"]:
+        pull = views.local(b["last_pull_at"]) if b.get("last_pull_at") else "never"
+        paused = b.get("paused")
+        note = (
+            f"  PAUSED since {views.local(paused['since'])}: {paused['detail']}" if paused else ""
+        )
+        lines.append(f"{b['board']}  {b['project']}  last pull {pull}{note}")
+    lines += [
+        f"{ln['jira_key']}  card {ln['task_id']}  {ln['conflict'] or ln['error']}"
+        for ln in data["links"]
+    ]
+    return data, "\n".join(lines) or "no board is paired with a Jira project"
 
 
 @owner_verb("create")

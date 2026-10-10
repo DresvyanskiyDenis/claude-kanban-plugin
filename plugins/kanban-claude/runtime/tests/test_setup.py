@@ -363,3 +363,54 @@ def test_a_plugin_older_than_the_stamp_is_refused_unless_confirmed(
     assert stamp()["version"] == "99.0.0"
     assert setup("--yes")[0] == 0
     assert stamp()["version"] == __version__
+
+
+def claude_json(path: Path, servers: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mcpServers": servers}))
+
+
+ATLASSIAN = {
+    "command": "uvx",
+    "args": ["mcp-atlassian", "--cache", "${HOME}/.cache/jira"],
+    "env": {"JIRA_API_TOKEN": "s3cr3t-token"},
+}
+
+
+def test_setup_records_the_atlassian_server_command_and_never_its_env(setup: Setup, kb: Kb) -> None:
+    claude_json(Path.home() / ".claude.json", {"atlassian": ATLASSIAN, "other": {"command": "x"}})
+    code, out, err = setup()
+    assert code == 0, err
+    assert cfg("jira.mcp_command") == [
+        "uvx",
+        "mcp-atlassian",
+        "--cache",
+        f"{Path.home()}/.cache/jira",
+    ]
+    assert "atlassian MCP server" in err
+    for text in (out, err, kb("config", "list")[1], json.dumps(stamp())):
+        assert "s3cr3t-token" not in text
+    assert (Path.home() / ".claude.json").read_text().count("s3cr3t-token") == 1
+
+
+def test_setup_reads_a_non_default_config_directory_and_leaves_the_command_alone_without_one(
+    setup: Setup, env: Path
+) -> None:
+    claude_json(Path.home() / ".claude.json", {"atlassian": ATLASSIAN})
+    alt = env / "alt-claude"
+    assert setup("--claude-config-dir", str(alt))[0] == 0
+    assert cfg("jira.mcp_command") is None
+    claude_json(alt / ".claude.json", {"atlassian": {"command": "jira-mcp"}})
+    assert setup("--claude-config-dir", str(alt))[0] == 0
+    assert cfg("jira.mcp_command") == ["jira-mcp"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["not json", '{"mcpServers": {"atlassian": "oops"}}', '{"mcpServers": {"atlassian": {"args": []}}}',
+     '{"mcpServers": {"atlassian": {"command": "uvx", "args": [1]}}}'],
+)  # fmt: skip
+def test_an_unreadable_atlassian_entry_changes_nothing(setup: Setup, content: str) -> None:
+    (Path.home() / ".claude.json").write_text(content)
+    assert setup()[0] == 0
+    assert cfg("jira.mcp_command") is None

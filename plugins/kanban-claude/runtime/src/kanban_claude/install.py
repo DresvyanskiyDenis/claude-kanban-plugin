@@ -162,6 +162,21 @@ def config_dir_for(a: argparse.Namespace, conn: sqlite3.Connection) -> str:
     return str(Path(chosen).expanduser().absolute())
 
 
+def atlassian_command(config_dir: str) -> list[str] | None:
+    """JIR-01: argv of the owner's own `atlassian` MCP server. Only `command` and `args` are read:
+    `env` holds the token, and the sync talks to the server the way the owner's Claude starts it."""
+    home = Path.home()
+    base = Path(config_dir)
+    path = home / ".claude.json" if base == home / ".claude" else base / ".claude.json"
+    try:
+        server = json.loads(path.read_text())["mcpServers"]["atlassian"]
+        return [
+            a.replace("${HOME}", str(home)) for a in [server["command"], *server.get("args", [])]
+        ]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def probe_env(captured: dict[str, str], config_dir: str) -> dict[str, str]:
     """What a worker would see under launchd: its four basics plus the captured variables, nothing
     else of this shell."""
@@ -346,12 +361,15 @@ def run_setup(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str
     say(f"probing {claude} with the worker flags (model {model}, config {config_dir})")
     check_probe(claude, model, env, config_dir, conn, a.yes)
     port = a.port or int(store.cfg(conn, "web.port"))
+    settings = [("claude.bin", claude), ("claude.config_dir", config_dir), ("web.port", port)]
+    atlassian = atlassian_command(config_dir)
+    if atlassian:
+        say(
+            f"found the atlassian MCP server in {config_dir}; the Jira sync will start {atlassian[0]}"
+        )
+        settings.append(("jira.mcp_command", atlassian))
     with store.tx(conn):
-        for key, value in (
-            ("claude.bin", claude),
-            ("claude.config_dir", config_dir),
-            ("web.port", port),
-        ):
+        for key, value in settings:
             if store.cfg(conn, key) != value:
                 store.config_set(conn, key, value, actor="setup")
     if not a.no_daemon:

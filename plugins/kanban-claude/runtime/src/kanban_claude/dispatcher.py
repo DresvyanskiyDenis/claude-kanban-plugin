@@ -209,7 +209,7 @@ def dispatch_once(
     if store.state_get(conn, "dispatch_paused"):
         report["paused"] = True
         return report
-    roles, reviewer = store.cfg(conn, "dispatch.roles"), store.cfg(conn, "dispatch.reviewer")
+    roles, reviewer = store.active_roles(conn), store.cfg(conn, "dispatch.reviewer")
     ready = []
     for t in conn.execute("SELECT * FROM tasks WHERE status IN ('ready', 'review')").fetchall():
         reason: str | None = "error"
