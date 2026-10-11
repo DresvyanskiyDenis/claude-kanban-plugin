@@ -45,6 +45,9 @@ elif args[:2] == ["pr", "merge"]:
     pr["state"] = "MERGED"
     json.dump(prs, open(os.environ["GH_FAKE_PRS"], "w"))
 elif args[:2] == ["repo", "view"]:
+    if "-R" in args:  # real gh: the repository is positional here
+        sys.stderr.write("unknown shorthand flag: 'R' in -R\\n")
+        sys.exit(1)
     print(json.dumps({"defaultBranchRef": {"name": os.environ.get("GH_FAKE_DEFAULT", "main")}}))
 elif args[:2] == ["auth", "status"]:
     mode = os.environ.get("GH_FAKE_AUTH", "keyring")

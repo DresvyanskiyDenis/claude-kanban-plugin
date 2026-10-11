@@ -49,9 +49,9 @@ def pr_view(
 def repo_default_branch(repo: str) -> str:
     try:
         return str(
-            json.loads(gh("repo", "view", "-R", repo, "--json", "defaultBranchRef"))[
-                "defaultBranchRef"
-            ]["name"]
+            json.loads(gh("repo", "view", repo, "--json", "defaultBranchRef"))["defaultBranchRef"][
+                "name"
+            ]
         )
     except (ValueError, KeyError, TypeError) as e:
         raise Error("gh returned unreadable JSON for the repository") from e
