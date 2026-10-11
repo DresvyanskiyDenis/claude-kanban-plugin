@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.2.0.dev0 (unreleased)
+## 0.2.0.dev1 (unreleased)
+
+### Fixed
+
+- The daemon merges approved PRs again: `gh repo view` takes the repository positionally, and `-R` made every merge job fail.
+- The warden's pre-flight reads a PR on a repository without CI as having no checks instead of aborting.
+- `daemon.log` is 0600 even when launchd created it first, so a fresh install passes doctor check 17.
+
+## 0.2.0.dev0
 
 ### Added
 
