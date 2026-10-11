@@ -97,6 +97,8 @@ Start one Monitor per session on `kanban --board <slug> watch --follow`. Note th
 
 The owner's own feedback on a card in `review` is `kanban reopen-review <id> --reason "<feedback>"`, not a comment.
 
+To steer a card while it runs, send the owner's words with SendMessage to its session, `kanban <id> <role>` (ListAgents shows it only while it runs), and record the same words with `kanban comment <id> "<owner>: <words>"` so warden and later runs see them. Roles cannot message back; their questions arrive as `blocked` `needs_input`.
+
 ## The diagnostic-card rule
 
 A card that investigates a problem before a fix, which has timed out or failed twice, is never retried a third time: it would re-diagnose instead of shipping. Archive it with `kanban archive <id>` and open a new card that only ships: it states what is already known and lists what not to investigate again.

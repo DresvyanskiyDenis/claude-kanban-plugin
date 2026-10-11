@@ -2,7 +2,7 @@
 
 A local kanban board for Claude Code. Cards are dispatched to headless Claude workers (`claude -p`) under a macOS LaunchAgent; the board is a SQLite file and a loopback web page. No external service.
 
-Status: pre-release (`0.2.0.dev2`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
+Status: pre-release (`0.2.0.dev3`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
 
 ## Install
 
@@ -52,6 +52,8 @@ Upgrading is the same skill on a newer plugin: when the recorded version is olde
 - Skills: `kanban` (the orchestrator rulebook and CLI reference), `kanban-code-review` (warden's procedure and `preflight.py`), `simplify-code-card` (`slop_gate.py`).
 - Hooks: a lint check on the lines a builder just edited, a session-start status check, and the board pane mod.
 - The designer runs Playwright MCP, pinned to an exact version in `runtime/src/kanban_claude/mcp/designer.json`.
+
+Each worker session is named `kanban <card-id> <role>`. Ask your session to steer a running card and it sends your words there and records them on the card; a worker asks back only by blocking its card with `needs_input`.
 
 Agents cannot enforce a deny list for Bash commands; the runner's `--settings` carries the rules for `gh pr merge`, force pushes and `kanban grant`, and branch protection on the remote is the backstop.
 

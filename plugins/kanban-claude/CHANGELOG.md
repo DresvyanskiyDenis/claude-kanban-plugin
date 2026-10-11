@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.2.0.dev2 (unreleased)
+## 0.2.0.dev3 (unreleased)
+
+### Added
+
+- The `kanban` skill steers a running card: the owner's words go to the worker's session, `kanban <id> <role>`, by SendMessage and onto the card as a comment. Workers still ask back only by blocking the card.
+
+## 0.2.0.dev2
 
 ### Added
 
