@@ -182,3 +182,14 @@ def test_run_reads_the_card_through_kanban_show_json(tmp_path: Path):
     assert "INFO PR #7 fix/x -> main @ abc1234, review round 2" in r.stdout
     assert any(line.startswith("CHECK") and "docs/a.md" in line for line in r.stdout.splitlines())
     assert any(line.startswith("CHECK") and "test" in line for line in r.stdout.splitlines())
+
+
+def test_a_repo_without_ci_reads_as_no_checks(monkeypatch):
+    # real `gh pr checks` exits 1 instead of printing [] when the repo has no CI at all
+    def gh(argv):
+        return subprocess.CompletedProcess(
+            argv, 1, "", "no checks reported on the 'fix/x' branch\n"
+        )
+
+    monkeypatch.setattr(p, "call", gh)
+    assert p.pr_checks("7", []) == []

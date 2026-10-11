@@ -195,6 +195,21 @@ def gh_json(argv: list[str]) -> object:
     return json.loads(r.stdout)
 
 
+def pr_checks(number: str, scope: list[str]) -> object:
+    """The required checks, else all of them. `gh pr checks` exits 1 with "no checks reported"
+    instead of printing [] when the repo has no CI at all."""
+    argv = ["pr", "checks", number, *scope, "--json", "name,bucket"]
+    try:
+        try:
+            return gh_json([*argv, "--required"])
+        except RuntimeError:
+            return gh_json(argv)
+    except RuntimeError as e:
+        if "no checks reported" in str(e):
+            return []
+        raise
+
+
 def main(argv: list[str]) -> int:
     shown = call(["kanban", "show", "--json"])
     if shown.returncode:
@@ -222,12 +237,7 @@ def main(argv: list[str]) -> int:
             ]
         )
         assert isinstance(pr, dict)
-        try:
-            checks = gh_json(
-                ["pr", "checks", number, *scope, "--required", "--json", "name,bucket"]
-            )
-        except RuntimeError:
-            checks = gh_json(["pr", "checks", number, *scope, "--json", "name,bucket"])
+        checks = pr_checks(number, scope)
         diff = call(["gh", "pr", "diff", number, *scope]).stdout
     except (RuntimeError, ValueError) as e:
         print(f"cannot read the PR: {e}", file=sys.stderr)
