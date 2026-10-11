@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.2.0.dev1 (unreleased)
+## 0.2.0.dev2 (unreleased)
+
+### Added
+
+- A board pane mod (`hooks/board.tsx`, Claude Code 2.1.287 or later): `/kanban-board` docks a short board beside the transcript (running, review, blocked, up next, triage and done counts), read from `kanban --json list` every 15 s while it is open. It reopens in the next session until closed, and never loads in a card's worker.
+
+## 0.2.0.dev1
 
 ### Fixed
 

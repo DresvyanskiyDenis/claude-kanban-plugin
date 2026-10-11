@@ -2,7 +2,7 @@
 
 A local kanban board for Claude Code. Cards are dispatched to headless Claude workers (`claude -p`) under a macOS LaunchAgent; the board is a SQLite file and a loopback web page. No external service.
 
-Status: pre-release (`0.2.0.dev1`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
+Status: pre-release (`0.2.0.dev2`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
 
 ## Install
 
@@ -50,7 +50,7 @@ Upgrading is the same skill on a newer plugin: when the recorded version is olde
 
 - Agents `kanban-claude:smith`, `designer`, `scout` and `warden` run cards; `card-helper` and `review-helper` are their subagents; `card-checker` (tools `Read, Grep, Glob`) checks card bodies for the orchestrator. The optional `atlassian` role makes one exact Jira or Confluence write per card (see Jira sync). Each agent file lists its tools explicitly.
 - Skills: `kanban` (the orchestrator rulebook and CLI reference), `kanban-code-review` (warden's procedure and `preflight.py`), `simplify-code-card` (`slop_gate.py`).
-- Hooks: a lint check on the lines a builder just edited, and a session-start status check.
+- Hooks: a lint check on the lines a builder just edited, a session-start status check, and the board pane mod.
 - The designer runs Playwright MCP, pinned to an exact version in `runtime/src/kanban_claude/mcp/designer.json`.
 
 Agents cannot enforce a deny list for Bash commands; the runner's `--settings` carries the rules for `gh pr merge`, force pushes and `kanban grant`, and branch protection on the remote is the backstop.
@@ -58,6 +58,12 @@ Agents cannot enforce a deny list for Bash commands; the runner's `--settings` c
 ## Session start
 
 `hooks/scripts/session_start.sh` (POSIX `sh`, well under 50 ms, read-only) runs at the start of every session except a worker's. It prints nothing when the machine is not set up or all is well. When the plugin's version differs from `installed.json` it prints `kanban-claude: daemon a.b.c, plugin x.y.z — run /kanban-claude:setup to upgrade`. While dispatch is paused it prints one line of enumerated codes (`manual`, `systemic`, `auth:<config dir>`, `quota:<config dir> until <time>`) and `kanban doctor` as the way to the fix. It reads the two versions with a fixed `sed` pattern, queries the database with `sqlite3 -readonly`, never evaluates a file, never prints card or worker text, and never installs anything.
+
+## Board pane
+
+`/kanban-board` docks a short board beside the transcript: the cards running, in review, blocked and up next (four per lane, then `+N more`), with each card's role and the age of its last change, and the triage and done counts. It reads `kanban --json list --sort priority` for the board of the session's folder every 15 s while the pane is open, and only then. `/kanban-board SLUG` pins another board; `/kanban-board close` closes it. A pane left open reopens in the next session; one closed by hand stays closed. Card workers never load it. The web board stays the full view.
+
+It is a Claude Code mod and needs Claude Code 2.1.287 or later; an organization's managed settings can disable mods. Narrower than 144 columns, Claude Code places a pane it was not asked for only from 110 columns, so a reopened pane may wait until the terminal is wide enough.
 
 ## Doctor
 
@@ -139,7 +145,7 @@ uv run mypy src
 uv run pytest -q
 ```
 
-`pytest` also collects the script tests under `skills/` and `hooks/` and the frontmatter tests in `tests/test_surface.py`, so that one command is the whole suite.
+`pytest` also collects the script tests under `skills/` and `hooks/` and the frontmatter tests in `tests/test_surface.py`, so that one command is the whole Python suite. The board pane has its own: `claude plugin test` and `claude plugin validate` from `plugins/kanban-claude`.
 
 Try the CLI against a scratch board without touching a real one:
 

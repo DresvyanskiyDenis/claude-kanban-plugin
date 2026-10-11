@@ -1,6 +1,6 @@
 [project]
 name = "kanban-claude"
-version = "0.2.0.dev1"
+version = "0.2.0.dev2"
 description = "Local kanban board for Claude Code: store, CLI, dispatcher."
 requires-python = ">=3.12"
 dependencies = []

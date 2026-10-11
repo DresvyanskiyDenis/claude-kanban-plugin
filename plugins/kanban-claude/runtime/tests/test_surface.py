@@ -179,7 +179,9 @@ def test_marketplace_lists_the_one_plugin_and_allows_the_official_dependency():
 
 
 def test_hooks_json_wires_the_lint_hook_and_the_session_start_script():
-    hooks = load_json(PLUGIN / "hooks/hooks.json")["hooks"]
+    wiring = load_json(PLUGIN / "hooks/hooks.json")
+    assert wiring["modules"] == ["./board.tsx"]
+    hooks = wiring["hooks"]
     (post,) = hooks["PostToolUse"]
     assert post["matcher"] == "Edit|Write"
     lint = post["hooks"][0]
