@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import daemon, dispatcher, housekeeping, store, web
+from kanban_claude import daemon, dispatcher, housekeeping, paths, store, web
 
 Card = Callable[..., str]
 
@@ -227,3 +227,15 @@ def test_a_daemon_probe_ignores_a_concurrent_probe(env: Path) -> None:
         fcntl.flock(other_probe, fcntl.LOCK_UN)
         fcntl.flock(other_probe, fcntl.LOCK_EX)
         assert daemon.running() is True
+
+
+def test_a_log_that_launchd_created_world_readable_is_made_private(tmp_path: Path) -> None:
+    log = tmp_path / "logs" / "daemon.log"
+    log.parent.mkdir()
+    log.touch()
+    log.chmod(0o644)  # launchd opens StandardOutPath under its own umask before the daemon starts
+    logger = logging.getLogger("kanban.test-log-mode")
+    handler = paths.add_file_log(logger, log)
+    logger.removeHandler(handler)
+    handler.close()
+    assert log.stat().st_mode & 0o777 == 0o600

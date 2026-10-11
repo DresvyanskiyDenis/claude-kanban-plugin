@@ -31,8 +31,11 @@ def ensure_dir(path: Path) -> Path:
 
 
 def add_file_log(logger: logging.Logger, path: Path) -> logging.Handler:
-    """Log `logger` at INFO to a rotating file (10 MiB, 3 backups); its directory is made 0700."""
+    """Log `logger` at INFO to a rotating file (10 MiB, 3 backups); its directory is made 0700 and the
+    file 0600, also when launchd created it first under its own umask (as `StandardOutPath`)."""
     ensure_dir(path.parent)
+    path.touch(mode=0o600)
+    path.chmod(0o600)
     handler = logging.handlers.RotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=3)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
