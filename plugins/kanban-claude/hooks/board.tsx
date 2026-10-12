@@ -7,14 +7,20 @@ const PANE = 'kanban'
 const POLL_MS = 15_000
 const SHOWN = 4
 
-const LANES: [string, string[]][] = [
-  ['Running', ['running']],
-  ['Review', ['review']],
-  ['Blocked', ['blocked']],
-  ['Up next', ['ready', 'todo']],
+// Colors are theme keys, not hex, so the pane follows the person's light or dark theme.
+type Group = { name: string; statuses: string[]; glyph: string; color: string }
+const LANES: Group[] = [
+  { name: 'Running', statuses: ['running'], glyph: '●', color: 'claude' },
+  { name: 'Review', statuses: ['review'], glyph: '◐', color: 'merged' },
+  { name: 'Blocked', statuses: ['blocked'], glyph: '✕', color: 'error' },
+  { name: 'Up next', statuses: ['ready', 'todo'], glyph: '○', color: 'suggestion' },
 ]
+const DONE: Group = { name: 'done', statuses: ['done'], glyph: '■', color: 'success' }
+const TRIAGE: Group = { name: 'triage', statuses: ['triage'], glyph: '■', color: 'inactive' }
+// The status bar: shipped on the left, the lanes, raw ideas on the right; archived cards stay out.
+const BAR = [DONE, ...LANES, TRIAGE]
 
-type Card = { id: string; title: string; status: string; assignee: string | null; updated_at: number }
+type Card = { id: string; title: string; status: string; assignee: string | null; priority: number; updated_at: number }
 type Snapshot = { board: string; cards: Card[] } | { error: string }
 // Kept in $.store across sessions while the person leaves the pane open; `board` is a pinned slug.
 type Saved = { board: string | null }
@@ -31,11 +37,34 @@ async function load($: EngineInterface, board: string | null): Promise<Snapshot>
   }
 }
 
+// `kanban board` mints a one-time login link and hands it to the browser.
+async function openBoard($: EngineInterface) {
+  const r = await $.process
+    .run(['kanban', 'board'], { cwd: await $.session.cwd(), timeoutMs: 5_000 })
+    .catch((err: unknown) => ({ exitCode: -1, stderr: `kanban did not run: ${String(err)}` }))
+  if (r.exitCode !== 0) $.ui.toast(r.stderr.trim() || `kanban board exited ${r.exitCode}`)
+}
+
 function ago(seconds: number): string {
   if (seconds < 60) return `${Math.max(0, Math.floor(seconds))}s`
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`
   return `${Math.floor(seconds / 86400)}d`
+}
+
+// Cells per segment, rounded on the running total so the segments always fill `width` exactly.
+// ponytail: a status holding a sliver of a big board can round to no cell; its lane still lists it.
+function segments(parts: { color: string; n: number }[], width: number) {
+  const total = parts.reduce((a, p) => a + p.n, 0)
+  let seen = 0
+  let drawn = 0
+  return parts.map(p => {
+    seen += p.n
+    const end = Math.round((seen / total) * width)
+    const cells = end - drawn
+    drawn = end
+    return { color: p.color, cells }
+  })
 }
 
 // ponytail: one pane per module instance; per-session atoms if a host ever shares a module across sessions.
@@ -93,42 +122,89 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const width = e.props.bodyColumns
     const s = (snap ??= await load($, board))
+    const controls = (
+      <Box flexDirection="row" gap={2}>
+        <Button key="refresh" label="refresh" hotkey="r" plain dimColor onPress={() => refresh($)} />
+        <Button key="open" label="web board" hotkey="o" plain dimColor onPress={() => openBoard($)} />
+      </Box>
+    )
     if ('error' in s) {
       return (
-        <Box flexDirection="column" width={e.props.bodyColumns}>
-          <Text color="yellow">{s.error}</Text>
+        <Box flexDirection="column" width={width}>
+          <Box flexDirection="row" gap={1}>
+            <Text color="warning">▲</Text>
+            <Box flexShrink={1}>
+              <Text color="warning">{s.error}</Text>
+            </Box>
+          </Box>
           <Text dimColor>/kanban-board SLUG pins a board.</Text>
+          <Box marginTop={1}>{controls}</Box>
         </Box>
       )
     }
     const now = (await $.clock.now()) / 1000
-    const count = (status: string) => s.cards.filter(c => c.status === status).length
-    const lanes = LANES.map(([name, statuses]) => ({
-      name,
-      cards: statuses.flatMap(st => s.cards.filter(c => c.status === st)),
-    })).filter(l => l.cards.length > 0)
+    const of = (g: Group) => g.statuses.flatMap(st => s.cards.filter(c => c.status === st))
+    const lanes = LANES.map(l => ({ ...l, cards: of(l) })).filter(l => l.cards.length > 0)
+    const parts = BAR.map(g => ({ color: g.color, n: of(g).length }))
+    const total = parts.reduce((a, p) => a + p.n, 0)
+    // One badge column wide enough for every priority shown, so the titles line up.
+    const shown = lanes.flatMap(l => l.cards.slice(0, SHOWN))
+    const badge = Math.max(0, ...shown.map(c => (c.priority > 0 ? `P${c.priority}`.length : 0)))
     return (
-      <Box flexDirection="column" width={e.props.bodyColumns}>
-        <Text bold wrap="truncate-end">{s.board}</Text>
+      <Box flexDirection="column" width={width}>
+        <Box flexDirection="row" justifyContent="space-between" gap={1}>
+          <Box flexDirection="row" gap={1} flexShrink={1}>
+            <Text color="claude">◆</Text>
+            <Text bold wrap="truncate-end">{s.board}</Text>
+          </Box>
+          <Text dimColor>{`${total - of(DONE).length} open`}</Text>
+        </Box>
+        {total > 0 && (
+          <Box flexDirection="row">
+            {segments(parts, width).map(seg => seg.cells > 0 && <Text color={seg.color}>{'━'.repeat(seg.cells)}</Text>)}
+          </Box>
+        )}
         {lanes.length === 0 && <Text dimColor>Nothing running or planned.</Text>}
         {lanes.map(l => (
-          <Box key={l.name} flexDirection="column" marginTop={1}>
-            <Text bold>{`${l.name} ${l.cards.length}`}</Text>
+          <Box key={l.name} flexDirection="column" borderStyle="round" borderColor={l.color} paddingX={1}>
+            <Box flexDirection="row" justifyContent="space-between">
+              <Box flexDirection="row" gap={1}>
+                <Text color={l.color}>{l.glyph}</Text>
+                <Text bold color={l.color}>{l.name}</Text>
+              </Box>
+              <Text dimColor>{String(l.cards.length)}</Text>
+            </Box>
             {l.cards.slice(0, SHOWN).map(c => (
               <Box key={c.id} flexDirection="row" gap={1}>
+                {badge > 0 && (
+                  <Box width={badge} flexShrink={0}>
+                    {c.priority > 0 && <Text bold color="warning">{`P${c.priority}`}</Text>}
+                  </Box>
+                )}
                 <Box flexGrow={1} flexShrink={1}>
                   <Text wrap="truncate-end">{c.title}</Text>
                 </Box>
-                <Text dimColor>{`${c.assignee ? `@${c.assignee} ` : ''}${ago(now - c.updated_at)}`}</Text>
+                <Box flexShrink={0}>
+                  <Text dimColor>{[c.assignee && `@${c.assignee}`, ago(now - c.updated_at)].filter(Boolean).join(' · ')}</Text>
+                </Box>
               </Box>
             ))}
-            {l.cards.length > SHOWN && <Text dimColor>{`+${l.cards.length - SHOWN} more`}</Text>}
+            {l.cards.length > SHOWN && <Text dimColor italic>{`+${l.cards.length - SHOWN} more`}</Text>}
           </Box>
         ))}
-        <Box marginTop={1}>
-          <Text dimColor>{`triage ${count('triage')} · done ${count('done')}`}</Text>
+        <Box flexDirection="row" justifyContent="space-between">
+          <Box flexDirection="row" gap={2}>
+            {[DONE, TRIAGE].map(g => (
+              <Box key={g.name} flexDirection="row" gap={1}>
+                <Text color={g.color}>{g.glyph}</Text>
+                <Text dimColor>{`${g.name} ${of(g).length}`}</Text>
+              </Box>
+            ))}
+          </Box>
+          {controls}
         </Box>
       </Box>
     )

@@ -2,7 +2,7 @@
 
 A local kanban board for Claude Code. Cards are dispatched to headless Claude workers (`claude -p`) under a macOS LaunchAgent; the board is a SQLite file and a loopback web page. No external service.
 
-Status: pre-release (`0.2.0.dev5`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
+Status: pre-release (`0.2.0.dev6`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
 
 ## Install
 
@@ -63,7 +63,7 @@ Agents cannot enforce a deny list for Bash commands; the runner's `--settings` c
 
 ## Board pane
 
-`/kanban-board` docks a short board beside the transcript: the cards running, in review, blocked and up next (four per lane, then `+N more`), with each card's role and the age of its last change, and the triage and done counts. It reads `kanban --json list --sort priority` for the board of the session's folder every 15 s while the pane is open, and only then. `/kanban-board SLUG` pins another board; `/kanban-board close` closes it. A pane left open reopens in the next session; one closed by hand stays closed. Card workers never load it. The web board stays the full view.
+`/kanban-board` docks a short board beside the transcript. Under the board's name and its open count, a bar across the pane shows the board's cards by status, done on the left and triage on the right. Below it, each lane with cards (running, in review, blocked, up next) is a round card in its status color, listing up to four cards, then `+N more`, each with its priority, role and the age of its last change. The footer is the bar's legend for done and triage. Colors are Claude Code theme keys, so the pane follows your theme. While the pane has the keyboard (click it, or Ctrl+X then Tab), `r` reloads it and `o` opens the web board. It reads `kanban --json list --sort priority` for the board of the session's folder every 15 s while the pane is open, and only then. `/kanban-board SLUG` pins another board; `/kanban-board close` closes it. A pane left open reopens in the next session; one closed by hand stays closed. Card workers never load it. The web board stays the full view.
 
 It is a Claude Code mod and needs Claude Code 2.1.287 or later; an organization's managed settings can disable mods. Narrower than 144 columns, Claude Code places a pane it was not asked for only from 110 columns, so a reopened pane may wait until the terminal is wide enough.
 

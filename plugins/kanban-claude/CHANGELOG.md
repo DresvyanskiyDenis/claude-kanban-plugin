@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.2.0.dev5 (unreleased)
+## 0.2.0.dev6 (unreleased)
+
+### Added
+
+- The board pane has keys: `r` reloads it and `o` opens the web board, as `kanban board` does.
+
+### Changed
+
+- The board pane is redesigned: a status bar across the pane, one round card per lane in its status color, priority badges in an aligned column, and a legend for done and triage. Colors follow the Claude Code theme.
+
+## 0.2.0.dev5
 
 ### Added
 
