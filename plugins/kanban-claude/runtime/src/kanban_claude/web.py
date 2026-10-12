@@ -685,6 +685,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and u.path in self.server.assets:
             page, ctype = self.server.assets[u.path]
             return self.send_body(200, page, ctype, "no-cache")
+        if self.command == "GET" and u.path == "/theme.css":
+            # An optional private look kept outside the plugin; read per request, so a reload shows edits.
+            theme = self.server.dirs.home / "theme.css"
+            css = theme.read_bytes() if theme.is_file() else b""
+            return self.send_body(200, css, "text/css", "no-cache")
         if not u.path.startswith("/api/"):
             raise Fail(404, "not found")
         if (self.command, u.path) != ("POST", "/api/login"):

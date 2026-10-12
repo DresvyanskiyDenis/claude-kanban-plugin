@@ -496,6 +496,19 @@ def test_static_assets_and_headers(srv: web.WebServer) -> None:
     assert send(srv.port, "GET", "/api/boards", h)[1]["cache-control"] == "no-store"
 
 
+def test_theme_css_comes_from_the_kanban_home_and_loads_after_the_board_css(
+    srv: web.WebServer,
+) -> None:
+    h = {"Host": f"127.0.0.1:{srv.port}"}
+    page = send(srv.port, "GET", "/", h)[2]
+    assert page.index(b'href="/board.css"') < page.index(b'href="/theme.css"')
+    status, headers, body = send(srv.port, "GET", "/theme.css", h)
+    assert (status, body) == (200, b"") and headers["content-type"].startswith("text/css")
+    (srv.dirs.home / "theme.css").write_text(":root { --accent: #c00; }")
+    status, headers, body = send(srv.port, "GET", "/theme.css", h)
+    assert body == b":root { --accent: #c00; }" and headers["cache-control"] == "no-cache"
+
+
 def test_body_limits_and_malformed_requests(call: Call, srv: web.WebServer, card: Card) -> None:
     tid = card()
     path = f"/api/cards/{tid}/comments"

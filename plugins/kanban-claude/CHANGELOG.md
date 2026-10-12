@@ -1,6 +1,21 @@
 # Changelog
 
-## 0.2.0.dev4 (unreleased)
+## 0.2.0.dev5 (unreleased)
+
+### Added
+
+- An optional `theme.css` in `$KANBAN_HOME` restyles the web board. It loads after the board's own stylesheet, is read on every page load, and only sets the custom properties the README lists.
+- `/` focuses the filter. An empty lane says what lands there, and an empty lane under a filter says that nothing matches.
+
+### Changed
+
+- The web board is redesigned on a token layer: neutral greys with one accent, a status dot per lane and per move button, a card count pill, priority and role pills, a slimmer runtime bar with a pulsing dot while a run is live, a searchable header with a board picker, an Archived switch and ok, warn or bad dots on the dispatch and account stats. Light and dark follow the system; animations stop under reduced motion.
+
+### Fixed
+
+- Toasts show above an open drawer or dialog and can be dismissed there. Before, a modal dialog covered them, so an action that failed from the drawer gave no visible message.
+
+## 0.2.0.dev4
 
 ### Fixed
 

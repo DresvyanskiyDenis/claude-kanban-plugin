@@ -48,11 +48,19 @@ function gate(text) {
   $("#gate-text").replaceChildren(...text.split("`").map((p, i) => (i % 2 ? el("code", null, p) : p)));
 }
 
+// A modal dialog paints over and inerts everything outside it, so the toast stack rides in the topmost one.
+function hostToasts() {
+  const box = $("#toasts"), host = [...document.querySelectorAll("dialog[open]")].pop() || document.body;
+  if (box.parentElement !== host) host.append(box);
+  return box;
+}
+document.addEventListener("close", hostToasts, true);
+
 function toast(text, bad) {
   const t = el("div", { class: bad ? "toast err" : "toast", role: bad ? "alert" : null },
     el("p", null, el("strong", null, bad ? "Problem: " : "Done: "), text),
     el("button", { type: "button", "aria-label": "Dismiss message", onclick: () => t.remove() }, "Dismiss"));
-  $("#toasts").append(t);
+  hostToasts().append(t);
   if (!bad) setTimeout(() => t.remove(), 6000);
 }
 
@@ -136,11 +144,12 @@ function strip(c) {
     class: c.pending ? "strip pending" : "strip", role: "button", tabindex: "0", draggable: "true",
     "data-id": c.id, "aria-label": `${c.id}, ${c.status}: ${c.title}. ${chips.map((t) => t.textContent).join(", ")}`,
     "data-start": running ? c.run_started : null, "data-cap": running ? c.run_max || 0 : null },
-    el("div", { class: "row" }, el("span", null, c.id),
-      el("span", null, [c.assignee && `@${c.assignee}`, c.priority && `P${c.priority}`, ago(c.updated_at)]
-        .filter(Boolean).join(" "))),
+    el("div", { class: "row" }, el("span", { class: "id" }, c.id),
+      c.priority ? el("span", { class: "prio", title: "Priority" }, `P${c.priority}`) : null,
+      el("span", null, ago(c.updated_at))),
     el("p", { class: "title" }, c.title),
-    chips.length ? el("div", { class: "tags" }, chips) : null,
+    c.assignee || chips.length ? el("div", { class: "tags" },
+      c.assignee ? el("span", { class: "role" }, `@${c.assignee}`) : null, chips) : null,
     running ? el("div", { class: "run" }, el("span", { class: "elapsed" }),
       c.run_max ? el("span", { class: "cap", "aria-hidden": "true" }, el("i")) : null) : null);
   return el("li", null, body);
@@ -153,6 +162,17 @@ const order = {
   _: (a, b) => b.priority - a.priority || a.created_at - b.created_at || (a.id < b.id ? -1 : 1),
 };
 
+const HINTS = {
+  triage: "New cards start here. Refine one, then move it to ready.",
+  todo: "Cards waiting on their parents. They move on by themselves.",
+  ready: "Next in line. Dispatch starts these as slots free up.",
+  running: "Nothing running. Ready cards start here while dispatch is on.",
+  review: "Finished work waits here for warden's review.",
+  blocked: "Cards that need your answer or hit a problem land here.",
+  done: "Finished cards collect here.",
+  archived: "Archived cards: off the board, kept on record.",
+};
+
 function render() {
   if (S.dragging) return;
   const focus = document.activeElement?.closest?.(".strip")?.dataset.id;
@@ -161,7 +181,8 @@ function render() {
     !f || `${c.title} ${c.id} ${c.assignee || ""}`.toLowerCase().includes(f));
   for (const lane of document.querySelectorAll(".lane")) {
     const s = lane.dataset.s, mine = shown.filter((c) => c.status === s).sort(order[s] || order._);
-    lane.querySelector("ol").replaceChildren(...mine.map(strip));
+    lane.querySelector("ol").replaceChildren(...(mine.length ? mine.map(strip)
+      : [el("li", { class: "empty" }, f ? "No card matches the filter." : HINTS[s])]));
     lane.querySelector(".count").textContent = s === "running" && S.header
       ? `${mine.length}/${S.header.cap}` : mine.length;
   }
@@ -186,13 +207,13 @@ function tick() {
 
 function renderHeader() {
   const h = S.header;
-  const stat = (k, v) => el("span", null, `${k} `, el("b", null, v));
+  const stat = (k, v, dot) => el("span", null, `${k} `, el("b", { class: dot }, v));
   $("#pause").textContent = h.paused ? "Resume dispatch" : "Pause dispatch";
   $("#stats").replaceChildren(
-    stat("Dispatch", h.paused ? "paused" : "on"), stat("Running", `${h.running}/${h.cap}`),
+    stat("Dispatch", h.paused ? "paused" : "on", h.paused ? "warn" : "ok"), stat("Running", `${h.running}/${h.cap}`),
     stat("Today", money(h.cost_today)), stat("7 days", money(h.cost_7d)),
     ...h.accounts.map((a) => stat(a.name, a.logged_out ? "logged out"
-      : a.hard_until ? `limited until ${when(a.hard_until)}` : "ok")));
+      : a.hard_until ? `limited until ${when(a.hard_until)}` : "ok", a.logged_out ? "bad" : a.hard_until ? "warn" : "ok")));
   const notes = [];
   if (h.paused) notes.push(["warn", "Dispatch paused", `${h.paused.reason}${h.paused.detail ? `: ${h.paused.detail}` : ""}. Nothing new starts until you resume.`]);
   for (const a of h.accounts) {
@@ -337,7 +358,7 @@ function head(title, id, status) {
 }
 
 function show(headEl, ...body) {
-  drawer.replaceChildren(headEl, el("div", { class: "d-body" }, body));
+  drawer.replaceChildren(headEl, el("div", { class: "d-body" }, body), ...drawer.querySelectorAll("#toasts"));
   if (!drawer.open) drawer.showModal();
 }
 
@@ -355,7 +376,7 @@ async function openCard(id) {
 
 function drawerView(d) {
   const t = d.task, c = d.row, run = c.status === "running";
-  const act = (label, fn, cls) => el("button", { type: "button", class: cls, onclick: fn }, label);
+  const act = (label, fn, cls, s) => el("button", { type: "button", class: cls, "data-s": s, onclick: fn }, label);
   const go = (path, body, msg) => async () => {
     try { await api("POST", `/cards/${c.id}/${path}`, body); toast(msg); await refresh(); openCard(c.id); } catch (e) { fail(e); }
   };
@@ -366,7 +387,7 @@ function drawerView(d) {
     el("div", { id: "stale", class: "stale", hidden: true },
       "This card changed since you opened it.", act("Reload", () => openCard(c.id))),
     section("Actions", el("div", { class: "actions" },
-      Object.keys(c.moves).filter((to) => to !== "archived").map((to) => act(`Move to ${to}`, () => move(c, to))),
+      Object.keys(c.moves).filter((to) => to !== "archived").map((to) => act(`Move to ${to}`, () => move(c, to), null, to)),
       run ? null : act("Edit", () => drawerEdit(d)),
       run ? act("Stop run", async () => {
         if (await ask(`Stop ${c.id}`, { confirm: "Stop the run. The card becomes blocked." }))
@@ -523,6 +544,11 @@ $("#pause").addEventListener("click", async () => {
     }
     await refresh(true);
   } catch (e) { fail(e); }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "/" || e.metaKey || e.ctrlKey || e.target.closest("input, textarea, select, dialog")) return;
+  e.preventDefault();
+  $("#filter").focus();
 });
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && S.token && !S.polling) { clearTimeout(S.timer); poll(); }

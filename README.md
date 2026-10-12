@@ -2,7 +2,7 @@
 
 A local kanban board for Claude Code. Cards are dispatched to headless Claude workers (`claude -p`) under a macOS LaunchAgent; the board is a SQLite file and a loopback web page. No external service.
 
-Status: pre-release (`0.2.0.dev4`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
+Status: pre-release (`0.2.0.dev5`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
 
 ## Install
 
@@ -66,6 +66,12 @@ Agents cannot enforce a deny list for Bash commands; the runner's `--settings` c
 `/kanban-board` docks a short board beside the transcript: the cards running, in review, blocked and up next (four per lane, then `+N more`), with each card's role and the age of its last change, and the triage and done counts. It reads `kanban --json list --sort priority` for the board of the session's folder every 15 s while the pane is open, and only then. `/kanban-board SLUG` pins another board; `/kanban-board close` closes it. A pane left open reopens in the next session; one closed by hand stays closed. Card workers never load it. The web board stays the full view.
 
 It is a Claude Code mod and needs Claude Code 2.1.287 or later; an organization's managed settings can disable mods. Narrower than 144 columns, Claude Code places a pane it was not asked for only from 110 columns, so a reopened pane may wait until the terminal is wide enough.
+
+## Board theme
+
+The web board follows the system's light or dark scheme and uses system fonts; `/` jumps to the filter. Every colour, font and corner radius is a CSS custom property, so a team can restyle the board without forking it: put a `theme.css` in `$KANBAN_HOME` and the board loads it after its own stylesheet. The file is read on every page load, so a reload shows an edit. Without it the board keeps its own look.
+
+The properties: surfaces `--canvas --lane --surface --surface-2`, lines `--line --line-strong --control`, text `--ink --ink-2 --ink-3`, `--accent --accent-ink --focus --veil`, signals `--ok --warn --bad --warn-soft --warn-ink --bad-soft --bad-ink`, one per lane `--triage --todo --ready --running --review --blocked --done --archived`, and `--font-sans --font-head --font-mono --radius --radius-pill`. Set them in `:root` and again in `@media (prefers-color-scheme: dark) { :root { … } }`; a theme that sets only the first shows its light colours in dark mode. The page's content security policy loads fonts from the board only, so a font the theme names must be installed on the machine.
 
 ## Doctor
 
