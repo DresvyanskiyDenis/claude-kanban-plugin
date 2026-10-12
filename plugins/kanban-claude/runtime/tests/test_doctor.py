@@ -275,6 +275,14 @@ def test_probe_fails_check_9_when_the_agent_does_not_resolve(
     knobs(FAKE_CLAUDE_FIXTURE_AGENT="no_agent")
     check = got(doctor("--probe"), 9)
     assert check["status"] == "fail" and "does not resolve" in check["detail"]
+    assert "--agent 'kanban-claude:scout' not found" in check["detail"]
+
+
+def test_probe_passes_check_9_when_the_scout_spends_its_one_turn_on_a_tool(
+    doctor: Doctor, knobs: Callable[..., None]
+) -> None:
+    knobs(FAKE_CLAUDE_FIXTURE_AGENT="max_turns")
+    assert got(doctor("--probe"), 9)["status"] == "ok"
 
 
 def test_probe_fails_check_9_when_the_login_is_gone(

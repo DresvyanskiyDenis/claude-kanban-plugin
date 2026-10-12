@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.2.0.dev3 (unreleased)
+## 0.2.0.dev4 (unreleased)
+
+### Fixed
+
+- Setup's and doctor's agent probe decides from claude's start-up event, which lists the agents it loaded, instead of the scout's first turn. A scout that spent its one turn on a tool (`error_max_turns`) no longer reads as "does not resolve", and an unknown agent now reports claude's own reason instead of an empty one or a JSON parse error.
+- Setup prints which claude it uses, so a `--claude-bin` recorded by an earlier run is visible.
+
+## 0.2.0.dev3
 
 ### Added
 

@@ -34,6 +34,7 @@ TOOL_FIX = {
     "gh": "brew install gh",
 }
 PLUGIN_INSTALL = "/plugin install kanban-claude@claude-kanban-plugin"
+SCOUT = "kanban-claude:scout"
 PLUGIN_UNINSTALL = PLUGIN_INSTALL.replace("install", "uninstall")
 # a runner notices its stopped row within one poll, then claude exits
 STOP_WAIT_S = runner.QUIET_POLL_S + 10.0
@@ -261,24 +262,27 @@ def check_probe(
 
 
 def check_agent(claude: str, env: dict[str, str], config_dir: str) -> None:
-    """INS-05 step 9: the agent resolves the way a worker will start it (INS-03)."""
+    """INS-05 step 9: the agent resolves the way a worker will start it (INS-03). The start-up
+    event decides, not the turn: the scout may spend its one turn on a tool and end in
+    error_max_turns, and claude refuses an unknown agent on stderr before any event."""
     d = dirs()
     argv = [
-        claude, "-p", "reply ok", "--agent", "kanban-claude:scout", "--max-turns", "1",
+        claude, "-p", "reply ok", "--agent", SCOUT, "--max-turns", "1",
         "--permission-mode", "auto", "--permission-prompts", "none",
-        "--settings", runner.settings_json(d.home, []), "--output-format", "json",
+        "--settings", runner.settings_json(d.home, []), "--output-format", "stream-json", "--verbose",
     ]  # fmt: skip
     try:
+        # ponytail: still pays the one model turn; read until the init event and stop if it matters
         p = subprocess.run(
             argv, capture_output=True, text=True, env=env, cwd=d.work, timeout=PROBE_TIMEOUT_S,
             stdin=subprocess.DEVNULL,
         )  # fmt: skip
-        out = json.loads(p.stdout)
+        events = [json.loads(x) for x in p.stdout.splitlines() if x.strip()]
     except (OSError, subprocess.TimeoutExpired, ValueError) as e:
         raise Error(f"the agent probe could not run: {e}") from e
-    if isinstance(out, dict) and not out.get("is_error"):
+    if any(isinstance(e, dict) and SCOUT in e.get("agents", []) for e in events):
         return
-    why = classify.first_line(out) if isinstance(out, dict) else p.stderr.strip()[:200]
+    why = p.stderr.strip()[:200] or f"exit {p.returncode}, and no start-up event lists {SCOUT}"
     where = (
         f" (start it as CLAUDE_CONFIG_DIR={config_dir} claude)"
         if "CLAUDE_CONFIG_DIR" in env
@@ -341,6 +345,7 @@ def setup(a: argparse.Namespace) -> tuple[dict[str, Any], str]:
 def run_setup(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str]:
     d = dirs()
     claude = resolve_claude(a.claude_bin, conn)
+    say(f"using claude at {claude}")
     old = read_stamp()
     if old:
         before, now = version_key(old["version"]), version_key(__version__)

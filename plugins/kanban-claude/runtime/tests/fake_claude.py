@@ -32,6 +32,9 @@ def main() -> None:
     name = env.get("FAKE_CLAUDE_FIXTURE", "success")
     if "--agent" in argv:  # FAKE_CLAUDE_FIXTURE_AGENT answers only an `--agent` call
         name = env.get("FAKE_CLAUDE_FIXTURE_AGENT", name)
+        if name == "no_agent":  # the real CLI refuses an unknown agent before any event, on stderr
+            agent = argv[argv.index("--agent") + 1]
+            sys.exit(f"--agent '{agent}' not found. Available agents: general-purpose")
     if "--model" in argv:  # FAKE_CLAUDE_FIXTURE_OPUS answers only `--model opus`
         name = env.get(f"FAKE_CLAUDE_FIXTURE_{argv[argv.index('--model') + 1].upper()}", name)
     text = (fixtures / f"{name}.jsonl").read_text()

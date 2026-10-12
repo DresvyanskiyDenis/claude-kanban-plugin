@@ -67,6 +67,7 @@ def test_setup_loads_the_agent_stamps_the_version_and_names_the_board(
         and stat.S_IMODE(os.stat(paths.dirs().home / "installed.json").st_mode) == 0o600
     )
     assert "kanban board" in out and f"http://127.0.0.1:{board_up}/" in out
+    assert f"using claude at {env / 'bin' / 'claude'}" in err
     assert cfg("claude.bin") == str(env / "bin" / "claude")
     assert cfg("web.port") == board_up
 
@@ -89,7 +90,11 @@ def test_the_probes_run_with_the_worker_flags_from_the_work_directory(
         "1",
     ]
     assert agent["argv"][6:10] == ["--permission-mode", "auto", "--permission-prompts", "none"]
-    assert agent["argv"][10] == "--settings" and agent["argv"][-2:] == ["--output-format", "json"]
+    assert agent["argv"][10] == "--settings" and agent["argv"][-3:] == [
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ]
     assert Path(agent["cwd"]).resolve() == paths.dirs().work.resolve()
 
 
