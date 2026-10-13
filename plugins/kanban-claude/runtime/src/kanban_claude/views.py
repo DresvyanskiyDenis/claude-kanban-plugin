@@ -86,11 +86,66 @@ def _json(value: str | None) -> Any:
     return json.loads(value) if value else None
 
 
+# Why a card waits (`todo` only): its parents that do not satisfy `store._all_done`.
+_WAITING_SQL = """(CASE WHEN t.status = 'todo' THEN (
+  SELECT json_group_array(json_object('id', id, 'status', status, 'block_kind', block_kind,
+                                      'merge_state', merge_state))
+  FROM (SELECT p.id, p.status, p.block_kind, p.merge_state FROM task_links l
+        JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = t.id
+        AND NOT (p.status IN ('done', 'archived') AND (p.merge_state IS NULL OR p.merge_state = 'merged'))
+        ORDER BY p.id)) END) AS waiting_for"""
+# A done card whose approved PR no one has merged: the last word on it was `awaiting_owner_merge`.
+_AWAITING_WHERE = """t.status = 'done' AND t.merge_state IS NULL AND t.merged_at IS NULL AND (
+  SELECT e.kind FROM task_events e WHERE e.task_id = t.id
+  AND e.kind IN ('awaiting_owner_merge', 'completed', 'completed_by_owner', 'reopened')
+  ORDER BY e.id DESC LIMIT 1) = 'awaiting_owner_merge'"""
+_AWAITING_SQL = f"({_AWAITING_WHERE}) AS awaiting_merge"
+
+
+def awaiting_owner_merge(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The cards `_AWAITING_SQL` marks, that have a PR and a repository to ask about it."""
+    return conn.execute(
+        f"SELECT t.* FROM tasks t WHERE {_AWAITING_WHERE} "
+        "AND t.pr_number IS NOT NULL AND t.workspace_path IS NOT NULL"
+    ).fetchall()
+
+
+def _why(p: dict[str, Any]) -> str:
+    if p["status"] == "blocked" and p["block_kind"]:
+        return f"blocked: {p['block_kind']}"
+    if p["status"] == "done" and p["merge_state"]:
+        return f"done, merge {p['merge_state']}"
+    return str(p["status"])
+
+
+def _flags(c: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **c,
+        "waiting_for": json.loads(c["waiting_for"] or "[]"),
+        "awaiting_merge": bool(c["awaiting_merge"]),
+    }
+
+
+def notes(c: dict[str, Any]) -> list[str]:
+    """The `list`/`show` words for a card's wait: what it waits for, or that its PR awaits a merge."""
+    out = []
+    if c["waiting_for"]:
+        parents = ", ".join(f"{p['id']} ({_why(p)})" for p in c["waiting_for"])
+        out.append(f"waits for {parents}")
+    if c["awaiting_merge"]:
+        out.append("awaiting merge")
+    return out
+
+
 def show_data(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     """CLI-02: legacy field names kept (`task.*`, `latest_summary`, `parents`, `comments[].body`)."""
     t = store.get_task(conn, task_id)
     task = dict(t)
     task["skills"] = json.loads(task["skills"])
+    flags = conn.execute(
+        f"SELECT {_WAITING_SQL}, {_AWAITING_SQL} FROM tasks t WHERE t.id = ?", (task_id,)
+    )
+    task.update(_flags(dict(flags.fetchone())))
 
     def ids(sql: str) -> list[str]:
         return [r[0] for r in conn.execute(sql, (task_id,))]
@@ -147,6 +202,7 @@ def show_text(d: dict[str, Any]) -> str:
         lines.append(f"block: {t['block_kind']}")
     if t["merge_state"]:
         lines.append(f"merge: {t['merge_state']}")
+    lines += notes(t)
     lines.append(
         f"parents: {', '.join(d['parents']) or '-'}  children: {', '.join(d['children']) or '-'}"
     )
@@ -286,19 +342,24 @@ def cards_list(
         where.append("assignee = ?")
         args.append(assignee)
     sql = (
-        "SELECT id, title, status, assignee, priority, branch_name, pr_number, created_at, "
-        f"updated_at, completed_at FROM tasks WHERE {' AND '.join(where)} ORDER BY {SORTS[sort]}"
+        "SELECT t.id, t.title, t.status, t.assignee, t.priority, t.branch_name, t.pr_number, "
+        f"t.created_at, t.updated_at, t.completed_at, {_WAITING_SQL}, {_AWAITING_SQL} "
+        f"FROM tasks t WHERE {' AND '.join(where)} ORDER BY {SORTS[sort]}"
     )
     if limit:
         sql += " LIMIT ?"
         args.append(limit)
-    return [dict(r) for r in conn.execute(sql, args)]
+    return [_flags(dict(r)) for r in conn.execute(sql, args)]
 
 
 def runs_list(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
     store.get_task(conn, task_id)
     cols = (
-        "id, n, kind, role, status, outcome, started_at, ended_at, model, effort, cost_usd, error"
+        "id, n, kind, role, status, outcome, started_at, ended_at, model, effort, cost_usd, "
+        "input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, model_usage, error"
     )
     q = f"SELECT {cols} FROM task_runs WHERE task_id = ? ORDER BY n"
-    return [dict(r) for r in conn.execute(q, (task_id,))]
+    return [
+        {**r, "model_usage": json.loads(r["model_usage"]) if r["model_usage"] else None}
+        for r in map(dict, conn.execute(q, (task_id,)))
+    ]

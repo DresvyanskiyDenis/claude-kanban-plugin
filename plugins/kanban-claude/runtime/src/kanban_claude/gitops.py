@@ -9,7 +9,7 @@ import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
-from .errors import Error
+from .errors import Error, NotFound, Usage
 from .paths import dirs, ensure_dir
 
 LOCK = "kanban-provision.lock"
@@ -197,17 +197,34 @@ def cleanup(root: str | Path, task_id: str, branch: str | None, *, merged: bool)
     return "removed"
 
 
-def snapshot(repo: str | Path) -> tuple[Path, str | None]:
-    """CHK-03: (path, warning). A detached checkout of origin/HEAD, or the working tree itself."""
+def _resolve(root: Path, ref: str, fetch_warning: str | None) -> str:
+    """A branch on origin, else a tag, else anything git can name (a sha, a local branch)."""
+    if ref.startswith("-"):
+        raise Usage(f"--ref {ref!r} must be a branch, tag or commit, not an option")
+    for candidate in (f"refs/remotes/origin/{ref}", f"refs/tags/{ref}", ref):
+        if _exists(root, candidate):
+            return candidate
+    why = f"; {fetch_warning}" if fetch_warning else ""
+    raise NotFound(
+        f"no branch, tag or commit {ref!r} in {root}; push it, or pass another --ref{why}"
+    )
+
+
+def snapshot(repo: str | Path, ref: str | None = None) -> tuple[Path, str | None]:
+    """CHK-03: (path, warning). A detached checkout of `ref`, else of origin/HEAD, or the working tree itself."""
     top = toplevel(repo)
     if top is None:
+        if ref:
+            raise Usage(f"--ref needs a git repository, and {repo} is not one")
         return Path(repo).resolve(), "not a git repository; using the directory as it is"
-    rc, out = run("fetch", "-q", "origin", root=top, timeout=120)
+    rc, out = run("fetch", "-q", *(("--tags",) if ref else ()), "origin", root=top, timeout=120)
     warning = None if rc == 0 else f"git fetch failed ({out}); the snapshot may be stale"
-    head = "refs/remotes/origin/HEAD"
-    if not _exists(top, head):
+    head = _resolve(top, ref, warning) if ref else "refs/remotes/origin/HEAD"
+    if not ref and not _exists(top, head):
         return top, "no origin/HEAD; using the working tree"
-    snap = dirs().home / "snapshots" / hashlib.sha256(str(top).encode()).hexdigest()[:16]
+    # ponytail: one worktree per distinct ref, nothing prunes snapshots/; prune by age when it grows
+    key = f"{top}\0{ref}" if ref else str(top)
+    snap = dirs().home / "snapshots" / hashlib.sha256(key.encode()).hexdigest()[:16]
     if snap.is_dir():
         rc, out = run("checkout", "--detach", head, root=snap)
     else:

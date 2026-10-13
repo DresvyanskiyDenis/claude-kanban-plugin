@@ -644,7 +644,7 @@ def test_feed_is_scoped_to_the_board(
 
 
 def test_pause_resume_and_header_facts(
-    call: Call, conn: sqlite3.Connection, srv: web.WebServer, board: str
+    call: Call, conn: sqlite3.Connection, srv: web.WebServer, board: str, tmp_path: Path
 ) -> None:
     assert (
         ok(call("POST", "/api/dispatch/pause", {"reason": "lunch"}))["paused"]["detail"] == "lunch"
@@ -663,11 +663,12 @@ def test_pause_resume_and_header_facts(
         )
     (srv.dirs.home / "installed.json").write_text(json.dumps({"version": "9.9.9"}))
     LIVE["unprotected"] = ["acme/proj"]
+    store.board_create(conn, "other", default_workdir=str(tmp_path), claude_config_dir="/c/one")
+    store.board_edit(conn, board, claude_config_dir="/c/two")
     h = ok(call("GET", f"/api/boards/{board}"))["header"]
-    accts = {a["name"]: a for a in h["accounts"]}
-    assert accts["one"]["logged_out"] and accts["one"]["hard_until"] is None
-    assert accts["two"]["hard_until"] == soon and accts["two"]["soft_until"] is None
-    assert not {"five_hour", "seven_day"} & accts["two"].keys()
+    assert h["accounts"] == [{"logged_out": False, "hard_until": soon, "soft_until": None}]
+    other = ok(call("GET", "/api/boards/other"))["header"]
+    assert other["accounts"] == [{"logged_out": True, "hard_until": None, "soft_until": None}]
     assert h["installed"] == "9.9.9" and "unprotected" not in h
     snap = ok(call("GET", f"/api/boards/{board}"))
     assert snap["live"]["unprotected"] == ["acme/proj"]
@@ -1103,3 +1104,34 @@ def test_a_jira_base_url_that_is_not_https_is_never_handed_to_the_page(
 ) -> None:
     store.config_set(conn, "web.jira_base_url", "javascript:alert(1)//")
     assert ok(call("GET", f"/api/boards/{board}"))["header"]["jira_base"] is None
+
+
+def test_header_counts_running_cards_here_and_on_all_boards(
+    call: Call, conn: sqlite3.Connection, card: Card, board: str, tmp_path: Path
+) -> None:
+    store.board_create(conn, "other", default_workdir=str(tmp_path))
+    elsewhere = store.create(conn, "other", "elsewhere", body="b", assignee="smith")["id"]
+    assert store.claim(conn, card("here")) and store.claim(conn, elsewhere)
+    h = ok(call("GET", f"/api/boards/{board}"))["header"]
+    assert (h["running_here"], h["running"]) == (1, 2)
+    assert ok(call("GET", "/api/boards/other"))["header"]["running_here"] == 1
+
+
+def test_no_config_folder_name_reaches_the_page(
+    call: Call, conn: sqlite3.Connection, card: Card, board: str
+) -> None:
+    secret, soon = ".secret-claude-dir", int(time.time()) + 600
+    cursor = ok(call("GET", f"/api/boards/{board}"))["last_event_id"]
+    with store.tx(conn):
+        store.account_set(conn, f"/c/{secret}", auth_paused={"since": 1}, hard_until=soon)
+        store.event(conn, None, "account_resumed", store.OWNER, {"config_dir": f"/c/{secret}"})
+        store.config_set(conn, "claude.config_dir", f"/c/{secret}")
+    feed = ok(call("GET", f"/api/boards/{board}?since={cursor}"))
+    assert [e["kind"] for e in feed["events"]] == ["account_resumed", "config_changed"]
+    assert secret not in json.dumps(feed)
+    page = ok(call("GET", f"/api/boards/{board}"))
+    assert page["header"]["accounts"] and secret not in json.dumps(page)
+    tid = card()
+    store.archive(conn, tid, rm=True)
+    gone = ok(call("GET", f"/api/boards/{board}?since={feed['last_event_id']}"))["events"][-1]
+    assert gone["kind"] == "deleted" and gone["payload"]["id"] == tid, "the board reads this one"

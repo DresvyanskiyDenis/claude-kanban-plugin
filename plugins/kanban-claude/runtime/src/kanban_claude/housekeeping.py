@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from . import ghops, gitops, jira, protection, store
+from . import ghops, gitops, jira, protection, store, views
 from .errors import Error
 from .paths import dirs
 
@@ -161,6 +161,22 @@ def cleanup_card(conn: sqlite3.Connection, t: Row) -> None:
             store.event(conn, t, "worktree_kept", "housekeeping", {"state": state})
 
 
+def settle_owner_merges(conn: sqlite3.Connection) -> None:
+    """A PR into the default branch is merged by the owner on GitHub, which nothing else sees: note the
+    time, so the card stops being `awaiting merge`. Its worktree is usually gone by then (GIT-06)."""
+    for t in views.awaiting_owner_merge(conn):
+        with contextlib.suppress(Error):
+            repo = gitops.repo_slug(gitops.origin_url(t["workspace_path"]) or "")
+            if ghops.pr_view(repo, t["pr_number"])["state"] == "MERGED":
+                ts = store.now()
+                with store.tx(conn):
+                    conn.execute(
+                        "UPDATE tasks SET merged_at = ?, updated_at = ?, version = version + 1 "
+                        "WHERE id = ? AND merge_state IS NULL AND merged_at IS NULL",
+                        (ts, ts, t["id"]),
+                    )
+
+
 def sweep(conn: sqlite3.Connection) -> None:
     """GIT-06: finished worktree cards, and the scratch directories of archived cards."""
     for t in conn.execute(
@@ -168,6 +184,7 @@ def sweep(conn: sqlite3.Connection) -> None:
         "AND worktree_state IN ('active', 'kept_dirty', 'kept_unpushed')"
     ).fetchall():
         cleanup_card(conn, t)
+    settle_owner_merges(conn)
     scratch = dirs().work / "scratch"
     for t in conn.execute(
         "SELECT id FROM tasks WHERE status = 'archived' AND workspace_kind = 'scratch'"

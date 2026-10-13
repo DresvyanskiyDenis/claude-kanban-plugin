@@ -31,11 +31,11 @@ from .procs import Procs
 
 Handler = Callable[[argparse.Namespace, sqlite3.Connection], tuple[dict[str, Any], str | None]]
 
-RUN_ONLY = {"block", "complete", "request-review", "request-changes"}
+RUN_ONLY = {"block", "complete"}
 NEEDS_DAEMON = {"create", "specify", "promote", "unblock"}
 NUDGE = NEEDS_DAEMON | {
     "assign", "reassign", "edit", "reopen", "reopen-review", "merge-retry", "mark-done", "resume",
-    "stop",
+    "stop", "request-review", "request-changes",
 }  # fmt: skip
 LONG_RUNNING: dict[str, Callable[[argparse.Namespace], int]] = {
     "daemon": lambda a: daemon.serve(),
@@ -55,6 +55,13 @@ def owner_verb(name: str) -> Callable[[Handler], Handler]:
 def plain(fn: Callable[[argparse.Namespace, sqlite3.Connection], dict[str, Any]]) -> Handler:
     """A verb whose store result is its whole output."""
     return lambda a, conn: (fn(a, conn), None)
+
+
+def warn(result: dict[str, Any]) -> dict[str, Any]:
+    """The store's non-fatal notes, on stderr; they stay in the JSON result as `warnings`."""
+    for w in result.get("warnings", ()):
+        print(f"warning: {w}", file=sys.stderr)
+    return result
 
 
 def _reasoned(fn: Callable[..., dict[str, Any]]) -> Handler:
@@ -111,7 +118,7 @@ def build() -> argparse.ArgumentParser:
     add("jira", "action", ("ref", "?"), ("issue", "?"))
     add(
         "create", "title", *card, *text, "--idempotency-key", ("--parent", "append"),
-        ("--triage", "flag"),
+        ("--triage", "flag"), ("--grant", "append"), "--approved",
     )  # fmt: skip
     add("specify", "id", "--title", *card, *text)
     add("list", "--status", "--assignee", "--sort", ("--limit", int))
@@ -127,7 +134,7 @@ def build() -> argparse.ArgumentParser:
     add("dispatch", ("--dry-run", "flag"))
     add("daemon")
     add("run", ("run_id", int))
-    add("snapshot", "repo")
+    add("snapshot", "repo", "--ref")
     add("archive", "id", ("--rm", "flag"), ("--yes", "flag"))
     add("merge-retry", "id")
     add("grant", "id", ("--allow", "append"), "--approved", ("--revoke", "flag"))
@@ -333,8 +340,9 @@ def v_create(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
     f.pop("title")
     got = store.create(
         conn, need_board(conn, a), a.title, parents=a.parent or [], triage=a.triage,
-        idempotency_key=a.idempotency_key, **f,
+        idempotency_key=a.idempotency_key, grants=a.grant or [], approved=a.approved, **f,
     )  # fmt: skip
+    warn(got)
     return got, None
 
 
@@ -348,6 +356,7 @@ def v_list(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, A
     )
     lines = [
         f"{c['id']}  {c['status']:<8}  @{c['assignee'] or '-':<8}  p{c['priority']}  {c['title']}"
+        + "".join(f"  [{n}]" for n in views.notes(c))
         for c in cards
     ]
     return {"board": board, "cards": cards}, "\n".join(lines) or "(no cards)"
@@ -367,10 +376,25 @@ OWNER["unblock"] = _reasoned(store.unblock)
 OWNER["reopen-review"] = _reasoned(store.reopen_review)
 OWNER["reopen"] = _reasoned(store.reopen)
 OWNER["mark-done"] = _reasoned(store.mark_done)
-OWNER["link"] = plain(lambda a, conn: store.link(conn, a.parent, a.child))
+OWNER["link"] = plain(lambda a, conn: warn(store.link(conn, a.parent, a.child)))
 OWNER["unlink"] = plain(lambda a, conn: store.unlink(conn, a.parent, a.child))
 OWNER["stop"] = plain(lambda a, conn: store.stop(conn, a.id))
 OWNER["merge-retry"] = plain(lambda a, conn: store.merge_retry(conn, a.id))
+OWNER["request-changes"] = plain(lambda a, conn: store.request_changes_owner(conn, a.id, a.reason))
+
+
+@owner_verb("request-review")
+def v_request_review(
+    a: argparse.Namespace, conn: sqlite3.Connection
+) -> tuple[dict[str, Any], str | None]:
+    summary = text_arg(a.summary, a.summary_file) or ""
+    t = store.get_task(conn, a.id)
+    store.owner_builder(conn, t)
+    number, url = worker._check_pr(t, summary)
+    done = store.request_review_owner(
+        conn, a.id, summary, pr_number=number, pr_url=url, reviewer=a.reviewer
+    )
+    return done, None
 
 
 @owner_verb("archive")
@@ -434,6 +458,12 @@ def v_runs(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, A
     lines = [
         f"#{r['n']}  {r['kind']:<6}  {r['role'] or '-':<8}  {r['status']:<7}  "
         f"{r['outcome'] or '-':<18}  {views.iso(r['started_at'])}  ${r['cost_usd'] or 0:.2f}"
+        + (
+            ""
+            if r["input_tokens"] is None
+            else f"  in {r['input_tokens']} out {r['output_tokens']} "
+            f"cache-write {r['cache_write_tokens']} cache-read {r['cache_read_tokens']}"
+        )
         for r in runs
     ]
     return {"id": a.id, "runs": runs}, "\n".join(lines) or "(no runs)"
@@ -534,7 +564,7 @@ def v_snapshot(
     a: argparse.Namespace, conn: sqlite3.Connection
 ) -> tuple[dict[str, Any], str | None]:
     """CHK-03: print the path of a detached origin checkout; a warning goes to stderr."""
-    path, warning = gitops.snapshot(a.repo)
+    path, warning = gitops.snapshot(a.repo, a.ref)
     if warning:
         print(f"kanban: {warning}", file=sys.stderr)
     return {"path": str(path), "warning": warning}, str(path)

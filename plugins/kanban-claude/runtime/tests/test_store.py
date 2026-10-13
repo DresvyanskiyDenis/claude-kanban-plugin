@@ -430,7 +430,7 @@ def test_jira_migration_keeps_a_version_1_database_and_adds_the_link_tables(env:
     old.commit()
     old.close()
     c = store.connect()
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store.MIGRATIONS)
     assert dict(c.execute("SELECT * FROM boards").fetchone())["jira_project"] is None
     assert c.execute("SELECT COUNT(*) FROM jira_links").fetchone()[0] == 0
     assert list((home / "backups").glob("kanban-s1-*.db"))

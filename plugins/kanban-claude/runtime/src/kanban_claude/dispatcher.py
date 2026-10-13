@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from . import store, validate
+from . import jira, store, validate
 from .errors import Error
 from .paths import run_files
 from .procs import Procs
@@ -114,6 +114,8 @@ def skip_reason(
     board = store.get_board(conn, t["board"])
     if board["archived_at"] is not None:
         return "board_archived"
+    if held := jira.claim_gate(conn, t):
+        return held
     acct = store.account_get(conn, store.effective_config_dir(conn, board))
     if acct.get("auth_paused"):
         return "account_paused"
@@ -166,6 +168,29 @@ def record_skips(conn: sqlite3.Connection, skipped: dict[str, str], memory: dict
                 store.event(
                     conn, store.get_task(conn, task_id), "skipped", "dispatcher", {"reason": reason}
                 )
+
+
+def announce_walls(conn: sqlite3.Connection, skipped: dict[str, str]) -> None:
+    """One `quota_wall` event per account and `until`, not per tick or card. The account state
+    remembers the last `until` announced, so a restart does not repeat it. Like
+    `account_resumed` it belongs to no card and no board: the wall holds every board on it."""
+    waiting: dict[str, int] = {}
+    for task_id, reason in skipped.items():
+        if reason == "quota_wall":
+            board = store.get_board(conn, store.get_task(conn, task_id)["board"])
+            config_dir = store.effective_config_dir(conn, board)
+            waiting[config_dir] = waiting.get(config_dir, 0) + 1
+    for config_dir, cards in waiting.items():
+        with isolated(f"account {config_dir}"):
+            acct = store.account_get(conn, config_dir)
+            hard, soft = acct.get("hard_until") or 0, acct.get("soft_until") or 0
+            until = max(hard, soft)
+            if acct.get("wall_announced") == until:
+                continue
+            with store.tx(conn):
+                store.account_set(conn, config_dir, wall_announced=until)
+                wall = {"until": until, "kind": "hard" if hard >= soft else "soft", "cards": cards}
+                store.event(conn, None, "quota_wall", "dispatcher", wall)
 
 
 def claim_and_spawn(conn: sqlite3.Connection, t: Row, procs: Procs, report: Report) -> None:
@@ -227,6 +252,7 @@ def dispatch_once(
         return report
     if memory is not None:
         record_skips(conn, report["skipped"], memory)
+    announce_walls(conn, report["skipped"])
     for t in chosen:
         with isolated(f"card {t['id']}"):
             claim_and_spawn(conn, t, procs, report)

@@ -472,6 +472,23 @@ def test_a_paused_jira_sync_warns_with_its_reason(
     assert check["status"] == "warn" and "main: " in check["detail"] and "401" in check["detail"]
 
 
+def test_check_20_warns_when_the_claim_cannot_match_the_assignee_jira_reports(
+    doctor: Doctor, conn: Any, jira_fake: Fake, card: Callable[..., str]
+) -> None:
+    store.config_set(conn, "jira.claim", True)
+    check = got(doctor(), 20)
+    assert check["status"] == "warn" and "unconfirmed" in check["detail"]
+    card("A")
+    jira.sync_all(conn)
+    assert got(doctor(), 20)["status"] == "ok"
+    store.config_set(conn, "jira.assignee", "Pat Example")
+    check = got(doctor(), 20)
+    assert check["status"] == "warn" and "jira.claim is on" in check["detail"]
+    assert "'Pat Example'" in check["detail"] and "jira.assignee" in check["fix"]
+    store.config_set(conn, "jira.claim", False)
+    assert got(doctor(), 20)["status"] == "ok"
+
+
 def test_probe_starts_the_server_and_wants_the_seven_tools(
     doctor: Doctor, conn: Any, jira_fake: Fake
 ) -> None:

@@ -35,6 +35,16 @@ summary with sources.
 - Do not add a constraint about push or PR approval. Roles push their own branch and open a PR; they never merge.
 - Put each `Out of scope` path in backticks, one per bullet, so the reviewer's pre-flight can match it against the changed files.
 
+## Commands that need a grant
+
+When the work runs a live write the deny rules refuse (a `gh` call that changes something, an upload, a deploy step), list the exact commands in `## Context` under "Commands that need a grant", one per bullet, spelled as the worker will run them. The list is not an approval; only the grant line in the run is.
+
+Before `create`, turn each bullet into a `--grant '<exact rule>'` flag and quote the owner's approval once: `--approved "<owner's words> · <source> · <date>"`. No owner words, no grant: ask first.
+
+- Exact rules only. A prefix, `:*` or any wildcard is refused.
+- One grant per exact command. Cards that differ in one argument need one grant each.
+- An id that exists only after a submit cannot be listed. Prefer one command that waits for the run in a single call, so no id is needed. Otherwise the first run is denied and blocks `capability`; the first-denial flow is in `cli.md`.
+
 ## Role defaults
 
 | Role | Deliverable usually | Default runtime |

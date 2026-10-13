@@ -1,6 +1,31 @@
 # Changelog
 
-## 0.2.0.dev6 (unreleased)
+## 0.2.0.dev7
+
+### Added
+
+- Jira team use: `jira.claim` (off by default) makes the issue's assignee the lock. A linked card dispatches only when its issue is assigned to `jira.assignee`; the sync pass assigns an unassigned issue, reads it back and does not overwrite an assignee it has read (Jira has no compare-and-set, so two boards that assign in the same instant end with the last write). Other cards skip as `jira_unclaimed` or `claimed_elsewhere`, dispatch fails closed, and only the board that holds an issue moves its status. Doctor check 20 warns when `jira.assignee` matches none of the assignees Jira reported. The README documents the team query and the limits.
+- Review verdicts reach Jira as `kanban review approved:`, `kanban review changes requested:` or `kanban review blocked:`. Verdicts given before the upgrade are marked sent by the migration, so it posts no backlog.
+- Owner forms of `request-review` (send a blocked builder card with an open PR to review) and `request-changes` (send a card blocked in review back to its builder with the owner's decision).
+- `create --grant RULE --approved TEXT` attaches exact grants to a new card in the same transaction.
+- `snapshot REPO --ref REF` checks out a branch, tag or sha, so the card check reads the card's base instead of the default branch. Each ref has its own checkout under `snapshots/`, so two refs of one repo do not move each other's tree; nothing prunes them.
+- Each run records its token counts (input, output, cache write, cache read) and a per-model breakdown; `kanban runs` prints them and `kanban stats` adds `tokens_by_model`.
+- A `quota_wall` event, once per wall per account, with `until`, `kind` and the number of waiting cards.
+- `list` and `show` name the parent a waiting card waits for, and mark a done card whose PR waits for the owner's merge as `awaiting merge`, until the daemon's sweep sees the PR merged. `create` and `link` warn when the parent is in triage.
+- Role files list the `code-review-graph` MCP tools, so a plugin update no longer drops them.
+
+### Changed
+
+- `reopen` and `reopen-review` write the reason as a `REOPEN:` comment, so the builder's next run reads it.
+- The web header shows only accounts with a problem, without their config directory, and the events feed no longer carries the payload of events that belong to no board. The running count says how many run on this board and how many on all boards.
+- The skill, the CLI reference and the role prompts cover: re-arming the watch Monitor, the first-denial grant flow, owner feedback on review and done cards, merging into the default branch and sibling PR conflicts, waiting inside a run instead of ending the turn, and when to run setup after an update.
+
+### Fixed
+
+- Leaving `blocked` clears the block chip; loop detection reads its memory from the events instead.
+- One runner test started the real `claude` from `PATH`; it uses the fake now, and the test environment puts a `claude` that fails loudly ahead of the real one.
+
+## 0.2.0.dev6
 
 ### Added
 

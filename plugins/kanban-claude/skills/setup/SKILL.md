@@ -20,6 +20,18 @@ restarts the daemon and rewrites `installed.json`.
 Setup records the Claude config directory of the session that runs it. If the user wants workers to use
 another one, they pass `--claude-config-dir`.
 
+## When to upgrade
+
+The plugin updates its role prompts and skills at once. The daemon, the `kanban` CLI the workers call and
+the run protocol (`protocol.md`) are the installed runtime and stay old until setup runs, so a new skill
+may name a flag the old CLI lacks.
+
+Setup restarts the daemon (`launchctl kickstart -k`); the board and dispatch are down for a moment.
+Runners are detached processes: the new daemon finds each live one by pid and start time and leaves it
+alone, so a running card is not stopped. It finishes on the runner code it already loaded, and its
+`kanban` calls use the new CLI. Setup does not check for running cards, so upgrade between cards, when
+`kanban --board <slug> list --status running` is empty.
+
 ## Reading the result
 
 - Exit 0: relay the last lines, which name the board command (`kanban board`) and its URL.

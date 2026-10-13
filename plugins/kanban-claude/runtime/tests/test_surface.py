@@ -26,7 +26,7 @@ BUILTIN = {
     "Grep", "Glob", "ListMcpResourcesTool", "ReadMcpResourceTool",
     "TaskCreate", "TaskGet", "TaskList", "TaskUpdate",
 }  # fmt: skip
-MCP_SERVERS = {"atlassian", "context7", "lightpanda", "playwright"}
+MCP_SERVERS = {"atlassian", "code-review-graph", "context7", "lightpanda", "playwright"}
 MCP_NAME = re.compile(r"mcp__([a-z0-9-]+)(?:__[a-z0-9_]+)?")
 IGNORED_FOR_PLUGIN_AGENTS = {"permissionMode", "hooks", "mcpServers"}
 MODEL_EFFORT = {

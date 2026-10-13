@@ -331,7 +331,7 @@ def test_stop_signals_no_process_it_only_ends_the_run_in_the_database(
 
 
 def test_a_runner_signalled_by_something_else_is_interrupted_not_a_crash(
-    conn: Any, card: Card, claim: Claim, env: Path, monkeypatch: pytest.MonkeyPatch
+    conn: Any, card: Card, claim: Claim, fake_claude: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tid = card()
     run = claim(tid)

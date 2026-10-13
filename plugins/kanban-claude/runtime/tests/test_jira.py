@@ -195,7 +195,7 @@ def test_j4_a_new_matching_issue_becomes_a_triage_card_and_a_new_card_an_issue(
     assert labels[0] == "kanban-claude"
     assert f"kanban-{mine}" in labels
     made = jira_fake.issue(link(conn, mine)["jira_key"])
-    assert (made["summary"], made["labels"], made["assignee"]) == (
+    assert (made["summary"], made["labels"], made["assignee"]["email"]) == (
         "From the board",
         labels,
         "me@example.com",
@@ -503,7 +503,7 @@ def test_j7_comments_cross_once_each_way_and_machine_comments_never_go_out(
     assert sorted(kinds(conn, "jira_pushed")) == ["jira_pushed"]
 
 
-def test_j7_a_work_runs_closing_text_is_pushed_once_but_a_review_ledger_never(
+def test_j7_a_work_runs_closing_text_and_a_review_verdict_are_each_pushed_once_with_their_own_label(
     conn: sqlite3.Connection, jira_fake: Fake, card: Card, sync: Sync
 ) -> None:
     tid = card("A")
@@ -519,7 +519,8 @@ def test_j7_a_work_runs_closing_text_is_pushed_once_but_a_review_ledger_never(
     sync()
     sync()
     assert [c["args"]["body"] for c in jira_fake.calls("jira_add_comment")] == [
-        "kanban completed: implemented the thing"
+        "kanban completed: implemented the thing",
+        "kanban review approved: WARDEN: APPROVED PR #1 @ abcdef1",
     ]
 
 

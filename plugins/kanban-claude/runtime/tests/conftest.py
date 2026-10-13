@@ -120,6 +120,12 @@ elif args[:2] not in (["tool", "install"], ["tool", "uninstall"]):
 """
 
 
+NO_CLAUDE_SCRIPT = """#!/bin/sh
+echo "a test ran claude without the fake_claude fixture" >&2
+exit 97
+"""
+
+
 def install_fake(path: Path, script: str) -> None:
     path.write_text(script.replace("__PYTHON__", sys.executable))
     path.chmod(0o755)
@@ -151,6 +157,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     install_fake(bindir / "gh", GH_SCRIPT)
     install_fake(bindir / "launchctl", LAUNCHCTL_SCRIPT)
     install_fake(bindir / "uv", UV_SCRIPT)
+    install_fake(bindir / "claude", NO_CLAUDE_SCRIPT)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("LAUNCHCTL_FAKE_LOG", str(tmp_path / "launchctl.log"))
     monkeypatch.setenv("LAUNCHCTL_FAKE_STATE", str(tmp_path / "launchctl.state"))

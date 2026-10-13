@@ -8,7 +8,22 @@ and change that file between passes. Every tool call is logged in the file under
 
 `mode` flags: `auth`, `start`, `init` (the server fails), `hang` (never answers), `hang_after` (a tool
 name: does the work, then never answers), `no_total` (searches report total -1), `tools` (the list),
-`fail` (`{"tool": "message"}` or `{"tool:needle": ..}`: that call is an error).
+`fail` (`{"tool": "message"}` or `{"tool:needle": ..}`: that call is an error), `ignore_assignee`
+(`jira_update_issue` answers success and leaves the assignee alone, as some Server/DC setups do),
+`stale_read` (a list of users: the next `jira_get_issue` of each answers with no assignee, once, as a
+read that predates a teammate's write does).
+
+`FAKE_JIRA_USER` names who is calling, as each person's own Atlassian login does: comments are written
+under that name, the call log records it, and a board query is answered by its `project`, `labels`,
+`assignee = currentUser()` and `assignee is EMPTY` clauses instead of the `in_jql` flag. Unset, the
+server is anonymous.
+
+An issue's assignee is read back in the shape `jira_get_issue` has in mcp-atlassian 0.23.1
+(`JiraUser.to_simplified_dict`): `account_id`, `display_name`, `name` (the username on Server/DC, the
+display name on Cloud), `email` and `avatar_url`; an issue without one reads `{"display_name":
+"Unassigned"}`. An identifier given to `jira_create_issue` or `jira_update_issue` is resolved by
+account id, email, username or display name, as the server does; one nobody holds becomes a user of
+its own, so a test need not list every address.
 """
 
 import json
@@ -26,6 +41,47 @@ WORKFLOW = {
 }
 CATEGORY = {"To Do": "To Do", "In Progress": "In Progress", "Review": "In Progress", "Done": "Done"}
 WRITES = ("jira_update_issue", "jira_transition_issue", "jira_add_comment", "jira_create_issue")
+USERS: list[dict[str, str | None]] = [
+    {"account_id": "acc-ann", "display_name": "Ann Example", "email": "ann@example.com", "username": None},
+    {"account_id": "acc-bob", "display_name": "Bob Example", "email": "bob@example.com", "username": None},
+]  # fmt: skip
+
+
+def who() -> str | None:
+    return os.environ.get("FAKE_JIRA_USER")
+
+
+def resolve(identifier: str) -> dict[str, Any]:
+    """The user an account id, email, username or display name names, in the server's shape."""
+    wanted = identifier.casefold()
+    for u in USERS:
+        if wanted in {str(v).casefold() for v in u.values() if v}:
+            return user_shape(u)
+    email = "@" in identifier
+    return user_shape(
+        {"account_id": None, "display_name": identifier, "email": identifier if email else None,
+         "username": None if email else identifier}
+    )  # fmt: skip
+
+
+def user_shape(u: dict[str, str | None]) -> dict[str, Any]:
+    return {"account_id": u["account_id"], "display_name": u["display_name"],
+            "name": u["username"] or u["display_name"], "email": u["email"], "avatar_url": None}  # fmt: skip
+
+
+def board_hit(issue: dict[str, Any], jql: str) -> bool:
+    """A board query as the calling user sees it: its project, its label and its assignee."""
+    project, label = re.search(r"project = (\w+)", jql), re.search(r'labels = "([^"]*)"', jql)
+    holder = (issue.get("assignee") or {}).get("display_name")
+    return (
+        (not project or issue["key"].startswith(f"{project[1]}-"))
+        and (not label or label[1] in issue["labels"])
+        and (
+            "assignee = currentUser()" not in jql
+            or holder == who()
+            or ("assignee is EMPTY" in jql and holder is None)
+        )
+    )
 
 
 def lossy(text: str) -> str:
@@ -81,6 +137,8 @@ class Fake:
             fields["description"] = lossy(fields["description"])
         if "status" in fields:
             fields["status"] = {"name": fields["status"], "category": CATEGORY[fields["status"]]}
+        if isinstance(fields.get("assignee"), str):
+            fields["assignee"] = resolve(fields["assignee"])
         issue.update(fields, **self.tick())
         self.save()
 
@@ -155,6 +213,8 @@ def serve(fake: Fake, tool: str, a: dict[str, Any]) -> Any:
                 if label
                 else k in wanted
                 if wanted is not None
+                else board_hit(i, jql)
+                if who()
                 else i["in_jql"]
             )
             and (since is None or i["updated_s"] >= since)
@@ -164,7 +224,11 @@ def serve(fake: Fake, tool: str, a: dict[str, Any]) -> Any:
                 "max_results": size,
                 "issues": [{"key": i["key"], "summary": i["summary"]} for i in hits[start : start + size]]}  # fmt: skip
     if tool == "jira_get_issue":
-        return get(a["issue_key"])
+        issue = get(a["issue_key"])
+        if who() in mode.get("stale_read", []):
+            mode["stale_read"].remove(who())
+            issue = {**issue, "assignee": None}
+        return {**issue, "assignee": issue.get("assignee") or {"display_name": "Unassigned"}}
     if tool == "jira_create_issue":
         n = fake.s["next"]
         fake.s["next"] += 1
@@ -173,7 +237,8 @@ def serve(fake: Fake, tool: str, a: dict[str, Any]) -> Any:
         issues[key] = {
             "id": str(n), "key": key, "summary": a["summary"], "description": lossy(a.get("description", "")),
             "status": {"name": "To Do", "category": "To Do"}, **fake.tick(), "comments": [],
-            "in_jql": True, "labels": extra.get("labels", []), "assignee": a.get("assignee"),
+            "in_jql": True, "labels": extra.get("labels", []),
+            "assignee": resolve(a["assignee"]) if a.get("assignee") else None,
         }  # fmt: skip
         return {"message": "Issue created successfully",
                 "issue": {"key": key, "id": str(n), "summary": a["summary"]}}  # fmt: skip
@@ -182,6 +247,10 @@ def serve(fake: Fake, tool: str, a: dict[str, Any]) -> Any:
         fields = json.loads(a["fields"])
         if "description" in fields:
             fields["description"] = lossy(fields["description"])
+        if "assignee" in fields and mode.get("ignore_assignee"):
+            del fields["assignee"]
+        elif "assignee" in fields:
+            fields["assignee"] = resolve(fields["assignee"]) if fields["assignee"] else None
         issue.update(fields, **fake.tick())
         return {"message": "Issue updated successfully", "issue": {"key": issue["key"]}}
     if tool == "jira_get_transitions":
@@ -199,7 +268,7 @@ def serve(fake: Fake, tool: str, a: dict[str, Any]) -> Any:
             return {"message": f"Issue {issue['key']} transitioned successfully"}
         raise Failure(f"Transition {a['transition_id']} is not available for {a['issue_key']}")
     if tool == "jira_add_comment":
-        return fake.add_comment(get(a["issue_key"])["key"], a["body"], "Kanban Owner")
+        return fake.add_comment(get(a["issue_key"])["key"], a["body"], who() or "Kanban Owner")
     raise Failure(f"unknown tool {tool}")
 
 
@@ -224,7 +293,7 @@ def main() -> None:
             res = {"tools": [{"name": n} for n in names]}
         else:
             tool, args = msg["params"]["name"], msg["params"]["arguments"]
-            fake.s["calls"].append({"tool": tool, "args": args})
+            fake.s["calls"].append({"tool": tool, "args": args, "user": who()})
             if fake.s["mode"].get("hang"):
                 time.sleep(3600)
             try:

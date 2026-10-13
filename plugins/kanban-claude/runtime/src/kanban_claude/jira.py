@@ -34,7 +34,14 @@ TOOLS = (
 )  # fmt: skip
 CLOSABLE = ("triage", "todo", "ready", "blocked")
 JIRA_NAME = {"title": "summary", "body": "description"}
-VERBS = {"complete": "completed", "request-review": "ready for review", "block": "blocked"}
+VERBS = {
+    ("work", "complete"): "completed",
+    ("work", "request-review"): "ready for review",
+    ("work", "block"): "blocked",
+    ("review", "complete"): "review approved",
+    ("review", "request-changes"): "review changes requested",
+    ("review", "block"): "review blocked",
+}
 AUTH = re.compile(
     r"(?<![\w-])(401|403)(?![\w-])|\b(unauthori[sz]ed|forbidden|authentication)\b", re.IGNORECASE
 )
@@ -200,6 +207,99 @@ def board_jql(conn: sqlite3.Connection, b: Row) -> str:
     return f'project = {b["jira_project"]} AND labels = "{label}" AND assignee = currentUser()'
 
 
+def assignee_of(issue: Issue) -> dict[str, Any] | None:
+    """Whom `jira_get_issue` says the issue is assigned to (mcp-atlassian 0.23.1: `account_id`,
+    `display_name`, `name`, `email`). `{}` when nobody: the server reads `{"display_name":
+    "Unassigned"}`. None when the answer has no assignee to read, which is not "nobody"."""
+    who = issue.get("assignee")
+    if not isinstance(who, dict) or not who:
+        return None
+    named = who.get("account_id") or who.get("email") or who.get("name")
+    return {} if who.get("display_name") == "Unassigned" and not named else who
+
+
+def is_me(who: dict[str, Any] | None, me: str | None) -> bool:
+    """`jira.assignee` names a user by account id, email or username, in any case; never by display
+    name, which two people can share. On Cloud `name` is the display name, so it counts only where it
+    differs from it. ponytail: a Server/DC user whose username is also their display name does not
+    match; the doctor says so, and the account id or email always does."""
+    if not who or not me:
+        return False
+    name = who.get("name") if who.get("name") != who.get("display_name") else None
+    ids = (who.get("account_id"), who.get("email"), name)
+    return me.strip().casefold() in {str(v).strip().casefold() for v in ids if v}
+
+
+def stored_assignee(issue: Issue) -> str | None:
+    who = assignee_of(issue)
+    return json.dumps(who, sort_keys=True) if who else None
+
+
+def holds_claim(conn: sqlite3.Connection, issue: Issue) -> bool:
+    """Whether this board may push the issue's status: always without `jira.claim`, with it only for
+    the board whose user the issue is assigned to."""
+    return not store.cfg(conn, "jira.claim") or is_me(
+        assignee_of(issue), store.cfg(conn, "jira.assignee")
+    )
+
+
+def claim_gate(conn: sqlite3.Connection, t: Row) -> str | None:
+    """The dispatch gate of `jira.claim`: a linked card runs only where the last sync stored this
+    board's user as the issue's assignee. A pure read; dispatch never waits on Jira, so what it
+    knows is at most `jira.poll_s` old. An unlinked card, or a board without the claim, is free."""
+    if not store.cfg(conn, "jira.claim"):
+        return None
+    lk = conn.execute(
+        "SELECT jira_assignee FROM jira_links WHERE task_id = ?", (t["id"],)
+    ).fetchone()
+    if lk is None:
+        return None
+    if not lk["jira_assignee"]:
+        return "jira_unclaimed"
+    mine = is_me(json.loads(lk["jira_assignee"]), store.cfg(conn, "jira.assignee"))
+    return None if mine else "claimed_elsewhere"
+
+
+def wants_claim(conn: sqlite3.Connection, t: Row, held: bool) -> bool:
+    """A card the dispatcher may start (ready, or in review) on an issue nobody holds, for a user
+    `jira.assignee` names. Also what refreshes a link that has no stored assignee yet: one made before
+    `jira.claim` was on, which would otherwise wait for a Jira edit to be read again."""
+    return bool(
+        store.cfg(conn, "jira.claim")
+        and store.cfg(conn, "jira.assignee")
+        and t["status"] in ("ready", "review")
+        and not held
+    )
+
+
+def claim(mcp: Mcp, key: str, me: str) -> Issue:
+    """Assign, then read again: the caller has just read the issue and found it unassigned, so this
+    assigns it and reads it back. What the read-back says is the answer, whoever it names. ponytail:
+    Jira has no compare-and-set, so two boards that assign within the same moment can both read
+    themselves back (the last write stands); the loser's next pass flags the issue as given away.
+
+    Does not overwrite an assignee it has read; one set after that read is overwritten."""
+    mcp.call("jira_update_issue", issue_key=key, fields=json.dumps({"assignee": me}))
+    issue = fetch(mcp, key)
+    if assignee_of(issue) == {}:
+        raise LinkError(f"{key} is still unassigned after the assignee was set to {me}")
+    return issue
+
+
+def reassigned(conn: sqlite3.Connection, t: Row, issue: Issue) -> str | None:
+    """A card that runs, or waits for its review, on an issue Jira has given to somebody else. Only a
+    conflict for the owner: the run is never stopped."""
+    who = assignee_of(issue)
+    if (
+        store.cfg(conn, "jira.claim")
+        and t["status"] in ("running", "review")
+        and who
+        and not is_me(who, store.cfg(conn, "jira.assignee"))
+    ):
+        return f"assigned to {who.get('display_name') or who.get('name')} in Jira while the card is {t['status']}"
+    return None
+
+
 def fetch(mcp: Mcp, key: str) -> Issue:
     """The one read that can say an issue is gone (JIR-03): the same words from any other tool are
     just an error on that link."""
@@ -300,7 +400,8 @@ def merge_text(t: Row, lk: Row, issue: Issue) -> Merge:
 def plan_status(conn: sqlite3.Connection, t: Row, lk: Row, issue: Issue) -> Plan:
     """JIR-05. A flip of the issue's Done closes or reopens the card unless that would start or cut
     short work: a running or review card, or a `todo` child that closing would make ready, leaves a
-    conflict for the owner. The card's own status is pushed only when it changed since the last sync."""
+    conflict for the owner. The card's own status is pushed only when it changed since the last sync,
+    and with `jira.claim` only by the board that holds the claim."""
     st = issue.get("status") or {}
     done_now = (st.get("category") or "").lower() == "done"
     flipped = done_now != ((lk["base_jira_status"] or "").lower() == "done")
@@ -325,6 +426,7 @@ def plan_status(conn: sqlite3.Connection, t: Row, lk: Row, issue: Issue) -> Plan
         or t["status"] == lk["synced_status"]
         or target.lower() == (st.get("name") or "").lower()
         or (t["status"] == "done" and done_now)
+        or not holds_claim(conn, issue)
     ):
         return Plan(None, None, None)
     return Plan(None, None, target)
@@ -332,7 +434,7 @@ def plan_status(conn: sqlite3.Connection, t: Row, lk: Row, issue: Issue) -> Plan
 
 def outbox(conn: sqlite3.Connection, lk: Row, t: Row) -> list[tuple[str, int, str]]:
     """JIR-06: what has not crossed yet. The owner's comments, and the terminal-verb text of each
-    work run, never `[run]` lines or review ledgers."""
+    work run and each review run's verdict, never `[run]` lines or the worker's own comments."""
     items = [
         ("comment", r["id"], r["body"])
         for r in conn.execute(
@@ -342,13 +444,16 @@ def outbox(conn: sqlite3.Connection, lk: Row, t: Row) -> list[tuple[str, int, st
         )
     ]
     for r in conn.execute(
-        "SELECT id, terminal_verb, summary FROM task_runs WHERE task_id = ? AND kind = 'work' "
-        "AND terminal_verb IN ('complete', 'request-review', 'block') AND COALESCE(summary, '') <> '' "
+        "SELECT id, kind, terminal_verb, summary FROM task_runs WHERE task_id = ? "
+        "AND terminal_verb IN ('complete', 'request-review', 'block', 'request-changes') "
+        "AND COALESCE(summary, '') <> '' "
         "AND ended_at >= ? AND NOT EXISTS "
         "(SELECT 1 FROM task_events WHERE run_id = task_runs.id AND kind = 'jira_pushed') ORDER BY id",
         (t["id"], lk["created_at"]),
     ):
-        text = f"kanban {VERBS[r['terminal_verb']]}: {r['summary']}"
+        if (r["kind"], r["terminal_verb"]) not in VERBS:
+            continue
+        text = f"kanban {VERBS[r['kind'], r['terminal_verb']]}: {r['summary']}"
         if t["pr_url"] and t["pr_url"] not in text:
             text += f"\nPR: {t['pr_url']}"
         items.append(("run", r["id"], text))
@@ -463,9 +568,16 @@ def sync_link(conn: sqlite3.Connection, mcp: Mcp, lk: Row, issue: Issue) -> None
     """One link, both ways (JIR-04..06): decide from the card as read here, write to Jira, then apply
     to the board in one transaction, only if the card is still at the version it was read at."""
     t = store.get_task(conn, lk["task_id"])
+    claiming, claim_error = wants_claim(conn, t, assignee_of(issue) != {}), None
+    if claiming:  # before anything else, so the status below is pushed by the board that holds it
+        try:
+            issue = claim(mcp, lk["jira_key"], store.cfg(conn, "jira.assignee"))
+        except LinkError as e:
+            claim_error = str(e)
     tid, m, items = t["id"], merge_text(t, lk, issue), outbox(conn, lk, t)
     plan = plan_status(conn, t, lk, issue)
     pushed, error, after = push(conn, mcp, lk, t, issue, m, plan, items)
+    error = error or claim_error
     with store.tx(conn):
         cur = store.get_task(conn, tid)
         fresh = cur["version"] == t["version"]
@@ -503,12 +615,13 @@ def sync_link(conn: sqlite3.Connection, mcp: Mcp, lk: Row, issue: Issue) -> None
             store.event(conn, cur, "jira_pulled", "jira", {"fields": changed, "comments": comments})
         if pushed:
             store.event(conn, cur, "jira_pushed", "jira", {"fields": pushed})
-        if plan.conflict and plan.conflict != lk["conflict"]:
-            store.event(conn, cur, "jira_conflict", "jira", {"detail": plan.conflict})
+        conflict = plan.conflict or reassigned(conn, cur, after)
+        if conflict and conflict != lk["conflict"]:
+            store.event(conn, cur, "jira_conflict", "jira", {"detail": conflict})
         # a push that failed leaves the card's version and status as they were, so the link stays
         # wanted and the next pass sends it again
         settled = fresh and not error
-        attempted = bool(m.push or m.pull or plan.want or items)
+        attempted = bool(m.push or m.pull or plan.want or items or claiming)
         error = error or (None if attempted else lk["error"])
         if error and error != lk["error"]:
             store.event(conn, cur, "jira_error", "jira", {"detail": error})
@@ -517,14 +630,14 @@ def sync_link(conn: sqlite3.Connection, mcp: Mcp, lk: Row, issue: Issue) -> None
         conn.execute(
             "UPDATE jira_links SET base_title = ?, base_body = ?, card_title = ?, card_body = ?, "
             "base_jira_status = ?, jira_updated = ?, synced_status = ?, synced_version = ?, "
-            "conflict = ?, error = ? WHERE task_id = ?",
+            "conflict = ?, error = ?, jira_assignee = ? WHERE task_id = ?",
             (
                 jb["title"], jb["body"], cb["title"], cb["body"],
                 lk["base_jira_status"] if keep else (after.get("status") or {}).get("category"),
                 after.get("updated"),
                 now["status"] if settled else lk["synced_status"],
                 now["version"] if settled else lk["synced_version"],
-                plan.conflict, error, tid,
+                conflict, error, stored_assignee(after), tid,
             ),
         )  # fmt: skip
 
@@ -554,12 +667,12 @@ def add_link(
         mine = ("", "")
     conn.execute(
         "INSERT INTO jira_links(task_id, jira_key, base_title, base_body, card_title, card_body, "
-        "base_jira_status, jira_updated, synced_status, synced_version, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "base_jira_status, jira_updated, synced_status, synced_version, created_at, jira_assignee) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             t["id"], key, norm(title), norm(body), norm(mine[0]), norm(mine[1]),
             (issue.get("status") or {}).get("category"), None if visit else issue.get("updated"),
-            t["status"], t["version"], store.now(),
+            t["status"], t["version"], store.now(), stored_assignee(issue),
         ),
     )  # fmt: skip
     store.event(conn, t, "jira_linked", actor, {"key": key, **(extra or {})})
@@ -688,7 +801,12 @@ def sync_board(conn: sqlite3.Connection, mcp: Mcp, b: Row) -> None:
     ).fetchall():
         t = store.get_task(conn, lk["task_id"])
         linked.append(lk["jira_key"])
-        if t["version"] > lk["synced_version"] or lk["jira_updated"] is None or outbox(conn, lk, t):
+        if (
+            t["version"] > lk["synced_version"]
+            or lk["jira_updated"] is None
+            or outbox(conn, lk, t)
+            or wants_claim(conn, t, bool(lk["jira_assignee"]))
+        ):
             wanted.append(lk["jira_key"])
     found = search(mcp, f"({board_jql(conn, b)}){window}")
     if since is None:

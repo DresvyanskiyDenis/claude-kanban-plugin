@@ -457,6 +457,25 @@ def jira_pairing(c: Ctx) -> Result:
     if paused:
         why = "; ".join(f"{b}: {p['detail']}" for b, p in paused.items())
         return warn(f"sync paused on {why}", "kanban jira sync")
+    if store.cfg(c.conn, "jira.claim"):
+        me = store.cfg(c.conn, "jira.assignee")
+        seen = [
+            json.loads(r[0])
+            for r in c.conn.execute(
+                "SELECT jira_assignee FROM jira_links WHERE jira_assignee IS NOT NULL"
+            )
+        ]
+        if not any(jira.is_me(who, me) for who in seen):
+            why = (
+                f"none of the {len(seen)} linked issues Jira has assigned matches jira.assignee"
+                f" {me!r}, so no linked card that is already assigned will dispatch"
+                if seen
+                else "no linked issue has reported an assignee yet, so jira.assignee is unconfirmed"
+            )
+            return warn(
+                f"jira.claim is on, but {why}",
+                "kanban config set jira.assignee <the account id or email Jira shows for you>",
+            )
     probed = ", the server lists the seven tools" if c.probe else ""
     return ok(f"{', '.join(boards) or 'no board'}: assignee set, sync running{probed}")
 

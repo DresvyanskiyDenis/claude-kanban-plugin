@@ -210,15 +210,17 @@ function renderHeader() {
   const stat = (k, v, dot) => el("span", null, `${k} `, el("b", { class: dot }, v));
   $("#pause").textContent = h.paused ? "Resume dispatch" : "Pause dispatch";
   $("#stats").replaceChildren(
-    stat("Dispatch", h.paused ? "paused" : "on", h.paused ? "warn" : "ok"), stat("Running", `${h.running}/${h.cap}`),
+    stat("Dispatch", h.paused ? "paused" : "on", h.paused ? "warn" : "ok"),
+    el("span", null, el("b", null, h.running_here), " running here · ", el("b", null, h.running),
+      " on all boards · ", el("b", null, h.cap), h.cap === 1 ? " slot" : " slots"),
     stat("Today", money(h.cost_today)), stat("7 days", money(h.cost_7d)),
-    ...h.accounts.map((a) => stat(a.name, a.logged_out ? "logged out"
-      : a.hard_until ? `limited until ${when(a.hard_until)}` : "ok", a.logged_out ? "bad" : a.hard_until ? "warn" : "ok")));
+    ...h.accounts.flatMap((a) => a.logged_out ? [stat("Account", "logged out", "bad")]
+      : a.hard_until ? [stat("Account", `quota wall until ${when(a.hard_until)}`, "warn")] : []));
   const notes = [];
   if (h.paused) notes.push(["warn", "Dispatch paused", `${h.paused.reason}${h.paused.detail ? `: ${h.paused.detail}` : ""}. Nothing new starts until you resume.`]);
   for (const a of h.accounts) {
-    if (a.logged_out) notes.push(["bad", "Logged out", `${a.name} needs a login before its cards can run.`]);
-    else if (a.soft_until) notes.push(["warn", "Slowing down", `${a.name} is near its limit until ${when(a.soft_until)}.`]);
+    if (a.logged_out) notes.push(["bad", "Logged out", "A Claude account needs a login before its cards can run."]);
+    else if (a.soft_until) notes.push(["warn", "Slowing down", `A Claude account is near its limit until ${when(a.soft_until)}.`]);
   }
   if (h.jira_paused) notes.push(["warn", "Jira sync paused", `${h.jira_paused.detail}. It retries on its own; kanban jira sync tries now.`]);
   for (const r of S.live.unprotected) notes.push(["warn", "Unprotected branch", `${r} has no branch protection; merges are not gated.`]);

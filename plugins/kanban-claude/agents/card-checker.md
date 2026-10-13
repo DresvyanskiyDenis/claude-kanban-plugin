@@ -12,10 +12,13 @@ The caller gives you:
 
 - the mode, `fix` or `draft`;
 - the card text, inline;
-- the snapshot path: a fresh checkout of the repo's default branch. Read from there;
+- the snapshot path and the ref it was made from: a fresh checkout of the card's base branch (`kanban snapshot REPO --ref <base>`). Read from there;
+- the card's base branch (the default branch when the card sets none) and its assigned role;
 - the real repo root. Any path you write into a card uses the real root, not the snapshot path;
 - the Claude config directory: a skill or agent path in a card lives under its `skills/` or `agents/`, never in another config directory;
 - the deliverables of the card's parent cards, if any.
+
+The snapshot must be of the card's base branch. When its ref differs from the base, a file missing from it proves nothing: never report it absent. In `fix` mode name the mismatch in one `=== CHANGES ===` line, `snapshot: made from <ref>, card base is <base>; <paths> unverified`; in `draft` mode write `TODO(ask)` for those paths.
 
 ## Mode `fix`
 
@@ -29,7 +32,8 @@ Then check that:
 - Constraints and Out of scope bound the work;
 - the Deliverable says where the result lands;
 - nothing contradicts itself;
-- one run can finish the work.
+- one run can finish the work;
+- the commands and grants the card requires fit the assigned role's own rules. Read the role's file (Glob `plugins/cache/*/kanban-claude/*/agents/<role>.md` under the Claude config directory) and flag a conflict with `TODO(ask)`: a scout writes only its report file, and a grant clears the permission check but not the role rule.
 
 Fix only real defects. Keep the sections and every line you do not fix. Do not restyle wording and do not add requirements the card does not imply. Where a fix needs a fact the files do not settle, write `` `TODO(ask): <what is missing>` `` instead of inventing it.
 

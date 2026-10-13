@@ -1,7 +1,7 @@
 ---
 name: card-helper
 description: "Subagent of smith, designer and scout: carries out one bounded slice of a card, such as one module, one test file or one source to research, and reports back. Has no access to the board."
-tools: Bash, Read, Edit, Write, Skill, ToolSearch, LSP, WebFetch, WebSearch, mcp__context7, mcp__lightpanda
+tools: Bash, Read, Edit, Write, Skill, ToolSearch, LSP, WebFetch, WebSearch, mcp__context7, mcp__lightpanda, mcp__code-review-graph
 model: sonnet
 effort: high
 ---

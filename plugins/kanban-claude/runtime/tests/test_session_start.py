@@ -15,7 +15,11 @@ from .test_install import PLUGIN
 
 HOOK = PLUGIN / "hooks" / "scripts" / "session_start.sh"
 Hook = Callable[[], subprocess.CompletedProcess[str]]
-UPGRADE = "kanban-claude: daemon 1.0.0, plugin 1.1.0 — run /kanban-claude:setup to upgrade"
+TAIL = (
+    " — new roles and skills run on the old daemon, CLI and protocol until /kanban-claude:setup;"
+    " run it between cards (a running card finishes on old code)"
+)
+UPGRADE = f"kanban-claude: daemon 1.0.0, plugin 1.1.0{TAIL}"
 
 
 @pytest.fixture
@@ -103,10 +107,7 @@ def test_a_pre_release_version_is_a_version(hook: Hook, root: Path) -> None:
     set_stamp(store.dumps({"version": "1.2.0.dev0"}))
     assert quiet(hook())
     set_stamp(store.dumps({"version": "1.1.0"}))
-    assert (
-        hook().stdout
-        == "kanban-claude: daemon 1.1.0, plugin 1.2.0.dev0 — run /kanban-claude:setup to upgrade\n"
-    )
+    assert hook().stdout == f"kanban-claude: daemon 1.1.0, plugin 1.2.0.dev0{TAIL}\n"
 
 
 def test_file_content_is_never_evaluated_and_only_a_plain_version_is_printed(
@@ -141,10 +142,7 @@ def test_without_a_plugin_root_variable_the_script_finds_its_own_manifest(
         text=True,
         check=False,
     )
-    assert (
-        p.stdout
-        == "kanban-claude: daemon 0.0.1, plugin 1.1.0 — run /kanban-claude:setup to upgrade\n"
-    )
+    assert p.stdout == f"kanban-claude: daemon 0.0.1, plugin 1.1.0{TAIL}\n"
 
 
 def test_a_manual_pause_prints_the_code_and_never_the_free_text(hook: Hook, conn: Any) -> None:

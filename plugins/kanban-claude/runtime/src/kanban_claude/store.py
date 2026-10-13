@@ -109,8 +109,32 @@ CREATE TABLE jira_links (
   synced_version INTEGER NOT NULL, conflict TEXT, error TEXT, created_at INTEGER NOT NULL);
 """
 
+# U3: what a run's result event says it spent, to check `cost_usd` against a price list. The four
+# counts are the invocation's own (`usage`); `model_usage` is its share per model, the rise over
+# the session's previous `modelUsage`, which `session_model_usage` keeps whole (it is cumulative
+# across a resume, as `total_cost_usd` is).
+USAGE_SCHEMA = """
+ALTER TABLE task_runs ADD COLUMN input_tokens INTEGER;
+ALTER TABLE task_runs ADD COLUMN output_tokens INTEGER;
+ALTER TABLE task_runs ADD COLUMN cache_write_tokens INTEGER;
+ALTER TABLE task_runs ADD COLUMN cache_read_tokens INTEGER;
+ALTER TABLE task_runs ADD COLUMN model_usage TEXT;
+ALTER TABLE task_runs ADD COLUMN session_model_usage TEXT;
+"""
+
+# JIR claim: who Jira said the issue was assigned to at the last sync, as the server's JSON user
+# (NULL: unassigned, or not read yet). Dispatch reads it without a call. Review verdicts now cross
+# to Jira too; the ones already given are marked pushed here, once, so an upgrade posts no backlog.
+CLAIM_SCHEMA = """
+ALTER TABLE jira_links ADD COLUMN jira_assignee TEXT;
+INSERT INTO task_events(board, task_id, run_id, kind, actor, created_at)
+  SELECT t.board, r.task_id, r.id, 'jira_pushed', 'jira', CAST(strftime('%s', 'now') AS INTEGER)
+  FROM task_runs r JOIN tasks t ON t.id = r.task_id JOIN jira_links l ON l.task_id = r.task_id
+  WHERE r.kind = 'review' AND r.terminal_verb IS NOT NULL;
+"""
+
 # Forward-only: MIGRATIONS[i] takes user_version i to i + 1 (STO-03).
-MIGRATIONS: list[str] = [SCHEMA, JIRA_SCHEMA]
+MIGRATIONS: list[str] = [SCHEMA, JIRA_SCHEMA, USAGE_SCHEMA, CLAIM_SCHEMA]
 BACKUPS_KEPT = 5
 
 STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "archived")
@@ -162,6 +186,8 @@ DEFAULTS: dict[str, Any] = {
     "roles.atlassian.enabled": False,
     "jira.mcp_command": None,
     "jira.assignee": None,
+    # ponytail: one switch for every paired board; a boards column if boards pair with different sites
+    "jira.claim": False,
     "jira.issue_type": "Task",
     "jira.label": "kanban-claude",
     "jira.poll_s": 120,
@@ -467,7 +493,10 @@ def _cas(
     **fields: Any,
 ) -> None:
     """Status compare-and-swap (STO-02), and with `version` the card must still be at it (WEB-09).
-    Any rowcount but 1 means the card moved under us; a version mismatch is reported first."""
+    Any rowcount but 1 means the card moved under us; a version mismatch is reported first.
+    Moving to any status but `blocked` drops the block chip, unless the caller sets it."""
+    if fields.get("status", "blocked") != "blocked":
+        fields = {"block_kind": None, "block_recurrences": 0, **fields}
     sets = "".join(f"{k} = ?, " for k in fields)
     guard = "" if version is None else " AND version = ?"
     cur = conn.execute(
@@ -744,7 +773,13 @@ def create(
     effort: str | None = None,
     budget: float | None = None,
     triage: bool = False,
+    grants: Sequence[str] = (),
+    approved: str | None = None,
 ) -> dict[str, Any]:
+    if grants:
+        approved = _check_grant(grants, approved)
+    elif approved:
+        raise Refused("--approved belongs to --grant RULE; pass the rule it approves")
     b = get_board(conn, board)
     if b["archived_at"] is not None:
         raise Refused(f"board {board!r} is archived; unarchive is not offered, create a new board")
@@ -776,11 +811,17 @@ def create(
                 (board, idempotency_key),
             ).fetchone()
             if dup:
-                return {"id": dup["id"], "status": dup["status"], "existing": True}
+                got = {"id": dup["id"], "status": dup["status"], "existing": True}
+                if grants:
+                    got["warnings"] = [f"card {dup['id']} already exists; the grant was not added"]
+                return got
+        warnings = []
         for p in parents:
             pt = get_task(conn, p)
             if pt["board"] != board:
                 raise Refused(f"parent {p} is on board {pt['board']!r}, not {board!r}")
+            if pt["status"] == "triage":
+                warnings.append(f"parent {p} is in triage; {tid} waits until it is done")
         status = "triage" if triage else "ready" if _all_done(conn, parents, False) else "todo"
         row.update(
             status=status, idempotency_key=idempotency_key, created_by=actor,
@@ -800,7 +841,10 @@ def create(
             actor,
             {"status": status, "assignee": assignee, "parents": list(parents)},
         )
-    return {"id": tid, "status": status, "existing": False}
+        got = {"id": tid, "status": status, "existing": False}
+        if grants and approved:
+            got["grant_id"] = _insert_grant(conn, row, grants, approved, actor)
+    return {**got, "warnings": warnings} if warnings else got
 
 
 def role_runtime(conn: sqlite3.Connection, role: str | None) -> int:
@@ -1035,6 +1079,7 @@ def reopen_review(
             conn, task_id, expected, version=expect_version, status=target,
             assignee=t["implementer"], **merge_reset,
         )  # fmt: skip
+        _comment(conn, t, "owner", f"REOPEN: {reason}", actor)
         event(conn, t, "review_reopened", actor, {"reason": reason, "status": target})
     return {"id": task_id, "status": target}
 
@@ -1057,6 +1102,8 @@ def reopen(
             merge_state=None, merge_attempts=0, merge_next_at=None, merged_at=None,
             retry_after=None, assignee=t["implementer"] or t["assignee"],
         )  # fmt: skip
+        if actor != "jira":  # jira.py pushes owner comments to the issue it just reopened from
+            _comment(conn, t, "owner", f"REOPEN: {reason}", actor)
         event(conn, t, "reopened", actor, {"reason": reason})
         children = conn.execute(
             "SELECT c.* FROM task_links l JOIN tasks c ON c.id = l.child_id WHERE l.parent_id = ?",
@@ -1130,7 +1177,10 @@ def link(
         if c["status"] == "ready" and not parents_satisfied(conn, child):
             _cas(conn, child, ["ready"], status="todo")
             event(conn, c, "dependency_wait", actor, {"parent": parent})
-    return {"parent": parent, "child": child}
+    got: dict[str, Any] = {"parent": parent, "child": child}
+    if p["status"] == "triage":
+        got["warnings"] = [f"parent {parent} is in triage; {child} waits until it is done"]
+    return got
 
 
 def unlink(
@@ -1443,11 +1493,30 @@ def end_run(
     return True
 
 
+_MODEL_USAGE_KEYS = (
+    "inputTokens", "outputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "costUSD",
+)  # fmt: skip
+
+
+def _model_usage(res: dict[str, Any]) -> dict[str, dict[str, float]] | None:
+    """The result's `modelUsage` cut to what a price list needs, or None when it reports none."""
+    raw = res.get("modelUsage")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    return {
+        str(m): {k: v[k] for k in _MODEL_USAGE_KEYS if isinstance(v.get(k), int | float)}
+        for m, v in raw.items()
+        if isinstance(v, dict)
+    }
+
+
 def record_result(
     conn: sqlite3.Connection, run: Row, exit_code: int | None, res: dict[str, Any]
 ) -> None:
-    """RUN-15: Claude's exit and result facts. A resumed session reports its whole cost, so
-    `cost_usd` is the rise over the session's previous total. Runs inside the caller's BEGIN IMMEDIATE."""
+    """RUN-15: Claude's exit and result facts. A resumed session reports its whole cost and its
+    whole per-model usage, so `cost_usd` and `model_usage` are the rise over the session's previous
+    totals (a total below the previous one is a fresh count and stands as it is).
+    Runs inside the caller's BEGIN IMMEDIATE."""
     total = res.get("total_cost_usd")
     prev = conn.execute(
         "SELECT session_cost_usd FROM task_runs WHERE session_id = ? AND id < ? "
@@ -1455,15 +1524,37 @@ def record_result(
         (run["session_id"], run["id"]),
     ).fetchone()
     floor = prev[0] if prev else 0.0
+    seen = _model_usage(res)
+    last = conn.execute(
+        "SELECT session_model_usage FROM task_runs WHERE session_id = ? AND id < ? "
+        "AND session_model_usage IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (run["session_id"], run["id"]),
+    ).fetchone()
+    before = json.loads(last[0]) if last else {}
+    share = None
+    if seen is not None:
+        share = {
+            m: {
+                k: round(v - b if v >= (b := before.get(m, {}).get(k, 0)) else v, 8)
+                for k, v in used.items()
+            }
+            for m, used in seen.items()
+        }
+    usage: dict[str, Any] = res["usage"] if isinstance(res.get("usage"), dict) else {}
     conn.execute(
         "UPDATE task_runs SET claude_exit_code = ?, exit_code = ?, subtype = ?, is_error = ?, "
-        "api_error_status = ?, num_turns = ?, session_cost_usd = ?, cost_usd = ? WHERE id = ?",
+        "api_error_status = ?, num_turns = ?, session_cost_usd = ?, cost_usd = ?, "
+        "input_tokens = ?, output_tokens = ?, cache_write_tokens = ?, cache_read_tokens = ?, "
+        "model_usage = ?, session_model_usage = ? WHERE id = ?",
         (
             exit_code, exit_code, res.get("subtype"),
             None if "is_error" not in res else int(bool(res["is_error"])),
             res.get("api_error_status"), res.get("num_turns"), total,
             None if total is None else (total - floor if total >= floor else total),
-            run["id"],
+            usage.get("input_tokens"), usage.get("output_tokens"),
+            usage.get("cache_creation_input_tokens"), usage.get("cache_read_input_tokens"),
+            None if share is None else json.dumps(share),
+            None if seen is None else json.dumps(seen), run["id"],
         ),
     )  # fmt: skip
 
@@ -1561,6 +1652,20 @@ def _worker(run: Row) -> str:
 _TERMINAL_CARD = {"retry_after": None, "protocol_violations": 0}
 
 
+def _last_block(conn: sqlite3.Connection, task_id: str) -> tuple[str | None, int]:
+    """The kind and repeat count of the card's latest block, `(None, 0)` once anything else ended
+    it (a stop, a give-up, a completion). The card's own columns are cleared when it leaves `blocked`,
+    so the loop check (BLOCK_RECURRENCE_LIMIT) reads the history instead."""
+    got = conn.execute(
+        "SELECT json_extract(payload, '$.kind'), json_extract(payload, '$.recurrences') "
+        "FROM task_events WHERE task_id = ? "
+        "AND kind IN ('blocked', 'block_loop_detected', 'stopped', 'gave_up', 'completed') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return (got[0], got[1] or 0) if got else (None, 0)
+
+
 def block(conn: sqlite3.Connection, run_id: int, kind: str, reason: str) -> dict[str, Any]:
     if kind not in WORKER_BLOCK_KINDS:
         raise Refused(f"block kind {kind!r} must be one of {', '.join(WORKER_BLOCK_KINDS)}")
@@ -1570,7 +1675,8 @@ def block(conn: sqlite3.Connection, run_id: int, kind: str, reason: str) -> dict
         if found is None:
             return {"noop": True}
         run, t = found
-        loops = t["block_recurrences"] + 1 if t["block_kind"] == kind else 0
+        prev = _last_block(conn, t["id"])
+        loops = prev[1] + 1 if prev[0] == kind else 0
         looped = loops >= BLOCK_RECURRENCE_LIMIT
         to = "triage" if looped else "blocked"
         end_run(
@@ -1690,20 +1796,81 @@ def request_changes(conn: sqlite3.Connection, run_id: int, reason: str) -> dict[
     return {"id": t["id"], "status": to, "assignee": t["implementer"]}
 
 
+def owner_builder(conn: sqlite3.Connection, t: Row) -> str:
+    """The builder of a blocked card: its assignee, or the implementer a blocked review run left behind."""
+    if t["status"] != "blocked":
+        raise Refused(f"card {t['id']} is {t['status']}; request-review needs it blocked")
+    if t["assignee"] in BUILDERS:
+        return str(t["assignee"])
+    if last_run_kind(conn, t["id"]) == "review" and t["implementer"] in BUILDERS:
+        return str(t["implementer"])
+    raise Refused(
+        f"card {t['id']} has no smith or designer to review; "
+        f"use: kanban assign {t['id']} ROLE, then unblock it"
+    )
+
+
+def request_review_owner(
+    conn: sqlite3.Connection,
+    task_id: str,
+    summary: str,
+    *,
+    pr_number: int,
+    pr_url: str,
+    reviewer: str | None = None,
+    actor: str = OWNER,
+) -> dict[str, Any]:
+    """The owner's form of request-review: a blocked builder card whose PR is ready goes to review."""
+    summary = _need(summary, "summary", "name the PR as 'PR #<n>' or its URL")
+    reviewer = reviewer or cfg(conn, "dispatch.reviewer")
+    if reviewer not in active_roles(conn):
+        raise Refused(f"reviewer {reviewer!r} is not a dispatchable role")
+    with tx(conn):
+        t = get_task(conn, task_id)
+        builder = owner_builder(conn, t)
+        _cas(
+            conn, task_id, ["blocked"], status="review", implementer=builder, assignee=reviewer,
+            pr_number=pr_number, pr_url=pr_url, consecutive_failures=0, protocol_violations=0,
+            last_failure_error=None, retry_after=None,
+        )  # fmt: skip
+        _comment(conn, t, "owner", f"REVIEW REQUESTED: {summary}", actor)
+        event(conn, t, "review_requested", actor, {"implementer": builder, "pr": pr_number})
+    return {"id": task_id, "status": "review", "assignee": reviewer, "pr_number": pr_number}
+
+
+def request_changes_owner(
+    conn: sqlite3.Connection, task_id: str, reason: str, *, actor: str = OWNER
+) -> dict[str, Any]:
+    """The owner's form of request-changes: a card blocked in a review run goes back to its builder."""
+    reason = _need(reason, "reason", "pass --reason")
+    with tx(conn):
+        t = get_task(conn, task_id)
+        if t["status"] != "blocked" or last_run_kind(conn, task_id) != "review":
+            raise Refused(
+                f"card {task_id} is {t['status']}; request-changes needs a card blocked in a review run"
+            )
+        if not t["implementer"]:
+            raise Refused(
+                f"card {task_id} has no recorded implementer; use: kanban unblock {task_id}"
+            )
+        to = "ready" if parents_satisfied(conn, task_id) else "todo"
+        _cas(
+            conn, task_id, ["blocked"], status=to, assignee=t["implementer"],
+            consecutive_failures=0, protocol_violations=0, last_failure_error=None,
+            retry_after=None,
+        )  # fmt: skip
+        _comment(conn, t, "owner", f"CHANGES REQUESTED: {reason}", actor)
+        event(conn, t, "changes_requested", actor, {"reason": reason})
+    return {"id": task_id, "status": to, "assignee": t["implementer"]}
+
+
 # --- grants, pause, stats -------------------------------------------------------------------
 
 _RULE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*\((.+)\)$")
 _MCP_RULE_RE = re.compile(r"^mcp__[A-Za-z0-9-]+__[A-Za-z0-9_]+$")
 
 
-def grant_add(
-    conn: sqlite3.Connection,
-    task_id: str,
-    rules: Sequence[str],
-    approved: str,
-    *,
-    actor: str = OWNER,
-) -> dict[str, Any]:
+def _check_grant(rules: Sequence[str], approved: str | None) -> str:
     approved = _need(approved, "--approved", "quote the owner's words, source and date")
     if not rules:
         raise Refused("pass at least one --allow RULE")
@@ -1715,14 +1882,37 @@ def grant_add(
             raise Refused(
                 f"grant rule {r!r} must name the exact action, not a wildcard or a tool prefix"
             )
+    return approved
+
+
+def _insert_grant(
+    conn: sqlite3.Connection,
+    t: Row | dict[str, Any],
+    rules: Sequence[str],
+    approved: str,
+    actor: str,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO grants(task_id, rules, approved, created_at) VALUES (?, ?, ?, ?)",
+        (t["id"], json.dumps(list(rules)), approved, now()),
+    )
+    assert cur.lastrowid is not None
+    event(conn, t, "grant_added", actor, {"grant_id": cur.lastrowid, "rules": list(rules)})
+    return cur.lastrowid
+
+
+def grant_add(
+    conn: sqlite3.Connection,
+    task_id: str,
+    rules: Sequence[str],
+    approved: str,
+    *,
+    actor: str = OWNER,
+) -> dict[str, Any]:
+    approved = _check_grant(rules, approved)
     with tx(conn):
-        t = get_task(conn, task_id)
-        cur = conn.execute(
-            "INSERT INTO grants(task_id, rules, approved, created_at) VALUES (?, ?, ?, ?)",
-            (task_id, json.dumps(list(rules)), approved, now()),
-        )
-        event(conn, t, "grant_added", actor, {"grant_id": cur.lastrowid, "rules": list(rules)})
-    return {"id": task_id, "grant_id": cur.lastrowid}
+        grant_id = _insert_grant(conn, get_task(conn, task_id), rules, approved, actor)
+    return {"id": task_id, "grant_id": grant_id}
 
 
 def grant_revoke(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) -> dict[str, Any]:
@@ -1775,6 +1965,16 @@ def stats(conn: sqlite3.Connection, *, board: str | None = None, days: int = 7) 
         "cost_by_role": table(f"SELECT r.role, COUNT(*) runs, ROUND(COALESCE(SUM(r.cost_usd), 0), 4) cost {base} GROUP BY r.role ORDER BY r.role"),
         "cost_by_model": table(f"SELECT r.model, ROUND(COALESCE(SUM(r.cost_usd), 0), 4) cost {base} GROUP BY r.model ORDER BY r.model"),
         "cost_by_day": table(f"SELECT date(r.started_at, 'unixepoch', 'localtime') day, ROUND(COALESCE(SUM(r.cost_usd), 0), 4) cost {base} GROUP BY day ORDER BY day"),
+        "tokens_by_model": table(
+            "SELECT j.key model, COUNT(*) runs, "
+            "COALESCE(SUM(json_extract(j.value, '$.inputTokens')), 0) input, "
+            "COALESCE(SUM(json_extract(j.value, '$.outputTokens')), 0) output, "
+            "COALESCE(SUM(json_extract(j.value, '$.cacheCreationInputTokens')), 0) cache_write, "
+            "COALESCE(SUM(json_extract(j.value, '$.cacheReadInputTokens')), 0) cache_read, "
+            "ROUND(COALESCE(SUM(json_extract(j.value, '$.costUSD')), 0), 4) cost "
+            f"FROM task_runs r JOIN tasks t ON t.id = r.task_id, json_each(r.model_usage) j "
+            f"WHERE {where} GROUP BY j.key ORDER BY j.key"
+        ),
         "outcomes": table(f"SELECT r.outcome, COUNT(*) runs {base} GROUP BY r.outcome ORDER BY r.outcome"),
         "review_rounds": table(f"SELECT t.id, COUNT(*) rounds {base} AND r.kind = 'review' GROUP BY t.id ORDER BY rounds DESC"),
     }  # fmt: skip

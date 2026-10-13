@@ -483,3 +483,51 @@ def test_snapshot_verb_prints_a_path(kb: Kb, origin: Path, repo: Path) -> None:
     code, out, _ = kb("snapshot", str(repo))
     assert code == 0 and Path(out.strip()).is_dir()
     assert (Path(out.strip()) / "a.txt").exists()
+
+
+def wall_events(conn: Any) -> list[tuple[Any, Any, dict[str, Any]]]:
+    return [
+        (r["board"], r["task_id"], json.loads(r["payload"]))
+        for r in conn.execute("SELECT * FROM task_events WHERE kind = 'quota_wall' ORDER BY id")
+    ]
+
+
+def test_a_quota_wall_is_announced_once_per_wall(conn: Any, card: Card, procs: FakeProcs) -> None:
+    card("one"), card("two")
+    cfg_dir = store.effective_config_dir(conn, store.get_board(conn, "main"))
+    with store.tx(conn):
+        store.account_set(conn, cfg_dir, hard_until=NOW + 100)
+    tick(conn, procs, NOW, dry_run=True)
+    assert wall_events(conn) == [], "a dry run records nothing"
+    for later in (0, 10):
+        tick(conn, procs, NOW + later)
+    card("three")
+    tick(conn, procs, NOW + 20)
+    assert wall_events(conn) == [(None, None, {"until": NOW + 100, "kind": "hard", "cards": 2})]
+    with store.tx(conn):
+        store.account_set(conn, cfg_dir, soft_until=NOW + 500)
+    for later in (30, 40):
+        tick(conn, procs, NOW + later)
+    assert [p for *_, p in wall_events(conn)][1:] == [
+        {"until": NOW + 500, "kind": "soft", "cards": 3}
+    ]
+
+
+def test_each_account_gets_its_own_wall_event_and_an_idle_wall_is_silent(
+    conn: Any, card: Card, procs: FakeProcs, tmp_path: Path
+) -> None:
+    store.board_create(conn, "other", default_workdir=str(tmp_path), claude_config_dir="acct-b")
+    cfg_dir = store.effective_config_dir(conn, store.get_board(conn, "main"))
+    with store.tx(conn):
+        store.account_set(conn, "acct-b", hard_until=NOW + 300)
+    tick(conn, procs, NOW)
+    assert wall_events(conn) == [], "nothing waits on the wall"
+    store.create(conn, "other", "elsewhere", body="do it", assignee="smith")
+    with store.tx(conn):
+        store.account_set(conn, cfg_dir, hard_until=NOW + 100)
+    card("here")
+    tick(conn, procs, NOW)
+    assert [p for *_, p in wall_events(conn)] == [
+        {"until": NOW + 300, "kind": "hard", "cards": 1},
+        {"until": NOW + 100, "kind": "hard", "cards": 1},
+    ]

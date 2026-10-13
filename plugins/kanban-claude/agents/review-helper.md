@@ -1,7 +1,7 @@
 ---
 name: review-helper
 description: "Read-only subagent of warden: gathers evidence for one bounded question about a pull request, such as one file, one claim or one repro, and reports facts without judging the verdict."
-tools: Bash, Read, LSP, ToolSearch, mcp__context7
+tools: Bash, Read, LSP, ToolSearch, mcp__context7, mcp__code-review-graph
 model: sonnet
 effort: high
 ---

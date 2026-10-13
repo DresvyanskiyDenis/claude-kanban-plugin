@@ -225,22 +225,18 @@ def one(r: Req, task_id: str) -> dict[str, Any]:
     return card_rows(r, slug, "t.id = ?", [task_id])[0]
 
 
-def accounts(conn: sqlite3.Connection, now: int) -> list[dict[str, Any]]:
-    out = []
-    for row in conn.execute("SELECT key, value FROM state WHERE key LIKE 'account:%' ORDER BY key"):
-        s = json.loads(row["value"])
-        if not isinstance(s, dict):
-            continue
-        raw = row["key"].removeprefix("account:")
-        out.append(
-            {
-                "name": Path(raw).name or raw,
-                "logged_out": bool(s.get("auth_paused")),
-                "hard_until": s["hard_until"] if (s.get("hard_until") or 0) > now else None,
-                "soft_until": s["soft_until"] if (s.get("soft_until") or 0) > now else None,
-            }
-        )
-    return out
+def accounts(conn: sqlite3.Connection, slug: str, now: int) -> list[dict[str, Any]]:
+    """The login this board runs under, if it has a problem, and never which config folder it is:
+    the page may be on a shared screen."""
+    s = store.account_get(conn, store.effective_config_dir(conn, store.get_board(conn, slug)))
+    if not isinstance(s, dict):
+        return []
+    acct = {
+        "logged_out": bool(s.get("auth_paused")),
+        "hard_until": s["hard_until"] if (s.get("hard_until") or 0) > now else None,
+        "soft_until": s["soft_until"] if (s.get("soft_until") or 0) > now else None,
+    }
+    return [acct] if any(acct.values()) else []
 
 
 def installed_version(home: Path) -> str | None:
@@ -259,15 +255,18 @@ def header(r: Req, slug: str) -> dict[str, Any]:
         "WHERE t.board = ? AND r.started_at >= ?",
         (int(midnight.timestamp()), slug, now - 7 * 86400),
     ).fetchone()
-    running = r.conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0]
+    running, here = r.conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(board = ?), 0) FROM tasks WHERE status = 'running'", (slug,)
+    ).fetchone()
     jira_base = store.cfg(r.conn, "web.jira_base_url")
     return {
         "paused": store.state_get(r.conn, "dispatch_paused"),
         "running": running,
+        "running_here": here,
         "cap": store.cfg(r.conn, "dispatch.max_in_progress"),
         "cost_today": today,
         "cost_7d": week,
-        "accounts": accounts(r.conn, now),
+        "accounts": accounts(r.conn, slug, now),
         "jira_paused": (store.state_get(r.conn, f"jira:{slug}") or {}).get("paused"),
         "jira_base": jira_base if str(jira_base).startswith("https://") else None,
         "version": __version__,
@@ -283,7 +282,10 @@ def qint(query: dict[str, str], key: str, default: int | None = None) -> int | N
 
 
 def event_json(e: dict[str, Any]) -> dict[str, Any]:
-    return e | {"payload": json.loads(e["payload"]) if e["payload"] else None}
+    """A board-less event (an account resumed, a setting changed) can carry a config folder or a
+    path; the page only needs its kind."""
+    payload = json.loads(e["payload"]) if e["payload"] and e["board"] else None
+    return e | {"payload": payload}
 
 
 # --- writes: field checks -------------------------------------------------------------------
