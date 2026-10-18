@@ -97,7 +97,7 @@ def worker_env(
     )
     d = dirs()
     env.update(
-        CLAUDE_CODE_WEB_FETCH_AGENT="0", KANBAN_TASK=t["id"],
+        CLAUDE_CODE_WEB_FETCH_AGENT="0", CLAUDE_SKIP_SOUL="1", KANBAN_TASK=t["id"],
         KANBAN_BOARD=t["board"], KANBAN_RUN_ID=str(run_id), KANBAN_WORKSPACE=str(workspace),
         KANBAN_HOME=str(d.home), KANBAN_WORK=str(d.work),
     )  # fmt: skip
