@@ -137,6 +137,7 @@ def test_r2_only_the_billing_switches_and_the_claude_markers_are_dropped(
     assert seen["KANBAN_RUN_ID"] == str(run["id"]) and seen["KANBAN_TASK"] == tid
     assert seen["KANBAN_BOARD"] == "main" and "CLAUDE_CONFIG_DIR" not in seen
     assert seen["CLAUDE_CODE_WEB_FETCH_AGENT"] == "0"
+    assert seen["CLAUDE_SKIP_SOUL"] == "1"
     assert not [k for k in seen if k.startswith("KANBAN_") and re.search("TOKEN|SOCK", k)]
 
 
