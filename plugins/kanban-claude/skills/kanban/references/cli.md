@@ -92,6 +92,7 @@ Observing:
 | `kanban runs ID` | Every run of the card with its outcome |
 | `kanban log ID [--run N] [--tail N]`, `kanban tail ID` | A run's log; `tail` follows the live run |
 | `kanban stats [--days N]` | Cost by role, model and day; outcomes; review rounds; `accounts`: each Claude config dir that is behind a quota wall (`wall_until`) or paused on sign-in (`auth_paused`) right now |
+| `kanban web [--port N] [--board SLUG] [--open]` | Read-only dashboard on `127.0.0.1:8742`: board, cards, every run's parameters and logs, statistics; foreground, Ctrl-C stops it; never writes the database |
 | `kanban dispatch --dry-run` | What the next tick would claim, and why each other card is skipped |
 | `kanban snapshot REPO [--ref REF]` | Prints the path of a fresh detached checkout of `origin/HEAD`, or of the branch, tag or sha `--ref` names, for the card check. Each ref keeps its own checkout, so two refs of one repo do not move each other's tree |
 

@@ -84,6 +84,17 @@ To follow the board from a session, run `kanban watch --actionable --wait --boar
 
 It is a Claude Code mod and needs Claude Code 2.1.287 or later; an organization's managed settings can disable mods. Narrower than 144 columns, Claude Code places a pane it was not asked for only from 110 columns, so a reopened pane may wait until the terminal is wide enough.
 
+## Web dashboard
+
+`kanban web [--port N] [--board SLUG] [--open]` serves a read-only dashboard at `http://127.0.0.1:8742/` (the default port is fixed, and the command says so and exits when it is taken). It runs in the foreground until Ctrl-C and works offline: the page is plain HTML, CSS and JavaScript shipped in the package, with no CDN and no build step.
+
+- The board has one lane per status, live cards with the last thing the worker did, and a dock that follows every running card's transcript.
+- A card opens in a drawer: Overview, Parameters (every card setting, then per run the command line, environment, what the session loaded and what it used), Runs, Logs and Comments.
+- Logs show a run's transcript with tools, results, hooks and subagent work folded under their parent, or the raw text log, with filters, search, paging for large streams, follow mode and a download of the original file. Long entries are cut on the page and expanded on request.
+- Stats shows spend per day, per role and per model, outcomes, review rounds and, on a schema 6 database, the harness numbers (skills, MCP, tools, subagents, hooks).
+
+It opens the database read-only on every request and never migrates it, so it can run beside an older daemon and shows a schema 5 board with the schema 6 parts left out. It binds to `127.0.0.1` only, answers `GET` and `HEAD` only, rejects other `Host` headers, and sends a content security policy with no inline script or style. Log and prompt files are read only through the run rows of the database, and only under the kanban home.
+
 ## Doctor
 
 `kanban doctor` runs twenty independent checks and exits 1 when any one fails (a warning leaves it at 0); `--json` gives the same list as data. Each line names what is wrong and the command that fixes it. `--probe` adds the two checks that start `claude` (the scout agent resolves and the login passes, in every config directory a board uses; this costs a few cents) and, for check 20, starts `jira.mcp_command` and confirms it lists the seven Jira tools. `--fix` repairs only what is safe: file modes (`$KANBAN_HOME` and `$KANBAN_WORK` 0700, the database, `installed.json`, logs and the plist 0600), a LaunchAgent that is not loaded (it rebuilds a missing plist from `installed.json`), and a `running` card or run that disagrees with the other through the dispatcher's reconcile step. Everything else is yours to repair.
