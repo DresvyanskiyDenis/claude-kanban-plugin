@@ -228,3 +228,14 @@ def test_watch_line_names_the_actor_not_the_assignee(conn: Any, card: Card) -> N
     ev = next(e for e in store.events_since(conn, 0) if e["kind"] == "commented")
     line = views.watch_line(ev)
     assert f" {tid} commented (owner:cli)" in line and "@smith" not in line
+
+
+def test_digest_shares_the_actionable_kinds_and_skips_the_owners_own_pause(
+    conn: Any, board: str
+) -> None:
+    store.pause(conn, "lunch")
+    assert views.digest(conn, board, 7200)["needs_you"] == []
+    store.resume(conn)
+    store.state_put(conn, "dispatch_paused", {"reason": "systemic", "since": store.now()})
+    store.event(conn, None, "dispatch_paused", "runner", {"reason": "systemic"})
+    assert [i["kind"] for i in views.digest(conn, board, 7200)["needs_you"]] == ["dispatch_paused"]

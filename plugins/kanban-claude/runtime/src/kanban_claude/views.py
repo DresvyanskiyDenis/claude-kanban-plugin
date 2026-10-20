@@ -392,16 +392,11 @@ def account_states(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return out
 
 
-# The events that ask the owner to act. The lead unifies this with `watch --actionable`'s kinds at integration.
-NEEDS_OWNER = (
-    "blocked", "block_loop_detected", "gave_up", "merge_failed", "account_paused", "quota_wall",
-    "awaiting_owner_merge",
-)  # fmt: skip
-
-
 def _still_open(conn: sqlite3.Connection, ev: dict[str, Any], payload: dict[str, Any]) -> bool:
-    """A `NEEDS_OWNER` event counts only while the card or login it names is still in that state."""
+    """An actionable event counts only while the card, login or pause it names is still in that state."""
     kind = ev["kind"]
+    if kind == "dispatch_paused":
+        return store.state_get(conn, "dispatch_paused") is not None
     if kind == "quota_wall":
         return (payload.get("until") or 0) > store.now()
     if kind == "account_paused":
@@ -428,7 +423,9 @@ def digest(conn: sqlite3.Connection, board: str | None, window: int) -> dict[str
         "SELECT MIN(id) FROM task_events WHERE created_at >= ?", (ts - window,)
     ).fetchone()[0]
     events = (
-        store.events_since(conn, first - 1, kinds=(*NEEDS_OWNER, "merged"), board=board, limit=-1)
+        store.events_since(
+            conn, first - 1, kinds=(*store.ACTIONABLE_EVENTS, "merged"), board=board, limit=-1
+        )
         if first
         else []
     )
@@ -446,7 +443,7 @@ def digest(conn: sqlite3.Connection, board: str | None, window: int) -> dict[str
         i = item(ev)
         if ev["kind"] == "merged":
             merged.append(i)
-        elif _still_open(conn, ev, i["payload"]):
+        elif store.actionable(ev) and _still_open(conn, ev, i["payload"]):
             open_items[(ev["kind"], ev["task_id"], i["payload"].get("config_dir"))] = i
     by_status: dict[str, list[dict[str, Any]]] = {"review": [], "running": []}
     for t in conn.execute(
