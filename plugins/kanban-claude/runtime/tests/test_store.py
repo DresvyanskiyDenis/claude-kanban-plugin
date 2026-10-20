@@ -890,6 +890,41 @@ def test_card_cap_raised_or_off_lets_the_card_run(conn: Any, card: Card) -> None
     assert store.claim(conn, other), "0 turns the per-card cap off"
 
 
+def _cost(conn: Any, run: int, usd: float) -> None:
+    conn.execute("UPDATE task_runs SET cost_usd = ? WHERE id = ?", (usd, run))
+
+
+def test_a_cap_hit_at_the_review_claim_unblocks_back_to_review(conn: Any, card: Card) -> None:
+    tid, other = card(), card("other")
+    for t in (tid, other):
+        run = claim_run(conn, t)
+        _cost(conn, run, 16.0)
+        store.request_review(conn, run, "PR #1", pr_number=1, pr_url=PR_URL)
+        assert store.claim(conn, t) is None, "the review claim is over the $15 cap"
+    store.request_changes_owner(conn, other, "the owner may still send it back")
+    store.config_set(conn, "budget.max_usd_per_card", 25)
+    store.unblock(conn, tid, "cap raised")
+    t = row(conn, tid)
+    assert (t["status"], t["assignee"]) == ("review", "warden"), (
+        "back to ready would run warden as a work run and skip the review gate"
+    )
+
+
+def test_a_cap_hit_at_the_work_claim_after_changes_unblocks_to_ready(conn: Any, card: Card) -> None:
+    tid = card()
+    store.request_review(conn, claim_run(conn, tid), "PR #1", pr_number=1, pr_url=PR_URL)
+    review = claim_run(conn, tid)
+    _cost(conn, review, 16.0)
+    store.request_changes(conn, review, "fix the thing")
+    assert store.claim(conn, tid) is None
+    store.config_set(conn, "budget.max_usd_per_card", 25)
+    store.unblock(conn, tid, "cap raised")
+    t = row(conn, tid)
+    assert (t["status"], t["assignee"]) == ("ready", "smith"), (
+        "back to review would leave smith stuck on role_not_dispatchable"
+    )
+
+
 def test_board_day_cap_counts_only_today_on_this_board(
     conn: Any, board: str, card: Card, repo: Path
 ) -> None:
@@ -945,6 +980,27 @@ def test_board_day_cap_off_states(conn: Any, card: Card, off: Any) -> None:
 def test_budget_caps_refuse_non_numbers_and_negatives(conn: Any, key: str, value: Any) -> None:
     with pytest.raises(Refused, match=key):
         store.config_set(conn, key, value)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("effort.smith", "turbo"),
+        ("effort.smith", 5),
+        ("effort.default", "turbo"),
+        ("effort.review", "turbo"),
+        ("models.default", "bad model!"),
+        ("models.review", "bad model!"),
+    ],
+)
+def test_effort_and_model_keys_refuse_what_claude_would_reject(
+    conn: Any, key: str, value: Any
+) -> None:
+    """A bad value reaches every run's argv: each run then fails, or Popen raises TypeError."""
+    with pytest.raises(Refused):
+        store.config_set(conn, key, value)
+    store.config_set(conn, "effort.smith", "max")
+    store.config_set(conn, "effort.smith", None)
 
 
 def test_link_ends_the_waiver_for_the_new_parent(conn: Any, card: Card) -> None:
