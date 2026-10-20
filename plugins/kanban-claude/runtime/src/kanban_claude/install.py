@@ -24,7 +24,7 @@ from .paths import add_file_log, dirs, ensure_dir, write_private
 from .procs import Procs
 
 MIN_CLAUDE = (2, 1, 259)
-HEALTH_WAIT_S = 10.0
+HEALTH_WAIT_S = 30.0  # after a restart the old daemon first joins its threads
 PROBE_TIMEOUT_S = 180
 STAMP_SCHEMA = 1
 LAUNCHD_BASICS = ("HOME", "USER", "LOGNAME", "TMPDIR")
@@ -294,14 +294,22 @@ def check_agent(claude: str, env: dict[str, str], config_dir: str) -> None:
     )
 
 
-def wait_for_daemon() -> None:
+def wait_for_daemon(version: str | None = None) -> None:
+    """Until a daemon holds the lock, and with `version`, until it is that version: right after a
+    restart the old daemon can still hold it (a dev7 one writes no version, so it reads as old)."""
     deadline = time.monotonic() + HEALTH_WAIT_S
-    while daemon.probe() is None:
+    while (held := daemon.probe()) is None or (version and held.get("version") != version):
         if time.monotonic() >= deadline:
             home = dirs().home
+            log = home / "logs" / "daemon.log"
+            if held is None:
+                raise Error(
+                    f"nothing holds {home / 'daemon.lock'} after {HEALTH_WAIT_S:.0f} s: "
+                    f"the daemon did not start; see {log}"
+                )
             raise Error(
-                f"nothing holds {home / 'daemon.lock'} after {HEALTH_WAIT_S:.0f} s: "
-                f"the daemon did not start; see {home / 'logs' / 'daemon.log'}"
+                f"the daemon still runs {held.get('version') or 'an older version'}, not {version}, "
+                f"after {HEALTH_WAIT_S:.0f} s; see {log}"
             )
         time.sleep(0.25)
 
@@ -415,7 +423,7 @@ def upgrade(
     say(f"database schema is {conn.execute('PRAGMA user_version').fetchone()[0]}")
     if not a.no_daemon:
         launchd.restart()
-        wait_for_daemon()
+        wait_for_daemon(__version__)
         say("the daemon runs the new code")
     stamp({k: v for k, v in old.items() if k != "setup_at"} | {"version": __version__})
     return (

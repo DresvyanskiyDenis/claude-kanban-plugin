@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import __version__, install, launchd, paths, store
+from kanban_claude import __version__, daemon, install, launchd, paths, store
 
 from .conftest import Calls, Kb
 
@@ -304,6 +304,15 @@ def test_an_upgrade_migrates_restarts_the_daemon_and_rewrites_the_stamp(
     assert len(claude_calls(env)) == 2
     assert f"{OLD} -> {__version__}" in (paths.dirs().home / "logs" / "upgrade.log").read_text()
     assert upgrade_lock_is_free()
+
+
+def test_an_upgrade_fails_while_the_old_daemon_still_holds_the_lock(
+    installed: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(daemon, "probe", lambda: {"pid": 1, "version": OLD})
+    code, _, err = installed()
+    assert code == 1 and f"still runs {OLD}, not {__version__}" in err
+    assert stamp()["version"] == OLD
 
 
 @contextlib.contextmanager
