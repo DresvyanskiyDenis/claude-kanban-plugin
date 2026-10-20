@@ -1,6 +1,6 @@
 # kanban CLI reference
 
-Usage: `kanban [--board SLUG] [--json] <verb> ...`. `--board` and `--json` are also accepted after the verb. Run `kanban <verb> --help` for the exact flags of the build you have.
+Usage: `kanban [--board SLUG] [--json] <verb> ...`. `--board` and `--json` are also accepted after the verb. `kanban --help` lists every verb with one line each; run `kanban <verb> --help` for the exact flags of the build you have.
 
 ## Conventions
 
@@ -16,7 +16,7 @@ Usage: `kanban [--board SLUG] [--json] <verb> ...`. `--board` and `--json` are a
 
 | Command | Notes |
 |---|---|
-| `kanban show [ID]` | The card. `--json`: `task` (`id`, `status`, `body`, `branch_name`, `base_branch`, `pr_url`, `pr_number`, `block_kind`, `merge_state`, `implementer`), `parents`, `children`, `comments` (`body`, `author`), `runs`, `events`, `grants`, `attachments`, `latest_summary`; for the wait fields see "Links and waiting" |
+| `kanban show [ID]` | The card. `--json`: `task` (`id`, `status`, `body`, `branch_name`, `base_branch`, `pr_url`, `pr_number`, `block_kind`, `merge_state`, `implementer`), `parents`, `children`, `comments` (`body`, `author`), `runs`, `events`, `grants`, `attachments`, `latest_summary`, and `skip` (`reason`, `at`: why the dispatcher last passed over a `ready` or `review` card, null once a run claims it); for the wait fields see "Links and waiting". The text form prints it as `not started: <reason> (since …)` |
 | `kanban context [ID]` | Markdown for a run. Its header names the card's branch, PR base, PR number and worktree path, then body, attachments, prior attempts, parent results, comment thread, grants. Quoted worker text is framed as data |
 | `kanban comment ID TEXT` | Notifies nobody; `--author` is set for workers. `comment ID -` reads the text from stdin (there is no `--body-file`). A comment starting `FOLLOW-UP:` marks work for a separate card; `followups` collects them |
 | `kanban attach ID PATH` | Copies a file (25 MiB at most) next to the card |
@@ -35,7 +35,7 @@ Cards:
 | `kanban create TITLE` | `--assignee --workspace worktree:<root>\|dir:<abs> --branch --base --priority --max-runtime 30m\|2h --max-retries --skill --model --effort --budget --touches GLOB (repeatable) --merge-method squash\|merge\|rebase --body \| --body-file - --idempotency-key --parent ID (repeatable) --triage`, and `--grant RULE` (repeatable) with `--approved "WORDS · SOURCE · DATE"` to attach exact grants at creation. A `--parent` in `triage` prints a warning: the child would never start. `--touches` globs make the dispatcher hold back the card while a running card's touches overlap (skip reason `overlaps:<id>`). `--merge-method` (default squash) is for the daemon's merge into a feature branch; a merge into the default branch stays the owner's |
 | `kanban specify ID` | Same fields plus `--title`; takes a `triage` card to `ready`, or to `todo` while a parent is open. The card starts at once, so stage its inputs first |
 | `kanban edit ID` | The same fields, including `--touches` and `--merge-method`; `--allow-empty-body`. Changes text and settings, never the status |
-| `kanban list` | `--status --assignee --sort created\|priority\|completed-desc --limit`; needs a resolvable board. Prints why a card waits and marks a `done` PR card `awaiting merge` (see "Links and waiting") |
+| `kanban list` | `--status --assignee --sort created\|priority\|completed-desc --limit`; needs a resolvable board. Prints why a card waits, the latest skip reason as `not started: <reason> (since …)` (`skip` in `--json`), and marks a `done` PR card `awaiting merge` (see "Links and waiting") |
 | `kanban assign ID ROLE`, `kanban reassign ID ROLE [--reclaim]` | Roles: smith, designer, scout, warden, and atlassian when `roles.atlassian.enabled` is set |
 | `kanban link PARENT CHILD`, `kanban unlink PARENT CHILD` | Dependencies. `link` warns when PARENT is in `triage`: the child would never start |
 
@@ -88,10 +88,10 @@ Observing:
 |---|---|
 | `kanban watch` | `--kinds a,b --since EVENT_ID \| --since-start --follow --actionable`; spans all boards unless `--board` is given. Starts at the end of the log by default. `--actionable` keeps only the events that need the owner (blocks, review verdicts, `merge_failed`, `awaiting_owner_merge`, `account_paused`, `quota_wall` and similar). One line per event: `[time] #<event id> <card> <kind> (@role) {payload}`, with the actor |
 | `kanban digest [--since DUR]` | Read-only summary of the last `DUR` (default `2h`). Opens with "Needs you: N" and those items, then what merged, what is in review, what is running, and the cost |
-| `kanban followups [--since DUR]` | Lists the `FOLLOW-UP:` comments of that window, for the owner to turn into `create --triage` cards. Creates nothing |
+| `kanban followups [--since DUR]` | Lists the `FOLLOW-UP:` comments of that window (default `24h`), for the owner to turn into `create --triage` cards. Creates nothing |
 | `kanban runs ID` | Every run of the card with its outcome |
 | `kanban log ID [--run N] [--tail N]`, `kanban tail ID` | A run's log; `tail` follows the live run |
-| `kanban stats [--days N]` | Cost by role, model and day; outcomes; review rounds |
+| `kanban stats [--days N]` | Cost by role, model and day; outcomes; review rounds; `accounts`: each Claude config dir that is behind a quota wall (`wall_until`) or paused on sign-in (`auth_paused`) right now |
 | `kanban dispatch --dry-run` | What the next tick would claim, and why each other card is skipped |
 | `kanban snapshot REPO [--ref REF]` | Prints the path of a fresh detached checkout of `origin/HEAD`, or of the branch, tag or sha `--ref` names, for the card check. Each ref keeps its own checkout, so two refs of one repo do not move each other's tree |
 
