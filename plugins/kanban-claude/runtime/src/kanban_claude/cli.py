@@ -593,6 +593,8 @@ def v_stats(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, 
 @owner_verb("digest")
 def v_digest(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
     data = views.digest(conn, find_board(conn, a), validate.duration(a.since or "2h"))
+    held = daemon.probe()
+    data["daemon"] = {"alive": held is not None, "version": (held or {}).get("version")}
     return data, views.digest_text(data)
 
 

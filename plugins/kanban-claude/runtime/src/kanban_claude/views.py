@@ -350,7 +350,7 @@ def cards_list(
         where.append("assignee = ?")
         args.append(assignee)
     sql = (
-        "SELECT t.id, t.title, t.status, t.assignee, t.priority, t.branch_name, t.pr_number, "
+        "SELECT t.id, t.title, t.status, t.assignee, t.priority, t.branch_name, t.pr_number, t.block_kind, "
         f"t.created_at, t.updated_at, t.completed_at, {_WAITING_SQL}, {_AWAITING_SQL}, {_SKIP_SQL} "
         f"FROM tasks t WHERE {' AND '.join(where)} ORDER BY {SORTS[sort]}"
     )
@@ -432,9 +432,14 @@ def digest(conn: sqlite3.Connection, board: str | None, window: int) -> dict[str
 
     def item(ev: dict[str, Any]) -> dict[str, Any]:
         row = conn.execute("SELECT title FROM tasks WHERE id = ?", (ev["task_id"],)).fetchone()
+        why = conn.execute(
+            "SELECT summary FROM task_runs WHERE task_id = ? AND summary != '' ORDER BY n DESC LIMIT 1",
+            (ev["task_id"],),
+        ).fetchone()
         return {
-            "task_id": ev["task_id"], "kind": ev["kind"], "at": ev["created_at"],
+            "id": ev["id"], "task_id": ev["task_id"], "kind": ev["kind"], "at": ev["created_at"],
             "title": row["title"] if row else None, "payload": _json(ev["payload"]) or {},
+            "reason": why["summary"] if why else None,
         }  # fmt: skip
 
     open_items: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -464,7 +469,7 @@ def digest(conn: sqlite3.Connection, board: str | None, window: int) -> dict[str
     return {
         "since": ts - window, "needs_you": list(open_items.values()), "merged": merged,
         "in_review": by_status["review"], "running": by_status["running"], "cost_usd": cost,
-        "runs": runs,
+        "runs": runs, "paused": store.state_get(conn, "dispatch_paused"),
     }  # fmt: skip
 
 
