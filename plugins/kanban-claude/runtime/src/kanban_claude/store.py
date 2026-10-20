@@ -386,6 +386,15 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         and not (isinstance(value, list) and value and all(isinstance(a, str) for a in value))
     ):
         raise Refused("jira.mcp_command must be a non-empty list of strings (argv)")
+    if (
+        key == "notify.command"
+        and value is not None
+        and not (
+            (isinstance(value, str) and value.strip())
+            or (isinstance(value, list) and value and all(isinstance(a, str) for a in value))
+        )
+    ):
+        raise Refused("notify.command must be a command line or a non-empty list of strings (argv)")
     if key == "jira.status_map" and not (
         isinstance(value, dict)
         and all(k in STATUSES and isinstance(v, str) and v for k, v in value.items())

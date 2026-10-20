@@ -326,6 +326,17 @@ def test_wait_ci_cli_exit_codes(
         assert (got, word in out) == (code, True)
     monkeypatch.delenv("KANBAN_RUN_ID")
     assert kb("wait-ci")[0] == 5
+    assert "worker verb" in kb("wait-ci")[2]
+
+
+def test_wait_ci_cannot_find_the_pr_is_pending_not_failed(
+    conn: Any, wt: tuple[str, int], fake_gh: Callable[..., FakeGh]
+) -> None:
+    fake_gh(pr_list=[(1, "", "HTTP 502")])
+    got = ask(conn, wt[1], "wait-ci")["data"]
+    assert got["state"] == "pending" and "cannot look up the PR" in got["summary"]
+    fake_gh(pr_list=[(0, "[]", "")])
+    assert ask(conn, wt[1], "wait-ci")["exit"] == 4
 
 
 # --- block --retry-after (P1-6) -------------------------------------------------------------

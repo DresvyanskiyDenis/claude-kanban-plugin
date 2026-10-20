@@ -131,10 +131,11 @@ def _poll(gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int) ->
     raise Error(f"gh pr checks failed: {(p.stderr or p.stdout).strip()[:300]}")
 
 
-def wait_ci(repo: str, number: int) -> tuple[str, str]:
-    """(state, one line): poll the PR's checks for at most BUDGET_S. `pending` means ask again;
-    a gh error or a PR with no checks yet is pending too, since the next call may see them."""
-    deadline = time.monotonic() + BUDGET_S
+def wait_ci(repo: str, number: int, deadline: float | None = None) -> tuple[str, str]:
+    """(state, one line): poll the PR's checks until `deadline` (BUDGET_S from now). `pending`
+    means ask again; a gh error or a PR with no checks yet is pending too, since the next call may
+    see them."""
+    deadline = deadline or time.monotonic() + BUDGET_S
 
     def gh(*args: str) -> "subprocess.CompletedProcess[str]":
         left = max(1, min(30, int(deadline - time.monotonic())))
@@ -184,8 +185,18 @@ def act(conn: sqlite3.Connection, run_id: int, verb: str, args: dict[str, Any]) 
             retry_after_s=None if after is None else validate.duration(after),
         )  # fmt: skip
     if verb == "wait-ci":
-        number = args.get("pr") or t["pr_number"] or _find_pr(t)[1]
-        state, line = wait_ci(_repo(t), number)
+        deadline = time.monotonic() + BUDGET_S  # the PR lookup spends the same budget
+        try:  # the card's stored number may be an old PR (REV-01); the branch says which is open
+            number = args.get("pr") or _find_pr(t)[1]
+        except Refused:
+            raise
+        except Error as e:  # exit 1 would read as "CI failed"
+            return {
+                "state": "pending",
+                "summary": f"pending: cannot look up the PR ({e})",
+                "pr": None,
+            }
+        state, line = wait_ci(_repo(t), number, deadline)
         return {"state": state, "summary": line, "pr": number}
     if verb == "request-changes":
         return store.request_changes(conn, run_id, _text(args, "reason"))

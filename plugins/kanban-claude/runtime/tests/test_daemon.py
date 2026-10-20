@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from kanban_claude import daemon, dispatcher, housekeeping, paths, store, web
+from kanban_claude.errors import Refused
 
 Card = Callable[..., str]
 
@@ -315,3 +316,24 @@ def test_notify_failures_are_logged_and_never_fatal(
     raise_events(conn, card, "blocked")
     daemon.notify_new(conn)
     assert len(sent(env)) == 1
+
+
+def test_notify_takes_an_argv_list_and_a_junk_value_cannot_stall_it(
+    conn: Any, card: Card, env: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    daemon.notify_new(conn)
+    store.config_set(conn, "notify.command", [str(notifier(env))])
+    raise_events(conn, card, "blocked")
+    daemon.notify_new(conn)
+    assert len(sent(env)) == 1
+    for junk in (42, [], [1], "  ", {"a": 1}):
+        with pytest.raises(Refused):
+            store.config_set(conn, "notify.command", junk)
+    with store.tx(conn):  # a value that got in some other way
+        conn.execute("UPDATE config SET value = '42' WHERE key = 'notify.command'")
+    raise_events(conn, card, "blocked")
+    with caplog.at_level(logging.WARNING, logger="kanban.daemon"):
+        daemon.notify_new(conn)
+    assert "not a command" in caplog.text
+    daemon.notify_new(conn)
+    assert len(sent(env)) == 1 and "not a command" in caplog.text

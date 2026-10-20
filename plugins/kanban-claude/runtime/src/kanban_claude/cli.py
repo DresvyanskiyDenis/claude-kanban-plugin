@@ -31,7 +31,7 @@ from .procs import Procs
 
 Handler = Callable[[argparse.Namespace, sqlite3.Connection], tuple[dict[str, Any], str | None]]
 
-RUN_ONLY = {"block", "complete", "wait-ci"}
+RUN_ONLY = {"block", "complete"}
 NEEDS_DAEMON = {"create", "specify", "promote", "unblock"}
 NUDGE = NEEDS_DAEMON | {
     "assign", "reassign", "edit", "reopen", "reopen-review", "merge-retry", "mark-done", "resume",
@@ -697,6 +697,8 @@ def run_as_worker(a: argparse.Namespace) -> int:
 
 
 def owner(a: argparse.Namespace) -> int:
+    if a.verb == "wait-ci":
+        raise NotAllowed("wait-ci is a worker verb; it waits on the CI of the run's own card")
     if a.verb in RUN_ONLY:
         raise NotAllowed(
             f"{a.verb} ends a worker's run, so only a worker can use it; "

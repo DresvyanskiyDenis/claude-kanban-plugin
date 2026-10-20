@@ -103,19 +103,28 @@ def notify_new(conn: sqlite3.Connection) -> None:
     while batch := store.events_since(conn, cursor, kinds=store.ACTIONABLE_EVENTS, limit=50):
         command = store.cfg(conn, "notify.command")
         for ev in batch:
+            cursor = ev["id"]
+            with store.tx(conn):  # before send: nothing that goes wrong there may replay or stall
+                store.state_put(conn, "notify_cursor", cursor)
             if command and store.actionable(ev):
                 send(command, views.clean(views.watch_line(ev)))
-            cursor = ev["id"]
-            with store.tx(conn):
-                store.state_put(conn, "notify_cursor", cursor)
 
 
-def send(command: str, line: str) -> None:
+def argv(command: object) -> list[str]:
+    """A list is the argv as it is (the form `jira.mcp_command` takes); a string is split like a shell would."""
+    if isinstance(command, list) and command and all(isinstance(a, str) for a in command):
+        return command
+    if isinstance(command, str):
+        return shlex.split(command)
+    raise ValueError(f"not a command: {command!r}")
+
+
+def send(command: object, line: str) -> None:
     """No shell, so the event text is never shell syntax; no output pipes, so a command that leaves
     a child behind cannot hold the thread past the timeout."""
     try:
         subprocess.run(
-            shlex.split(command), input=line + "\n", text=True, stdout=subprocess.DEVNULL,
+            argv(command), input=line + "\n", text=True, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=NOTIFY_TIMEOUT_S, check=True,
         )  # fmt: skip
     except (OSError, ValueError, subprocess.SubprocessError) as e:
@@ -160,10 +169,10 @@ def serve() -> int:
         signal.signal(sig, lambda *_: signalled.append(True))
     threads = [
         threading.Thread(target=tick_loop, args=(stop, memory), name="tick", daemon=True),
+        threading.Thread(target=notify_loop, args=(stop,), name="notify", daemon=True),
         threading.Thread(
             target=housekeeping_loop, args=(stop, unprotected), name="housekeeping", daemon=True
         ),
-        threading.Thread(target=notify_loop, args=(stop,), name="notify", daemon=True),
         threading.Thread(target=board.serve_forever, name="web", daemon=True),
     ]
     for t in threads:
