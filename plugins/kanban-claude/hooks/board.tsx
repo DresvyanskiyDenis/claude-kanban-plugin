@@ -34,8 +34,9 @@ const LANES: Lane[] = [
   { key: 'next', name: 'Up next', statuses: ['ready', 'todo'], glyph: '○', color: 'suggestion', meta: c => (c.skip ? words(c.skip.reason) : (c.assignee ?? '')) },
 ]
 const DONE = { name: 'done', statuses: ['done'], color: 'success' }
-const TRIAGE = { name: 'triage', statuses: ['triage'], color: 'inactive' }
-const LEGEND = [DONE, TRIAGE]
+// Raw ideas the orchestrator has yet to shape into cards: listed after the lanes, faint, never dispatched.
+const TRIAGE: Lane = { key: 'triage', name: 'Triage', statuses: ['triage'], glyph: '◇', color: 'inactive', meta: (c, now) => ago(now - c.updated_at) }
+const LEGEND = [DONE]
 // The status bar: shipped on the left, the lanes, raw ideas on the right; archived cards stay out.
 const BAR = [DONE, ...LANES, TRIAGE]
 
@@ -544,6 +545,9 @@ export const register: Register = on => {
 
     const of = (statuses: string[]) => snap.cards.filter(c => statuses.includes(c.status))
     const lanes = LANES.map(l => ({ ...l, cards: of(l.statuses) })).filter(l => l.cards.length > 0)
+    const raw = of(TRIAGE.statuses)
+    // The list draws triage as one more lane; the card view lists it under the grid.
+    const listed = raw.length > 0 ? [...lanes, { ...TRIAGE, cards: raw }] : lanes
     const parts = BAR.map(g => ({ color: g.color, n: of(g.statuses).length }))
     const total = parts.reduce((a, p) => a + p.n, 0)
     const d = snap.digest
@@ -726,6 +730,7 @@ export const register: Register = on => {
         lift +
         (stale ? 1 : 0) +
         (needs.length === 0 ? 0 : wide ? 1 + Math.min(needs.length, 2) + (needs.length > 2 ? 1 : 0) : lift + 1 + shown.reduce((a, x) => a + 3 + (x.why ? 1 : 0) + (x.act ? 1 : 0), 0) + (needs.length > CARDS ? 1 : 0)) +
+        (raw.length > 0 ? lift + 1 : 0) +
         (!wide && merged.length > 0 ? lift + 1 + merged.length : 0)
       const tall = (k: number) =>
         groups.reduce((a, g) => a + lift + 1 + Math.max(...g.map(l => l.cards.slice(0, k).reduce((b, c) => b + 3 + lines(c).title.length, 0)), 1) + (g.some(l => l.cards.length > k) ? 1 : 0), 0)
@@ -791,6 +796,18 @@ export const register: Register = on => {
           {needs.length > CARDS && <Text dimColor italic>{`  +${needs.length - CARDS} more`}</Text>}
         </Box>
       )
+      // Triage as rows, not tiles: a raw idea is a title and its age. The lanes come first: triage keeps
+      // its header and count, and lists as many ideas as the rows the lanes leave.
+      const spare = Math.max(0, e.props.scroll.bodyRows - above - tall(room))
+      const ideas = raw.slice(0, Math.min(CARDS, spare))
+      const ideaMeta = metaWidth(width, ideas.map(c => TRIAGE.meta(c, now)))
+      const triage = raw.length > 0 && (
+        <Box flexDirection="column" marginTop={lift}>
+          {head(TRIAGE.glyph, TRIAGE.name, TRIAGE.color, raw.length, width)}
+          {ideas.map(c => row(`card:${c.id}`, c.id, width, badgeWidth(ideas), ideaMeta, { priority: c.priority, title: c.title, meta: TRIAGE.meta(c, now) }))}
+          {raw.length > ideas.length && spare > ideas.length && <Text dimColor italic>{`  +${raw.length - ideas.length} more`}</Text>}
+        </Box>
+      )
       return (
         <Box flexDirection="column" width={width}>
           {header}
@@ -811,6 +828,7 @@ export const register: Register = on => {
                 ))}
               </Box>
             ))}
+          {triage}
           {!wide && merged.length > 0 && (
             <Box flexDirection="column" marginTop={1}>
               {recent(width)}
@@ -826,7 +844,7 @@ export const register: Register = on => {
     if (wide) {
       // Inline: the lanes side by side, as many rows as the frame holds.
       const gap = 2
-      const colW = Math.floor((width - gap * Math.max(0, lanes.length - 1)) / Math.max(1, lanes.length))
+      const colW = Math.floor((width - gap * Math.max(0, listed.length - 1)) / Math.max(1, listed.length))
       const room = Math.max(1, Math.min(SHOWN, e.props.scroll.bodyRows - used - 2))
       return (
         <Box flexDirection="column" width={width}>
@@ -836,7 +854,7 @@ export const register: Register = on => {
           {strip(2, true)}
           {lanes.length === 0 && <Text dimColor>Nothing running or planned.</Text>}
           <Box flexDirection="row" gap={gap}>
-            {lanes.map(l => {
+            {listed.map(l => {
               const cs = l.cards.slice(0, room)
               const metaW = colW < 30 ? 0 : metaWidth(colW, cs.map(c => l.meta(c, now)))
               const badge = badgeWidth(cs)
@@ -855,7 +873,7 @@ export const register: Register = on => {
     }
 
     // Dock: one column, lanes as headed lists, one meta column shared by every lane.
-    const visible = lanes.flatMap(l => l.cards.slice(0, SHOWN).map(c => ({ c, meta: l.meta(c, now) })))
+    const visible = listed.flatMap(l => l.cards.slice(0, SHOWN).map(c => ({ c, meta: l.meta(c, now) })))
     const metaW = metaWidth(width, visible.map(v => v.meta))
     const badge = badgeWidth(visible.map(v => v.c))
     return (
@@ -865,7 +883,7 @@ export const register: Register = on => {
         {stale}
         {strip(3, false)}
         {lanes.length === 0 && <Text dimColor>Nothing running or planned.</Text>}
-        {lanes.map(l => (
+        {listed.map(l => (
           <Box key={l.key} flexDirection="column">
             {head(l.glyph, l.name, l.color, l.cards.length, width)}
             {l.cards.slice(0, SHOWN).map(c => row(`card:${c.id}`, c.id, width, badge, metaW, { priority: c.priority, title: c.title, meta: l.meta(c, now) }))}
