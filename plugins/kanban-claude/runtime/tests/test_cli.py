@@ -329,3 +329,28 @@ def test_a_corrupt_database_is_a_clean_error(kb: Kb, env: Path) -> None:
     db.write_bytes(b"this is not a database\n" * 64)
     code, _, err = kb("list")
     assert code == 1 and "database" in err and "Traceback" not in err
+
+
+def test_touches_flag_repeats_and_edit_clears_it(
+    kb: Kb, workdirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_BOARD", "alpha")
+    code, out, err = kb(
+        "create", "T", "--body", "b", "--assignee", "smith", "--touches", "docs/**",
+        "--touches", "README.md", "--json",
+    )  # fmt: skip
+    assert code == 0, err
+    tid = json.loads(out)["id"]
+    shown = kb("show", tid)[1]
+    assert "touches: docs/**, README.md" in shown
+    assert kb("edit", tid, "--touches", "")[0] == 0
+    assert "touches:" not in kb("show", tid)[1]
+    assert json.loads(kb("show", tid, "--json")[1])["task"]["touches"] is None
+
+
+def test_create_scratch_with_a_branch_names_the_fix(
+    kb: Kb, workdirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_BOARD", "alpha")
+    code, _, err = kb("create", "T", "--body", "b", "--assignee", "smith", "--branch", "feat/x")
+    assert code == 4 and "--workspace worktree:<repo>" in err

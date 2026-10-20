@@ -1,9 +1,11 @@
 """The dispatcher's tick policy (DSP-02..08): reconcile, promote, order and claim."""
 
 import contextlib
+import json
 import logging
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +104,38 @@ def promote(conn: sqlite3.Connection) -> list[str]:
     return promoted
 
 
+def touches_overlap(a: Iterable[str], b: Iterable[str]) -> bool:
+    """Can a glob of `a` and a glob of `b` match a common path?
+
+    shortcut: one glob matching the other as a string, equality, or a directory prefix; two globs
+    that both wildcard (`src/a*`, `src/*b`) are missed, upgrade to a real intersection check if
+    that bites. `fnmatch`'s `*` crosses `/`, so the error leans toward "overlaps".
+    """
+    b = list(b)
+
+    def within(x: str, y: str) -> bool:
+        return x == y or fnmatchcase(x, y) or x.startswith(y.rstrip("/") + "/")
+
+    return any(within(x, y) or within(y, x) for x in a for y in b)
+
+
+def overlapping(t: Row, others: Iterable[Row]) -> str | None:
+    """P1-2: the id of the first card in `others` that edits the same repo's files as `t`.
+    A card without `touches` is unknown: it neither waits nor makes others wait. A review run
+    edits nothing, so it is exempt on both sides."""
+    if t["touches"] is None or t["status"] == "review":
+        return None
+    mine = json.loads(t["touches"])
+    for o in others:
+        if (
+            o["id"] != t["id"] and o["touches"] is not None and o["status"] != "review"
+            and o["workspace_path"] == t["workspace_path"]
+            and touches_overlap(mine, json.loads(o["touches"]))
+        ):  # fmt: skip
+            return str(o["id"])
+    return None
+
+
 def skip_reason(
     conn: sqlite3.Connection, t: Row, ts: int, procs: Procs, roles: list[str], reviewer: str
 ) -> str | None:
@@ -144,6 +178,13 @@ def skip_reason(
             return "workspace_invalid"
         if not Path(t["workspace_path"]).is_dir():
             return "workspace_invalid"
+    if t["touches"] is not None:
+        building = conn.execute(
+            "SELECT k.* FROM tasks k JOIN task_runs r ON r.task_id = k.id "
+            "WHERE r.status = 'running' AND r.kind = 'work'"
+        ).fetchall()
+        if other := overlapping(t, building):
+            return f"overlaps:{other}"
     return None
 
 
@@ -246,7 +287,12 @@ def dispatch_once(
             ready.append(t)
     running = conn.execute("SELECT COUNT(*) FROM task_runs WHERE status = 'running'").fetchone()[0]
     report["slots"] = store.cfg(conn, "dispatch.max_in_progress") - running
-    chosen = order(ready, report["slots"])
+    chosen: list[Row] = []
+    for t in order(ready, report["slots"]):
+        if other := overlapping(t, chosen):  # two ready cards that overlap start one at a time
+            report["skipped"][t["id"]] = f"overlaps:{other}"
+        else:
+            chosen.append(t)
     if dry_run:
         report["claimed"] = [{"id": t["id"]} for t in chosen]
         return report

@@ -79,3 +79,9 @@ def test_watch_line_shape(conn: Any, card: Card) -> None:
     ev = store.events_since(conn, 0)[-1]
     line = views.watch_line(ev)
     assert f" {tid} {ev['kind']}" in line and line.startswith("[")
+
+
+def test_show_text_prints_the_touches_only_when_set(conn: Any, card: Card) -> None:
+    plain, scoped = card("plain"), card("scoped", touches=["docs/**", "*.md"])
+    assert "touches" not in views.show_text(views.show_data(conn, plain))
+    assert "touches: docs/**, *.md" in views.show_text(views.show_data(conn, scoped))

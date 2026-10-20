@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -225,8 +226,10 @@ def test_s1_review_approval_complete(conn: Any, card: Card) -> None:
     assert "awaiting_owner_merge" in kinds(conn, tid)
 
 
-def test_review_approval_into_non_default_base_sets_merge_pending(conn: Any, card: Card) -> None:
-    tid = card(branch="feature/x", base="feature/base")
+def test_review_approval_into_non_default_base_sets_merge_pending(
+    conn: Any, card: Card, repo: Path
+) -> None:
+    tid = card(workspace=f"worktree:{repo}", branch="feature/x", base="feature/base")
     run = claim_run(conn, tid)
     review_request(conn, run)
     run2 = claim_run(conn, tid)
@@ -724,3 +727,187 @@ def test_no_sandbox_settings_remain(conn: Any) -> None:
     for key in ("worker.disabled_plugins", "worker.allowed_domains", "worker.allow_write"):
         with pytest.raises(Refused):
             store.config_set(conn, key, [])
+
+
+def unmerged_parent_and_child(conn: Any, card: Card) -> tuple[str, str]:
+    parent, child = card("p"), card("c")
+    store.link(conn, parent, child)
+    store.complete(conn, claim_run(conn, parent), "ok")
+    conn.execute("UPDATE tasks SET merge_state = 'pending' WHERE id = ?", (parent,))
+    return parent, child
+
+
+def test_promote_ignore_merge_survives_to_the_claim(conn: Any, card: Card) -> None:
+    _, child = unmerged_parent_and_child(conn, card)
+    store.promote(conn, child, "r", ignore_merge=True)
+    assert row(conn, child)["ignore_merge"] == 1
+    assert store.claim(conn, child), "the claim must honour the waiver the promote recorded"
+    assert "claim_rejected" not in kinds(conn, child)
+
+
+def test_promote_without_the_flag_leaves_the_claim_strict(conn: Any, card: Card) -> None:
+    _, child = unmerged_parent_and_child(conn, card)
+    with pytest.raises(Refused):
+        store.promote(conn, child, "r")
+    assert row(conn, child)["ignore_merge"] == 0
+
+
+def test_promote_auto_honours_the_waiver(conn: Any, card: Card) -> None:
+    _, child = unmerged_parent_and_child(conn, card)
+    assert not store.promote_auto(conn, child)
+    conn.execute("UPDATE tasks SET ignore_merge = 1 WHERE id = ?", (child,))
+    assert store.promote_auto(conn, child)
+
+
+def test_reopen_and_hold_clear_the_waiver(conn: Any, card: Card) -> None:
+    _, child = unmerged_parent_and_child(conn, card)
+    store.promote(conn, child, "r", ignore_merge=True)
+    store.complete(conn, claim_run(conn, child), "ok")
+    store.reopen(conn, child, "again")
+    assert row(conn, child)["ignore_merge"] == 0
+    assert store.claim(conn, child) is None, "a reopened card waits for its merged parent again"
+    assert status(conn, child) == "todo"
+    store.promote(conn, child, "r", ignore_merge=True)
+    store.hold(conn, child, "r")
+    assert row(conn, child)["ignore_merge"] == 0
+
+
+def test_scratch_card_with_a_branch_is_refused(conn: Any, card: Card, repo: Path) -> None:
+    with pytest.raises(Refused, match="--workspace worktree"):
+        card(branch="feat/x")
+    with pytest.raises(Refused, match="--workspace worktree"):
+        card(workspace=None, branch="feat/x")
+    assert card(triage=True, branch="feat/x"), (
+        "a triage card may name the branch before its workspace"
+    )
+
+
+def test_base_defaults_to_the_only_worktree_parent_base(conn: Any, board: str, repo: Path) -> None:
+    store.board_create(conn, "wt", default_workdir=str(repo))
+    ws = f"worktree:{repo}"
+
+    def make(**kw: Any) -> str:
+        kw.setdefault("workspace", ws)
+        return str(store.create(conn, "wt", "c", body="b", assignee="smith", **kw)["id"])
+
+    parent = make(branch="feat/p", base="release/1")
+    scratch = str(store.create(conn, "wt", "s", body="b", assignee="smith")["id"])
+    child = make(branch="feat/c", parents=[parent, scratch])
+    assert row(conn, child)["base_branch"] == "release/1"
+    explicit = make(branch="feat/d", base="main", parents=[parent])
+    assert row(conn, explicit)["base_branch"] == "main"
+    other = make(branch="feat/e", base="release/2")
+    two = make(branch="feat/f", parents=[parent, other])
+    assert row(conn, two)["base_branch"] is None, "two worktree parents: no guess"
+
+
+def test_touches_are_stored_as_a_json_list_and_edit_can_clear_them(conn: Any, card: Card) -> None:
+    tid = card(touches=["docs/**", "README.md"])
+    assert json.loads(row(conn, tid)["touches"]) == ["docs/**", "README.md"]
+    assert row(conn, card())["touches"] is None
+    store.edit(conn, tid, {"touches": ["src/*.py"]})
+    assert json.loads(row(conn, tid)["touches"]) == ["src/*.py"]
+    store.edit(conn, tid, {"touches": [""]})
+    assert row(conn, tid)["touches"] is None
+    for bad in ("docs/**", [3], [" "]):
+        with pytest.raises(Refused, match="touches"):
+            store.edit(conn, tid, {"touches": bad})
+
+
+def spend(conn: Any, tid: str, usd: float, *, started_at: int | None = None) -> None:
+    """A finished run on the card that cost `usd`, then back to ready."""
+    run = claim_run(conn, tid)
+    store.block(conn, run, "needs_input", "why")
+    conn.execute(
+        "UPDATE task_runs SET cost_usd = ?, started_at = ? WHERE id = ?",
+        (usd, started_at or store.now(), run),
+    )
+    store.unblock(conn, tid, "go")
+
+
+def test_card_cap_blocks_the_claim_with_the_numbers_and_the_key(conn: Any, card: Card) -> None:
+    tid = card()
+    spend(conn, tid, 16.5)
+    assert store.claim(conn, tid) is None
+    t = row(conn, tid)
+    assert (t["status"], t["block_kind"]) == ("blocked", "capability")
+    said = conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (tid,)).fetchall()
+    msg = said[-1]["body"]
+    assert "$16.50" in msg and "$15.00" in msg and "budget.max_usd_per_card" in msg
+    assert "blocked" in kinds(conn, tid)
+
+
+def test_card_cap_under_the_limit_claims(conn: Any, card: Card) -> None:
+    tid = card()
+    spend(conn, tid, 14.0)
+    assert store.claim(conn, tid)
+
+
+def test_card_cap_raised_or_off_lets_the_card_run(conn: Any, card: Card) -> None:
+    tid = card()
+    spend(conn, tid, 20.0)
+    assert store.claim(conn, tid) is None
+    store.config_set(conn, "budget.max_usd_per_card", 25)
+    store.unblock(conn, tid, "raised")
+    assert store.claim(conn, tid)
+    other = card("other")
+    spend(conn, other, 99.0)
+    store.config_set(conn, "budget.max_usd_per_card", 0)
+    assert store.claim(conn, other), "0 turns the per-card cap off"
+
+
+def test_board_day_cap_counts_only_today_on_this_board(
+    conn: Any, board: str, card: Card, repo: Path
+) -> None:
+    store.config_set(conn, "budget.max_usd_per_board_day", 75)
+    old, today, fresh = card("old"), card("today"), card("fresh")
+    spend(conn, old, 14.0, started_at=store.now() - 3 * 86400)
+    spend(conn, today, 14.0)
+    assert store.claim(conn, fresh), (
+        "$14 today is under the $75 cap; yesterday's spend is not counted"
+    )
+    store.complete(conn, _running(conn, fresh), "ok")
+    for i in range(5):
+        spend(conn, card(f"burn{i}"), 14.0)
+    late = card("late")
+    assert store.claim(conn, late) is None
+    t = row(conn, late)
+    assert (t["status"], t["block_kind"]) == ("blocked", "capability")
+    msg = conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (late,)).fetchone()[0]
+    assert "budget.max_usd_per_board_day" in msg and "$75.00" in msg and "$84.00" in msg
+    store.board_create(conn, "other", default_workdir=str(repo))
+    elsewhere = str(store.create(conn, "other", "e", body="b", assignee="smith")["id"])
+    assert store.claim(conn, elsewhere), "another board's spend does not count"
+
+
+def _running(conn: Any, tid: str) -> int:
+    return int(
+        conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? AND status = 'running'", (tid,)
+        ).fetchone()[0]
+    )
+
+
+@pytest.mark.parametrize("off", [None, 0])
+def test_board_day_cap_off_states(conn: Any, card: Card, off: Any) -> None:
+    store.config_set(conn, "budget.max_usd_per_board_day", 10)
+    store.config_set(conn, "budget.max_usd_per_board_day", off)
+    tid = card()
+    spend(conn, tid, 14.0)
+    assert store.claim(conn, tid)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("budget.max_usd_per_board_day", "lots"),
+        ("budget.max_usd_per_board_day", True),
+        ("budget.max_usd_per_board_day", -1),
+        ("budget.max_usd_per_card", "lots"),
+        ("budget.max_usd_per_card", -1),
+        ("budget.max_usd_per_card", None),
+    ],
+)
+def test_budget_caps_refuse_non_numbers_and_negatives(conn: Any, key: str, value: Any) -> None:
+    with pytest.raises(Refused, match=key):
+        store.config_set(conn, key, value)

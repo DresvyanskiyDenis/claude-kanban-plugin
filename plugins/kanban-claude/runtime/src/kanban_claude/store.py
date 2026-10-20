@@ -381,6 +381,12 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
     if key == "budget.ceiling" and value <= 0:
         raise Refused("budget.ceiling must be positive")
     if (
+        key in ("budget.max_usd_per_card", "budget.max_usd_per_board_day")
+        and value is not None
+        and (type(value) not in (int, float) or value < 0)
+    ):
+        raise Refused(f"{key} must be a number of dollars, 0 for off (board_day: or null)")
+    if (
         key == "jira.mcp_command"
         and value is not None
         and not (isinstance(value, list) and value and all(isinstance(a, str) for a in value))
@@ -500,9 +506,14 @@ def _all_done(conn: sqlite3.Connection, parent_ids: Sequence[str], ignore_merge:
 def parents_satisfied(
     conn: sqlite3.Connection, task_id: str, *, ignore_merge: bool = False
 ) -> bool:
-    """STO-09: every parent is done or archived, and merged unless `ignore_merge` waives that."""
+    """STO-09: every parent is done or archived, and merged unless `ignore_merge` or the card's own
+    waiver (a promote with --ignore-merge) says otherwise. Reading the waiver here reaches every caller."""
     q = "SELECT parent_id FROM task_links WHERE child_id = ?"
-    return _all_done(conn, [r[0] for r in conn.execute(q, (task_id,))], ignore_merge)
+    parents = [r[0] for r in conn.execute(q, (task_id,))]
+    if not parents:
+        return True
+    waived = conn.execute("SELECT ignore_merge FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return _all_done(conn, parents, ignore_merge or bool(waived and waived[0]))
 
 
 def _cas(
@@ -673,6 +684,7 @@ FIELD_COLUMNS = {
     "model": "model_override",
     "effort": "reasoning_effort",
     "budget": "budget_usd",
+    "touches": "touches",
 }
 
 
@@ -728,6 +740,8 @@ def _columns(conn: sqlite3.Connection, fields: dict[str, Any], board: Row) -> di
             raise Refused(f"max-retries {v!r} must be a positive integer")
         elif key == "skills":
             v = dumps(validate.skills(v))
+        elif key == "touches":
+            v = None if v is None or list(v) == [""] else dumps(validate.touches(v))
         elif key == "model" and v is not None:
             validate.model(v)
         elif key == "effort" and v is not None:
@@ -755,6 +769,11 @@ def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> No
         )
     kind = t["workspace_kind"]
     if kind == "scratch":
+        if t["branch_name"]:
+            raise Refused(
+                "a scratch card has no repo, so --branch cannot apply; "
+                "pass --workspace worktree:<repo> with it, or drop --branch"
+            )
         return
     validate.workspace(kind, t["workspace_path"], claude_dirs=claude_dirs(conn, board))
     if kind == "worktree":
@@ -796,6 +815,7 @@ def create(
     triage: bool = False,
     grants: Sequence[str] = (),
     approved: str | None = None,
+    touches: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     if grants:
         approved = _check_grant(grants, approved)
@@ -809,7 +829,7 @@ def create(
     given: dict[str, Any] = {
         "title": title, "body": body, "assignee": assignee, "priority": priority,
         "branch": branch, "base": base, "max_retries": max_retries, "skills": list(skills),
-        "model": model, "effort": effort, "budget": budget,
+        "model": model, "effort": effort, "budget": budget, "touches": touches,
     }  # fmt: skip
     if max_runtime is not None:
         given["max_runtime"] = max_runtime
@@ -820,6 +840,13 @@ def create(
     cols.setdefault("workspace_kind", "scratch")
     if cols["workspace_kind"] == "scratch":
         cols["workspace_path"] = str(dirs().work / "scratch" / tid)
+    elif cols["workspace_kind"] == "worktree" and "base_branch" not in cols:
+        same_repo = [
+            pt for pt in (get_task(conn, p) for p in parents)
+            if pt["workspace_kind"] == "worktree" and pt["workspace_path"] == cols["workspace_path"]
+        ]  # fmt: skip
+        if len(same_repo) == 1 and same_repo[0]["base_branch"]:
+            cols["base_branch"] = same_repo[0]["base_branch"]
     cols.setdefault("max_runtime_seconds", None if triage else role_runtime(conn, assignee))
     row = {**_EMPTY_CARD, **cols, "id": tid, "board": board, "assignee": assignee}
     if not triage:
@@ -999,7 +1026,10 @@ def promote(
                 f"card {task_id} still has an open parent; finish it, unlink it, "
                 "or for a stuck merge pass --ignore-merge"
             )
-        _cas(conn, task_id, ["todo"], version=expect_version, status="ready", retry_after=None)
+        _cas(
+            conn, task_id, ["todo"], version=expect_version, status="ready", retry_after=None,
+            ignore_merge=int(ignore_merge),
+        )  # fmt: skip
         event(
             conn,
             t,
@@ -1032,7 +1062,10 @@ def hold(
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         t = get_task(conn, task_id)
-        _cas(conn, task_id, ["todo", "ready", "blocked"], version=expect_version, status="triage")
+        _cas(
+            conn, task_id, ["todo", "ready", "blocked"], version=expect_version, status="triage",
+            ignore_merge=0,
+        )  # fmt: skip
         event(conn, t, "held", actor, {"reason": reason, "from": t["status"]})
     return {"id": task_id, "status": "triage"}
 
@@ -1121,7 +1154,7 @@ def reopen(
         _cas(
             conn, task_id, expected, version=expect_version, status=status, completed_at=None,
             merge_state=None, merge_attempts=0, merge_next_at=None, merged_at=None,
-            retry_after=None, assignee=t["implementer"] or t["assignee"],
+            retry_after=None, assignee=t["implementer"] or t["assignee"], ignore_merge=0,
         )  # fmt: skip
         if actor != "jira":  # jira.py pushes owner comments to the issue it just reopened from
             _comment(conn, t, "owner", f"REOPEN: {reason}", actor)
@@ -1407,6 +1440,33 @@ def _running_run(conn: sqlite3.Connection, task_id: str) -> Row:
     return run  # type: ignore[no-any-return]
 
 
+_CARD_SPEND = "SELECT COALESCE(SUM(cost_usd), 0) FROM task_runs WHERE task_id = ?"
+_DAY_SPEND = (
+    "SELECT COALESCE(SUM(r.cost_usd), 0) FROM task_runs r JOIN tasks k ON k.id = r.task_id "
+    "WHERE k.board = ? AND date(r.started_at, 'unixepoch', 'localtime') = date(?, 'unixepoch', 'localtime')"
+)
+
+
+def _over_budget(conn: sqlite3.Connection, t: Row) -> str | None:
+    """P2-4: why a claim must not start, once the card's spend or the board's spend today passes its
+    cap. A cap of 0 or None is off. The day is the local one, as in `stats` (`cost_by_day`)."""
+    caps = (
+        ("budget.max_usd_per_card", f"card {t['id']}", _CARD_SPEND, (t["id"],)),
+        (
+            "budget.max_usd_per_board_day",
+            f"board {t['board']} today",
+            _DAY_SPEND,
+            (t["board"], now()),
+        ),
+    )
+    for key, what, sql, args in caps:
+        cap = cfg(conn, key)
+        if cap and (used := conn.execute(sql, args).fetchone()[0]) > cap:
+            fix = f'kanban config set {key} <usd> (0 turns the cap off), then kanban unblock {t["id"]} --reason "cap raised"'
+            return f"{what} has spent ${used:.2f}, over {key} ${cap:.2f}; raise it with: {fix}"
+    return None
+
+
 def claim(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1424,6 +1484,11 @@ def claim(
             if source == "ready" and not parents_satisfied(conn, task_id):
                 _cas(conn, task_id, ["ready"], status="todo")
                 event(conn, t, "claim_rejected", actor, {"reason": "parents_not_done"})
+                return None
+            if over := _over_budget(conn, t):
+                _cas(conn, task_id, [source], status="blocked", block_kind="capability")
+                _comment(conn, t, "kanban", f"BLOCKED: {over}", actor)
+                event(conn, t, "blocked", actor, {"kind": "capability", "recurrences": 0})
                 return None
             _cas(conn, task_id, [source], status="running", started_at=t["started_at"] or now())
             n = conn.execute(
