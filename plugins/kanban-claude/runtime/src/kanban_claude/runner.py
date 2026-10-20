@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import queue
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -53,8 +54,35 @@ HELPERS = {
     "scout": "card-helper",
     "warden": "review-helper",
 }
-NO_FILE_WRITES = {"warden": ("Edit", "Write"), "atlassian": ("Edit", "Write"), "scout": ("Edit",)}
+# the floor under `tools.<role>`: a config list cannot give these roles a file writer
+NO_FILE_WRITES = {
+    "warden": ("Edit", "Write", "NotebookEdit"),
+    "atlassian": ("Edit", "Write", "NotebookEdit"),
+    "scout": ("Edit", "NotebookEdit"),
+}
 ROLE_SERVERS = {"atlassian": ("atlassian",)}
+# mcp-atlassian enforces ENABLED_TOOLS when it lists and when it calls a tool
+ATLASSIAN_TOOLS = (
+    "jira_get_issue", "jira_search", "jira_get_transitions", "jira_get_project_issues",
+    "jira_get_all_projects", "jira_get_link_types", "confluence_search", "confluence_get_page",
+    "confluence_get_comments", "jira_create_issue", "jira_update_issue", "jira_add_comment",
+    "jira_transition_issue", "jira_create_issue_link", "confluence_create_page",
+    "confluence_update_page", "confluence_add_comment",
+)  # fmt: skip
+# D1: an allowlist of one, so an agent type the deny list does not name (a user agent) stays out;
+# agent_id is set only inside a subagent, and a helper inherits the role's Agent tool
+# A PreToolUse hook that exits 1 lets the tool run, so any failure to read the event blocks (exit 2).
+SPAWN_GUARD = """import json, sys
+a = sys.argv[1]
+try:
+    e = json.load(sys.stdin)
+    ok = bool(a) and e["tool_input"]["subagent_type"] == a and "agent_id" not in e
+except Exception:
+    ok = False
+if not ok:
+    print("kanban: only the role spawns, and only " + (a or "no subagent"), file=sys.stderr)
+    sys.exit(2)
+"""
 EOF = object()
 Row = sqlite3.Row
 
@@ -121,7 +149,14 @@ def settings_json(
         "Bash(kanban grant:*)", f"Edit(/{home}/**)", *role_denies(role),
     ]  # fmt: skip
     plugins = off or {"cc-plugin-you-should-know@builtin": False}
-    return json.dumps({"permissions": {"deny": deny, "allow": rules}, "enabledPlugins": plugins})
+    helper = f"{OWN_PLUGIN}:{HELPERS[role]}" if role in HELPERS else ""
+    guard = shlex.join([sys.executable, "-c", SPAWN_GUARD, helper])
+    hooks = {
+        "PreToolUse": [{"matcher": "Agent|Task", "hooks": [{"type": "command", "command": guard}]}]
+    }
+    return json.dumps(
+        {"permissions": {"deny": deny, "allow": rules}, "enabledPlugins": plugins, "hooks": hooks}
+    )
 
 
 def mcp_config(
@@ -137,11 +172,15 @@ def mcp_config(
     )  # fmt: skip
     # a repo's .mcp.json is untrusted: it supplies only a name the account does not define
     known = {**json_section(workspace / ".mcp.json", "mcpServers"), **user}
-    servers = {
-        n: known[n]
-        for n in (*store.cfg(conn, "worker.mcp_allowlist"), *ROLE_SERVERS.get(role, ()))
-        if n in known
-    }
+    # a role's own server is its alone, and such a role gets nothing else
+    owned = {s for names in ROLE_SERVERS.values() for s in names}
+    shared = [n for n in store.cfg(conn, "worker.mcp_allowlist") if n not in owned]
+    allowed = [] if role in ROLE_SERVERS else shared
+    servers = {n: known[n] for n in (*allowed, *ROLE_SERVERS.get(role, ())) if n in known}
+    if "atlassian" in servers:
+        entry = servers["atlassian"]
+        env = {**entry.get("env", {}), "ENABLED_TOOLS": ",".join(ATLASSIAN_TOOLS)}
+        servers["atlassian"] = {**entry, "env": env}
     return {"mcpServers": {**servers, **json_section(MCP_DIR / f"{role}.json", "mcpServers")}}
 
 
@@ -255,7 +294,7 @@ def build_prompt(
 
 def build_argv(
     claude: str, prompt: str, role: str, task: str, model: str, effort: str, settings: str,
-    budget: float, turns: int | None, sid: str, resumed: bool, mcp: str,
+    budget: float, turns: int | None, sid: str, resumed: bool, mcp: str, tools: list[str],
 ) -> list[str]:  # fmt: skip
     argv = [
         claude, "-p", prompt, "--agent", f"{OWN_PLUGIN}:{role}", "--model", model,
@@ -263,6 +302,7 @@ def build_argv(
         "--settings", settings, "--strict-mcp-config", "--mcp-config", mcp,
         "--output-format", "stream-json", "--verbose", "--no-chrome",
         "--name", f"kanban {task} {role}", "--max-budget-usd", f"{budget:g}",
+        "--tools", ",".join(tools),
     ]  # fmt: skip
     if turns:
         argv += ["--max-turns", str(turns)]
@@ -420,6 +460,7 @@ class Runner:
             model, effort,
             settings_json(dirs().home, rules, run["role"], plugins_off(self.conn, self.config_dir)),
             budget, store.cfg(self.conn, "worker.max_turns"), sid, resumed, str(mcp),
+            store.cfg(self.conn, f"tools.{run['role']}"),
         )  # fmt: skip
         with store.tx(self.conn):
             self.conn.execute(

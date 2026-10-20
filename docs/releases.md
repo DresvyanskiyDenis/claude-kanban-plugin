@@ -4,6 +4,7 @@ Every version, dev or stable, adds one explain-diff page under `docs/explanation
 
 | Version | Channel | Date | Highlights | What changed |
 |---|---|---|---|---|
+| 0.2.0.dev9 | dev | 2026-10-20 | The runner forms each dispatched role's tool list from the new `tools.<role>` config keys (`--tools`); a PreToolUse hook limits spawning to a role's own helper; the atlassian role gets only its own MCP server with `ENABLED_TOOLS` | [explainer](explanations/2026-10-20-v0.2.0.dev9.html), [CHANGELOG](../plugins/kanban-claude/CHANGELOG.md) |
 | 0.2.0.dev8 | dev | 2026-10-20 | Web board removed; worker isolation, budget caps, `watch --actionable --wait`, `notify.command`, `wait-ci`, partial-review owner merges, schema v5; reworked `/kanban-board` pane | [explainer](explanations/2026-10-20-v0.2.0.dev8.html), [CHANGELOG](../plugins/kanban-claude/CHANGELOG.md) |
 
 ## Cut a release

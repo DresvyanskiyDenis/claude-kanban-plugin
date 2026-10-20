@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0.dev9
+
+### Changed
+
+- The runner, not the agent file, forms each dispatched role's tool list. New config keys `tools.smith`, `tools.designer`, `tools.scout`, `tools.warden` and `tools.atlassian` hold the built-in tools passed as `--tools`, so `kanban config set tools.<role> '[...]'` makes a list longer or shorter without editing an agent. The dispatched roles' agent files now say `tools: "*"`. Whatever the list says, warden and atlassian are still denied Edit, Write and NotebookEdit, and scout Edit.
+- A PreToolUse hook in each run's settings lets a role start only its own helper (`card-helper` for smith, designer and scout, `review-helper` for warden) and a helper start nothing; `--tools` cannot name an `Agent(type)`, so the old per-type grant moved here. The hook blocks the spawn when it cannot read its input, because a PreToolUse hook that crashes lets the tool run.
+- The atlassian role gets only its own MCP server, not `worker.mcp_allowlist`, and that server starts with `ENABLED_TOOLS` naming its nine read and eight write tools instead of the agent file listing them.
+
 ## 0.2.0.dev8
 
 ### Removed

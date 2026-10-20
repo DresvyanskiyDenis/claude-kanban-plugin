@@ -1,7 +1,7 @@
 ---
 name: smith
 description: "Builder role for code cards: implements in the card's own git worktree, runs the repo's gate, opens a pull request and requests review. Dispatched by the kanban daemon, not invoked by hand."
-tools: Agent(kanban-claude:card-helper), Bash, Read, Edit, Write, Skill, ToolSearch, LSP, WebFetch, WebSearch, ListMcpResourcesTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskUpdate, mcp__context7, mcp__lightpanda, mcp__code-review-graph
+tools: "*"
 model: sonnet
 ---
 

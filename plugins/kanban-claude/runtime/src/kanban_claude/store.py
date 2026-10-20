@@ -190,6 +190,18 @@ DEFAULTS: dict[str, Any] = {
     "runtime.designer": 7200,
     "runtime.warden": 2700,
     "runtime.atlassian": 900,
+    # D1: the built-in tools each role's `claude -p` gets (`--tools`); agent files say tools: "*"
+    "tools.smith": ["Agent", "Bash", "Read", "Edit", "Write", "Skill", "ToolSearch", "LSP", "WebFetch",
+                    "WebSearch", "ListMcpResourcesTool", "ReadMcpResourceTool", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate"],
+    "tools.designer": ["Agent", "Bash", "Read", "Edit", "Write", "Skill", "ToolSearch", "LSP",
+                       "WebFetch", "WebSearch", "ListMcpResourcesTool", "ReadMcpResourceTool",
+                       "TaskCreate", "TaskGet", "TaskList", "TaskUpdate"],
+    "tools.scout": ["Agent", "Bash", "Read", "Write", "Skill", "ToolSearch", "LSP", "WebFetch",
+                    "WebSearch", "ListMcpResourcesTool", "ReadMcpResourceTool", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate"],
+    "tools.warden": ["Agent", "Bash", "Read", "Skill", "ToolSearch", "LSP", "WebFetch", "WebSearch",
+                     "ListMcpResourcesTool", "ReadMcpResourceTool", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate"],
+    "tools.atlassian": ["Bash", "Read", "Skill", "ToolSearch", "ListMcpResourcesTool",
+                        "ReadMcpResourceTool"],
     "budget.max_usd_per_run": 30,
     "budget.ceiling": 100,
     "budget.max_usd_per_card": 15.0,
@@ -361,6 +373,8 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         ok_number = isinstance(default, float) and type(value) is int
         if not ok_number:
             raise Refused(f"{key} must be {type(default).__name__}, got {value!r}")
+    if key.startswith("tools.") and not all(isinstance(t, str) for t in value):
+        raise Refused(f"{key} must be a list of tool names, got {value!r}")
     if value is not None and key.startswith("effort."):
         validate.effort(value)
     if value is not None and key.startswith("models."):
