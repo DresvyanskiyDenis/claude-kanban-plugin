@@ -1,5 +1,6 @@
 """TST-L: board resolution (L1), worker-mode gating (L2), show --json (L3), watch replay (L4)."""
 
+import argparse
 import fcntl
 import io
 import json
@@ -12,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import store
+from kanban_claude import cli, store
 
 from .conftest import Kb, git
 
@@ -329,3 +330,35 @@ def test_a_corrupt_database_is_a_clean_error(kb: Kb, env: Path) -> None:
     db.write_bytes(b"this is not a database\n" * 64)
     code, _, err = kb("list")
     assert code == 1 and "database" in err and "Traceback" not in err
+
+
+def test_help_lists_every_verb_with_a_line_and_comment_names_stdin(kb: Kb) -> None:
+    verbs = next(
+        a.choices for a in cli.build()._actions if isinstance(a, argparse._SubParsersAction)
+    )
+    listed = {ln.split()[0]: ln for ln in kb("--help")[1].splitlines() if ln.startswith("    ")}
+    assert {v for v in verbs if v != "board"} <= {
+        v for v, ln in listed.items() if len(ln.split()) > 1
+    }
+    assert "stdin" in listed["comment"] and "stdin" in kb("comment", "--help")[1]
+
+
+def test_digest_and_followups_verbs(
+    kb: Kb, workdirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_BOARD", "alpha")
+    tid = json.loads(kb("create", "T", "--body", "b", "--assignee", "smith", "--json")[1])["id"]
+    kb("comment", tid, "FOLLOW-UP: tidy the flags", "--author", "warden")
+    assert "Needs you: 0" in kb("digest")[1]
+    assert json.loads(kb("digest", "--since", "30m", "--json")[1])["needs_you"] == []
+    assert kb("digest", "--since", "soon")[0] == 4
+    assert "warden" in kb("followups", "--since", "1h")[1]
+    assert json.loads(kb("followups", "--json")[1])["followups"][0]["text"] == "tidy the flags"
+
+
+def test_stats_reports_account_walls_and_pauses(kb: Kb, workdirs: tuple[Path, Path]) -> None:
+    conn = store.connect()
+    store.account_set(conn, "/acct", hard_until=store.now() + 600)
+    conn.close()
+    accounts = json.loads(kb("stats", "--json")[1])["accounts"]
+    assert accounts[0]["config_dir"] == "/acct" and accounts[0]["wall_until"]

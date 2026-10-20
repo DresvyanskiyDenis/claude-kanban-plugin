@@ -21,6 +21,7 @@ from . import (
     jira,
     runner,
     store,
+    validate,
     views,
     web,
     worker,
@@ -68,6 +69,60 @@ def _reasoned(fn: Callable[..., dict[str, Any]]) -> Handler:
     return plain(lambda a, conn: fn(conn, a.id, a.reason))
 
 
+# One line per verb for `kanban --help`. Looked up by name where the subparsers are created, so a verb
+# missing here only lacks its line.
+VERB_HELP = {
+    "show": "show a card with its comments, runs and events",
+    "context": "print the markdown a run reads: body, prior attempts, comments, grants",
+    "comment": "add a comment; TEXT of - reads the body from stdin",
+    "attach": "copy a file next to a card",
+    "block": "end the run: blocked on input, a capability or a transient failure",
+    "complete": "end the run: the work is done",
+    "request-review": "end the run: the PR is ready, hand it to the reviewer",
+    "request-changes": "send a reviewed card back to its builder with the reasons",
+    "wait-ci": "wait up to 9 minutes for the PR checks; exit 0 pass, 1 fail, 2 pending",
+    "boards": "list, create, edit or archive boards",
+    "jira": "import, link, unlink or sync Jira issues",
+    "create": "create a card",
+    "specify": "fill in a triage card and start it",
+    "list": "list the board's cards and why each waits",
+    "edit": "change a card's text and settings",
+    "assign": "give a card to a role",
+    "reassign": "move a card to another role",
+    "promote": "move a waiting card to ready",
+    "hold": "park a card in triage",
+    "unblock": "send a blocked card back to work or review",
+    "reopen-review": "send a card in review back to its builder",
+    "reopen": "reopen a done card for its builder",
+    "mark-done": "close a card in review or blocked as done",
+    "link": "make PARENT a dependency of CHILD",
+    "unlink": "remove a dependency",
+    "stop": "end a running card's run",
+    "dispatch": "run one dispatcher tick; --dry-run only shows it",
+    "daemon": "run the dispatcher and housekeeping",
+    "run": "run one worker run (started by the daemon)",
+    "snapshot": "print the path of a fresh checkout of a repo's origin",
+    "archive": "hide a card; --rm --yes deletes it",
+    "merge-retry": "try a failed merge again",
+    "grant": "approve exact commands for a card, or revoke them",
+    "grants": "list a card's grants",
+    "watch": "print board events; --follow keeps going",
+    "digest": "summarize a time window and what needs the owner",
+    "followups": "list FOLLOW-UP comments for the owner to turn into cards",
+    "runs": "list a card's runs and their cost",
+    "log": "print a run's log",
+    "tail": "follow the live run's log",
+    "stats": "cost, outcomes, review rounds, and accounts that are walled or logged out",
+    "pause": "stop dispatching",
+    "resume": "resume dispatching and re-probe sign-in",
+    "config": "list, get or set settings",
+    "migrate": "bring the database schema up to date",
+    "setup": "install the daemon and the board home",
+    "doctor": "check the install; --fix repairs what it can",
+    "uninstall": "remove the daemon and the install",
+}
+
+
 # --- parser ---------------------------------------------------------------------------------
 
 
@@ -83,7 +138,13 @@ def build() -> argparse.ArgumentParser:
 
     def add(name: str, *spec: str | tuple[str, Any]) -> None:
         """A bare name is a positional, `--x` takes a value; a tuple adds its type or kind."""
-        p = sub.add_parser(name, parents=[common], allow_abbrev=False)
+        p = sub.add_parser(
+            name,
+            parents=[common],
+            allow_abbrev=False,
+            help=VERB_HELP.get(name),
+            description=VERB_HELP.get(name),
+        )
         for item in spec:
             arg, kind = (item, None) if isinstance(item, str) else item
             if not arg.startswith("--"):
@@ -145,6 +206,8 @@ def build() -> argparse.ArgumentParser:
     add("runs", "id")
     add("log", "id", ("--run", int), ("--tail", int))
     add("tail", "id")
+    add("digest", "--since")
+    add("followups", "--since")
     add("stats", ("--days", int))
     add("pause", "--reason")
     add("resume")
@@ -514,7 +577,22 @@ def v_tail(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, A
 @owner_verb("stats")
 def v_stats(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
     data = store.stats(conn, board=find_board(conn, a), days=a.days or 7)
+    data["accounts"] = views.account_states(conn)
     return data, json.dumps(data, indent=2, sort_keys=True)
+
+
+@owner_verb("digest")
+def v_digest(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    data = views.digest(conn, find_board(conn, a), validate.duration(a.since or "2h"))
+    return data, views.digest_text(data)
+
+
+@owner_verb("followups")
+def v_followups(
+    a: argparse.Namespace, conn: sqlite3.Connection
+) -> tuple[dict[str, Any], str | None]:
+    rows = views.followups(conn, find_board(conn, a), validate.duration(a.since or "24h"))
+    return {"followups": rows}, views.followups_text(rows)
 
 
 @owner_verb("pause")
