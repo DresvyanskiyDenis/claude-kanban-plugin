@@ -1012,3 +1012,31 @@ def test_link_ends_the_waiver_for_the_new_parent(conn: Any, card: Card) -> None:
     store.link(conn, newer, child)
     assert row(conn, child)["ignore_merge"] == 0
     assert status(conn, child) == "todo"
+
+
+def test_advisor_config_takes_inherit_off_or_ab_only(conn: Any) -> None:
+    assert store.cfg(conn, "advisor.smith") == "inherit"
+    for policy in ("off", "ab", "inherit"):
+        store.config_set(conn, "advisor.warden", policy)
+        assert store.cfg(conn, "advisor.warden") == policy
+    for bad in ("on", "yes", True, 1):
+        with pytest.raises(Refused):
+            store.config_set(conn, "advisor.smith", bad)
+    for role in ("smith", "designer", "scout", "warden", "atlassian"):
+        assert f"advisor.{role}" in store.DEFAULTS
+
+
+def test_the_measure_columns_arrive_on_an_old_board_and_old_runs_stay_unmeasured(env: Path) -> None:
+    home = env / "kb-home"
+    home.mkdir(exist_ok=True)
+    old = sqlite3.connect(home / "kanban.db")
+    old.executescript(store.SCHEMA)
+    old.execute("PRAGMA user_version = 1")
+    old.commit()
+    old.close()
+    c = store.connect()
+    cols = {r[1] for r in c.execute("PRAGMA table_info(task_runs)")}
+    assert {"advisor", "advisor_calls", "cache_write_1h_tokens", "cache_write_5m_tokens",
+            "api_ms", "harness", "params"} <= cols  # fmt: skip
+    assert c.execute("PRAGMA user_version").fetchone()[0] == len(store.MIGRATIONS)
+    c.close()

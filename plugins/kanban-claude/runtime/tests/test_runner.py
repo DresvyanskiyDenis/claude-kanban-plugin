@@ -867,3 +867,75 @@ def test_the_account_paused_event_names_the_card_the_error_and_the_login_command
     payload = json.loads(event["payload"])
     assert payload["task"] == tid and payload["error"].startswith("Invalid API key")
     assert payload["login"] == "claude /login" and payload["config_dir"]
+
+
+# --- advisor policy and launch record (0.4.0) -----------------------------------------------
+
+
+def run_row(conn: Any, tid: str, role: str = "smith") -> Any:
+    run = store.claim(conn, tid, config_dir=None)
+    assert run
+    conn.execute("UPDATE task_runs SET role = ? WHERE id = ?", (role, run))
+    return conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
+
+
+@pytest.mark.parametrize("policy", ["inherit", "off"])
+def test_advisor_arm_follows_a_fixed_policy(conn: Any, card: Card, policy: str) -> None:
+    store.config_set(conn, "advisor.smith", policy)
+    assert runner.advisor_arm(conn, run_row(conn, card())) == policy
+
+
+def test_advisor_ab_splits_by_a_stable_role_salted_hash(conn: Any, card: Card) -> None:
+    for role in ("smith", "warden"):
+        store.config_set(conn, f"advisor.{role}", "ab")
+    arms = {role: set() for role in ("smith", "warden")}
+    for i in range(40):
+        row = {"role": "smith", "task_id": f"t_{i}"}
+        arm = runner.advisor_arm(conn, row)  # type: ignore[arg-type]
+        assert arm == runner.advisor_arm(conn, row)  # type: ignore[arg-type]
+        arms["smith"].add(arm)
+        other = runner.advisor_arm(conn, {"role": "warden", "task_id": f"t_{i}"})  # type: ignore[arg-type]
+        arms["warden"].add(other)
+    assert arms == {"smith": {"on", "off"}, "warden": {"on", "off"}}
+    differs = [
+        runner.advisor_arm(conn, {"role": "smith", "task_id": f"t_{i}"})  # type: ignore[arg-type]
+        != runner.advisor_arm(conn, {"role": "warden", "task_id": f"t_{i}"})  # type: ignore[arg-type]
+        for i in range(40)
+    ]
+    assert any(differs) and not all(differs)  # independent, not mirrored
+
+
+def test_the_advisor_arm_sets_pops_or_leaves_the_switch(
+    conn: Any, card: Card, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tid, name = card(), "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"
+    t = store.get_task(conn, tid)
+
+    def env(arm: str) -> dict[str, str]:
+        return runner.worker_env(conn, t, 1, tmp_path, "/cfg", arm)
+
+    monkeypatch.delenv(name, raising=False)
+    assert env("off")[name] == "1" and name not in env("inherit") and name not in env("on")
+    monkeypatch.setenv(name, "1")
+    assert env("inherit")[name] == "1" and name not in env("on")
+
+
+def test_launch_params_replace_the_prompt_and_keep_only_the_allowlisted_env(tmp_path: Path) -> None:
+    argv = ["claude", "-p", "SECRET PROMPT", "--model", "opus"]
+    got = runner.launch_params(
+        argv, {"KANBAN_TASK": "t_1", "PATH": "/bin", "ANTHROPIC_API_KEY": "k"}, tmp_path / "p.md"
+    )
+    assert (
+        got["argv"] == ["claude", "-p", "<prompt>", "--model", "opus"]
+        and argv[2] == "SECRET PROMPT"
+    )
+    assert got["env"] == {"KANBAN_TASK": "t_1"} and got["prompt_path"] == str(tmp_path / "p.md")
+
+
+def test_an_ab_role_records_its_arm_on_the_run_and_the_switch_in_its_params(
+    conn: Any, card: Card, execute: Execute
+) -> None:
+    store.config_set(conn, "advisor.smith", "off")
+    run = execute(card())
+    assert run["advisor"] == "off"
+    assert json.loads(run["params"])["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"

@@ -19,6 +19,7 @@ from . import (
     gitops,
     install,
     jira,
+    measure,
     runner,
     store,
     validate,
@@ -80,6 +81,7 @@ VERB_HELP = {
     "request-review": "end the run: the PR is ready, hand it to the reviewer",
     "request-changes": "send a reviewed card back to its builder with the reasons",
     "wait-ci": "wait up to 9 minutes for the PR checks; exit 0 pass, 1 fail, 2 pending",
+    "gate": "run a gate command; the full output goes to a log, a short digest is printed",
     "boards": "list, create, edit or archive boards",
     "jira": "import, link, unlink or sync Jira issues",
     "create": "create a card",
@@ -135,7 +137,7 @@ def build() -> argparse.ArgumentParser:
     root.add_argument("--version", action="version", version=f"kanban {__version__}")
     sub = root.add_subparsers(dest="verb", required=True, metavar="VERB")
 
-    def add(name: str, *spec: str | tuple[str, Any]) -> None:
+    def add(name: str, *spec: str | tuple[str, Any]) -> argparse.ArgumentParser:
         """A bare name is a positional, `--x` takes a value; a tuple adds its type or kind."""
         p = sub.add_parser(
             name,
@@ -157,6 +159,7 @@ def build() -> argparse.ArgumentParser:
                 p.add_argument(arg, required=True)
             else:
                 p.add_argument(arg, **({"type": kind} if kind else {}))
+        return p
 
     text = ("--body", "--body-file")
     card = (
@@ -171,6 +174,7 @@ def build() -> argparse.ArgumentParser:
     add("attach", "id", "path")
     add("block", "id", ("--kind", "required"), ("--reason", "required"), "--retry-after")
     add("wait-ci", ("--pr", int))
+    add("gate", ("--lines", int)).add_argument("command", nargs="*", metavar="-- CMD")
     add("complete", "id", "--summary", "--summary-file")
     add("request-review", "id", "--reviewer", "--summary", "--summary-file")
     add("request-changes", "id", ("--reason", "required"))
@@ -211,7 +215,7 @@ def build() -> argparse.ArgumentParser:
     add("tail", "id")
     add("digest", "--since")
     add("followups", "--since")
-    add("stats", ("--days", int))
+    add("stats", ("--days", int), ("--backfill", "flag"))
     add("pause", "--reason")
     add("resume")
     add("config", "action", ("key", "?"), ("value", "?"))
@@ -585,6 +589,12 @@ def v_tail(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, A
 
 @owner_verb("stats")
 def v_stats(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    if a.backfill:
+        done = measure.backfill(conn)
+        return (
+            done,
+            f"backfill: filled {done['filled']} runs, skipped {done['skipped']} (no stream sidecar)",
+        )
     data = store.stats(conn, board=find_board(conn, a), days=a.days or 7)
     data["accounts"] = views.account_states(conn)
     return data, json.dumps(data, indent=2, sort_keys=True)
@@ -738,6 +748,8 @@ def worker_args(a: argparse.Namespace) -> dict[str, Any]:
             args.update(kind=a.kind, reason=a.reason, retry_after=a.retry_after)
         case "wait-ci":
             args["pr"] = a.pr
+        case "gate":
+            args.update(command=a.command, lines=a.lines)
         case "complete" | "request-review":
             args["summary"] = text_arg(a.summary, a.summary_file)
             args["reviewer"] = getattr(a, "reviewer", None)
@@ -769,14 +781,17 @@ def run_as_worker(a: argparse.Namespace) -> int:
     elif a.verb == "wait-ci":
         present(a, data, data["summary"])
         return worker.CI_EXIT[data["state"]]
+    elif a.verb == "gate":
+        present(a, data, data["text"])
+        return int(data["exit"])
     else:
         present(a, data, "already done" if data.get("noop") else None)
     return 0
 
 
 def owner(a: argparse.Namespace) -> int:
-    if a.verb == "wait-ci":
-        raise NotAllowed("wait-ci is a worker verb; it waits on the CI of the run's own card")
+    if a.verb in ("wait-ci", "gate"):
+        raise NotAllowed(f"{a.verb} is a worker verb; it acts on the run's own card")
     if a.verb in RUN_ONLY:
         raise NotAllowed(
             f"{a.verb} ends a worker's run, so only a worker can use it; "

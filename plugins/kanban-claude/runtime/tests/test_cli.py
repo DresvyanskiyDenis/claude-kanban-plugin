@@ -487,3 +487,27 @@ def test_config_set_turns_the_budget_caps_on_and_off(kb: Kb, workdirs: tuple[Pat
     assert get("budget.max_usd_per_board_day") is None
     assert kb("config", "set", "budget.max_usd_per_board_day", '"lots"')[0] == 4
     assert kb("config", "set", "budget.max_usd_per_card", "-3")[0] == 4
+
+
+def test_gate_runs_the_command_and_exits_with_its_code_in_worker_mode_only(
+    kb: Kb, wt: tuple[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code, out, _ = kb("gate", "--", "echo hi; exit 4")
+    assert code == 5  # the owner has no use for it
+    monkeypatch.setenv("KANBAN_RUN_ID", str(wt[1]))
+    code, out, _ = kb("gate", "--lines", "3", "--", "echo hi; exit 4")
+    assert code == 4 and out.splitlines()[0].startswith("gate: exit 4 after ")
+    assert out.splitlines()[1] == "hi"
+    code, out, _ = kb("gate", "--", "echo", "a", "b")
+    assert code == 0 and out.splitlines()[1] == "a b"
+    assert kb("gate")[0] == 2
+
+
+def test_stats_backfill_reports_what_it_filled(kb: Kb, conn: Any, card: Any, claim: Any) -> None:
+    run = claim(card())
+    conn.execute(
+        "UPDATE task_runs SET status = 'ended', ended_at = started_at WHERE id = ?", (run,)
+    )
+    conn.execute("UPDATE task_runs SET stream_path = '/nonexistent/s.jsonl' WHERE id = ?", (run,))
+    code, out, _ = kb("stats", "--backfill")
+    assert code == 0 and "backfill: filled 0 runs, skipped 1 (no stream sidecar)" in out

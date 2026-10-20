@@ -15,11 +15,14 @@ import sqlite3
 import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import ghops, validate
 from .errors import Error, NotFound, Refused, Stale
 from .paths import dirs, ensure_dir
+
+if TYPE_CHECKING:
+    from . import measure
 
 log = logging.getLogger("kanban.store")
 
@@ -145,8 +148,37 @@ ALTER TABLE tasks ADD COLUMN merge_method TEXT
   CHECK (merge_method IS NULL OR merge_method IN ('squash','merge','rebase'));
 """
 
+# 0.4.0 per-run measurement. `advisor` is the arm a run used (`inherit`, `on` or `off`); the cache
+# split, the advisor calls, the API time and the `harness` counts (tools, skills, hooks ...) come
+# from the run's own stream; `params` is how it was launched (argv, allowlisted env, the prompt file
+# and the init event). NULL `harness` marks a run nobody measured yet.
+METRICS_SCHEMA = """
+ALTER TABLE task_runs ADD COLUMN advisor TEXT;
+ALTER TABLE task_runs ADD COLUMN advisor_calls INTEGER;
+ALTER TABLE task_runs ADD COLUMN cache_write_1h_tokens INTEGER;
+ALTER TABLE task_runs ADD COLUMN cache_write_5m_tokens INTEGER;
+ALTER TABLE task_runs ADD COLUMN api_ms INTEGER;
+ALTER TABLE task_runs ADD COLUMN harness TEXT;
+ALTER TABLE task_runs ADD COLUMN params TEXT;
+-- the token columns were the last result's per-turn usage; the run's `model_usage` delta covers the
+-- whole run, subagent and advisor models included
+UPDATE task_runs SET
+  input_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.inputTokens')), 0) FROM json_each(model_usage) j),
+  output_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.outputTokens')), 0) FROM json_each(model_usage) j),
+  cache_write_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.cacheCreationInputTokens')), 0) FROM json_each(model_usage) j),
+  cache_read_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.cacheReadInputTokens')), 0) FROM json_each(model_usage) j)
+WHERE model_usage IS NOT NULL;
+"""
+
 # Forward-only: MIGRATIONS[i] takes user_version i to i + 1 (STO-03).
-MIGRATIONS: list[str] = [SCHEMA, JIRA_SCHEMA, USAGE_SCHEMA, CLAIM_SCHEMA, MODERNIZE_SCHEMA]
+MIGRATIONS: list[str] = [
+    SCHEMA,
+    JIRA_SCHEMA,
+    USAGE_SCHEMA,
+    CLAIM_SCHEMA,
+    MODERNIZE_SCHEMA,
+    METRICS_SCHEMA,
+]
 BACKUPS_KEPT = 5
 
 STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "archived")
@@ -155,6 +187,7 @@ WORKER_BLOCK_KINDS = ("needs_input", "capability", "transient")
 BUILDERS = ("smith", "designer")
 PARTIAL_REVIEW = "PARTIAL REVIEW"  # a warden approval the owner merges (D10), never the daemon
 MERGE_METHODS = ("squash", "merge", "rebase")
+ADVISOR_POLICIES = ("inherit", "off", "ab")
 APPROVED_RE = re.compile(r"WARDEN: APPROVED PR #(\d+) @\s*([0-9a-f]{7,40})\b")
 BLOCK_RECURRENCE_LIMIT = 2
 PROTOCOL_VIOLATION_LIMIT = 3
@@ -185,6 +218,13 @@ DEFAULTS: dict[str, Any] = {
     "effort.designer": None,
     "effort.warden": None,
     "effort.atlassian": None,
+    # D1: `inherit` leaves the advisor as the owner's settings have it, `off` disables it for the
+    # role's runs, `ab` flips it per card (stable hash) to measure what it buys
+    "advisor.smith": "inherit",
+    "advisor.designer": "inherit",
+    "advisor.scout": "inherit",
+    "advisor.warden": "inherit",
+    "advisor.atlassian": "inherit",
     "runtime.scout": 1800,
     "runtime.smith": 7200,
     "runtime.designer": 7200,
@@ -377,6 +417,8 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         raise Refused(f"{key} must be a list of tool names, got {value!r}")
     if value is not None and key.startswith("effort."):
         validate.effort(value)
+    if key.startswith("advisor.") and value not in ADVISOR_POLICIES:
+        raise Refused(f"{key} must be one of {', '.join(ADVISOR_POLICIES)}, got {value!r}")
     if value is not None and key.startswith("models."):
         validate.model(value)
     roles = active_roles(conn, value if key == "dispatch.roles" else None)
@@ -1699,7 +1741,14 @@ def record_result(
             }
             for m, used in seen.items()
         }
-    usage: dict[str, Any] = res["usage"] if isinstance(res.get("usage"), dict) else {}
+    usage: dict[str, Any] = dict(res["usage"]) if isinstance(res.get("usage"), dict) else {}
+    if share is not None:  # the whole run, every model; the result's `usage` is one turn
+        for col, key in (
+            ("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"),
+            ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+            ("cache_read_input_tokens", "cacheReadInputTokens"),
+        ):  # fmt: skip
+            usage[col] = int(sum(u.get(key, 0) for u in share.values()))
     conn.execute(
         "UPDATE task_runs SET claude_exit_code = ?, exit_code = ?, subtype = ?, is_error = ?, "
         "api_error_status = ?, num_turns = ?, session_cost_usd = ?, cost_usd = ?, "
@@ -1714,6 +1763,34 @@ def record_result(
             usage.get("cache_creation_input_tokens"), usage.get("cache_read_input_tokens"),
             None if share is None else json.dumps(share),
             None if seen is None else json.dumps(seen), run["id"],
+        ),
+    )  # fmt: skip
+
+
+def record_measure(
+    conn: sqlite3.Connection, run: Row, m: "measure.Measure", *, advisor: str | None = None
+) -> None:
+    """The run's own counts from its stream. `duration_api_ms` is cumulative over the session
+    (verified on resumed runs), so `api_ms` is the rise over the session's earlier runs, as the
+    cost is; `advisor` fills the arm only where none was recorded (the backfill's `inherit`).
+    Runs inside the caller's BEGIN IMMEDIATE."""
+    total = m.api_ms
+    prev = conn.execute(
+        "SELECT COALESCE(SUM(api_ms), 0) FROM task_runs WHERE session_id = ? AND id < ?",
+        (run["session_id"], run["id"]),
+    ).fetchone()[0]
+    old = conn.execute("SELECT params FROM task_runs WHERE id = ?", (run["id"],)).fetchone()[0]
+    params = json.loads(old) if old else {}
+    if m.init:
+        params["init"] = m.init_params()
+    conn.execute(
+        "UPDATE task_runs SET advisor = COALESCE(advisor, ?), advisor_calls = ?, "
+        "cache_write_1h_tokens = ?, cache_write_5m_tokens = ?, api_ms = ?, harness = ?, "
+        "params = ? WHERE id = ?",
+        (
+            advisor, m.advisor_calls, m.cache_1h, m.cache_5m,
+            None if total is None else (total - prev if total >= prev else total),
+            dumps(m.harness()), dumps(params) if params else None, run["id"],
         ),
     )  # fmt: skip
 
@@ -2165,4 +2242,111 @@ def stats(conn: sqlite3.Connection, *, board: str | None = None, days: int = 7) 
         ),
         "outcomes": table(f"SELECT r.outcome, COUNT(*) runs {base} GROUP BY r.outcome ORDER BY r.outcome"),
         "review_rounds": table(f"SELECT t.id, COUNT(*) rounds {base} AND r.kind = 'review' GROUP BY t.id ORDER BY rounds DESC"),
+        **_measure_stats(conn, base, where, args),
     }  # fmt: skip
+
+
+def _measure_stats(
+    conn: sqlite3.Connection, base: str, where: str, args: list[Any]
+) -> dict[str, Any]:
+    """The 0.4.0 keys of `stats`: runtime, cost per role and model, the advisor arms, guards and
+    what the harness did (tools, skills, MCP, agents, hooks); all but the first two read what the
+    runner and the backfill recorded, so a run without `harness` only counts in `unmeasured_runs`."""
+
+    def table(sql: str, extra: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        return [dict(r) for r in conn.execute(sql, [*args, *extra])]
+
+    def counts(section: str) -> list[dict[str, Any]]:
+        return table(
+            "SELECT j.key name, SUM(j.value) calls, COUNT(*) runs "
+            f"FROM task_runs r JOIN tasks t ON t.id = r.task_id, json_each(r.harness, '$.{section}') j "
+            f"WHERE {where} GROUP BY j.key ORDER BY calls DESC, name"
+        )
+
+    verdict = "r.kind = 'review' AND r.terminal_verb IN ('complete', 'request-changes')"
+    reviews, sent = conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(r.terminal_verb = 'request-changes'), 0) {base} AND {verdict}",
+        args,
+    ).fetchone()
+    # a card's first verdict is its earliest review run that approved or sent back
+    cards_judged, first_ok = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(r.terminal_verb = 'complete'), 0) "
+        f"{base} AND {verdict} AND r.n = (SELECT MIN(x.n) FROM task_runs x WHERE x.task_id = r.task_id "
+        "AND x.kind = 'review' AND x.terminal_verb IN ('complete', 'request-changes'))",
+        args,
+    ).fetchone()
+    approved = [
+        row[0]
+        for row in conn.execute(
+            f"SELECT DISTINCT r.task_id {base} AND r.kind = 'review' AND r.terminal_verb = 'complete'",
+            args,
+        )
+    ]
+    spent = conn.execute(
+        f"SELECT COALESCE(SUM(cost_usd), 0) FROM task_runs WHERE task_id IN ({','.join('?' * len(approved))})",
+        approved,
+    ).fetchone()[0]
+    totals: dict[str, Any] = {
+        "hooks_ok": 0, "hooks_failed": 0, "compactions": 0, "permission_denials": 0,
+        "tool_errors": 0, "subagents_spawned": 0, "subagents_failed": 0, "by_terminal_reason": {},
+    }  # fmt: skip
+    for (raw,) in conn.execute(f"SELECT r.harness {base} AND r.harness IS NOT NULL", args):
+        h = json.loads(raw)
+        for v in h.get("hooks", {}).values():
+            totals["hooks_ok"] += v.get("ok", 0)
+            totals["hooks_failed"] += v.get("failed", 0)
+        for k in ("compactions", "permission_denials", "tool_errors"):
+            totals[k] += h.get(k, 0)
+        totals["subagents_spawned"] += h.get("subagents", {}).get("spawned", 0)
+        totals["subagents_failed"] += h.get("subagents", {}).get("failed", 0)
+        reason = str(h.get("terminal_reason") or "none")
+        totals["by_terminal_reason"][reason] = totals["by_terminal_reason"].get(reason, 0) + 1
+    cards = len(approved)
+    return {
+        "runtime_by_role": table(
+            "SELECT r.role, COUNT(*) runs, SUM(r.ended_at - r.started_at) total_s, "
+            "ROUND(AVG(r.ended_at - r.started_at), 1) avg_s, MAX(r.ended_at - r.started_at) max_s, "
+            f"ROUND(COALESCE(SUM(r.api_ms), 0) / 1000.0, 1) api_s {base} AND r.ended_at IS NOT NULL "
+            "GROUP BY r.role ORDER BY r.role"
+        ),
+        # per model the run used (`modelUsage`, so the advisor's model is a row of its own); the
+        # cache-write split is the run's, put on the model it ran as (a subagent's share stays there)
+        "cost_by_role_model": table(
+            "SELECT r.role, j.key model, COUNT(*) runs, "
+            "ROUND(COALESCE(SUM(json_extract(j.value, '$.costUSD')), 0), 4) cost, "
+            "ROUND(COALESCE(SUM(json_extract(j.value, '$.costUSD')), 0) / COUNT(*), 4) avg_cost, "
+            "COALESCE(SUM(json_extract(j.value, '$.inputTokens')), 0) input, "
+            "COALESCE(SUM(json_extract(j.value, '$.outputTokens')), 0) output, "
+            "COALESCE(SUM(json_extract(j.value, '$.cacheCreationInputTokens')), 0) cache_write, "
+            "COALESCE(SUM(CASE WHEN j.key = r.model THEN r.cache_write_1h_tokens END), 0) cache_write_1h, "
+            "COALESCE(SUM(CASE WHEN j.key = r.model THEN r.cache_write_5m_tokens END), 0) cache_write_5m, "
+            "COALESCE(SUM(json_extract(j.value, '$.cacheReadInputTokens')), 0) cache_read "
+            f"FROM task_runs r JOIN tasks t ON t.id = r.task_id, json_each(r.model_usage) j "
+            f"WHERE {where} GROUP BY r.role, j.key ORDER BY r.role, j.key"
+        ),
+        "advisor_arms": table(
+            "SELECT r.role, r.advisor, COUNT(*) runs, ROUND(COALESCE(SUM(r.cost_usd), 0), 4) cost, "
+            "ROUND(COALESCE(SUM(r.cost_usd), 0) / COUNT(*), 4) avg_cost, "
+            f"COALESCE(SUM(r.advisor_calls), 0) advisor_calls {base} AND r.advisor IS NOT NULL "
+            "GROUP BY r.role, r.advisor ORDER BY r.role, r.advisor"
+        ),
+        "per_approved_card": {
+            "cards": cards,
+            "cost": round(spent, 4),
+            "avg_cost": round(spent / cards, 4) if cards else None,
+        },  # fmt: skip
+        "guards": {
+            "reviews": reviews,
+            "first_pass_approvals": first_ok,
+            "send_backs": sent,
+            "first_pass_rate": round(first_ok / cards_judged, 3) if cards_judged else None,
+        },  # fmt: skip
+        "skills": counts("skills"),
+        "mcp": counts("mcp"),
+        "tools": counts("tools"),
+        "agents": counts("agents"),
+        "harness_totals": totals,
+        "unmeasured_runs": conn.execute(
+            f"SELECT COUNT(*) {base} AND r.harness IS NULL", args
+        ).fetchone()[0],
+    }
