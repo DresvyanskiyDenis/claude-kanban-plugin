@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import gitops, runner, store
+from kanban_claude import dispatcher, gitops, runner, store
 from kanban_claude.dispatcher import dispatch_once
 from kanban_claude.errors import Refused
 
@@ -282,39 +282,42 @@ def test_a_paused_login_is_probed_after_5_15_then_60_minutes_and_lifts_when_it_p
         return store.account_get(conn, cfg)["auth_paused"].get("probes", 0)
 
     answers[:] = ["login failed"]
+    dispatcher.reprobe_logins(conn, NOW + 299)
     assert tick(conn, procs, NOW + 299)["skipped"] == {tid: "account_paused"}
     assert answers and probes() == 0
-    tick(conn, procs, NOW + 300)
+    dispatcher.reprobe_logins(conn, NOW + 300)
     assert not answers and probes() == 1
     answers[:] = ["login failed"]
-    tick(conn, procs, NOW + 300 + 899)
+    dispatcher.reprobe_logins(conn, NOW + 300 + 899)
     assert answers and probes() == 1
-    tick(conn, procs, NOW + 300 + 900)
+    dispatcher.reprobe_logins(conn, NOW + 300 + 900)
     assert not answers and probes() == 2
     answers[:] = ["login failed"]
-    tick(conn, procs, NOW + 1200 + 3599)
+    dispatcher.reprobe_logins(conn, NOW + 1200 + 3599)
     assert answers
-    tick(conn, procs, NOW + 1200 + 3600)
+    dispatcher.reprobe_logins(conn, NOW + 1200 + 3600)
     assert not answers and probes() == 3
     assert store.account_get(conn, cfg)["auth_paused"]["next_probe_at"] == NOW + 1200 + 7200
     answers[:] = [None]
+    dispatcher.reprobe_logins(conn, NOW + 1200 + 7200)
     report = tick(conn, procs, NOW + 1200 + 7200)
     assert not store.account_get(conn, cfg).get("auth_paused")
     assert [c["id"] for c in report["claimed"]] == [tid]
     assert "account_resumed" in kinds(conn)
 
 
-def test_a_dry_run_does_not_probe_a_paused_login(
+def test_the_tick_never_probes_a_paused_login(
     conn: Any, card: Card, procs: FakeProcs, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     card()
     paused_account(conn, 1)
 
     def boom(*_a: Any) -> None:
-        raise AssertionError("a dry run probed the login")
+        raise AssertionError("the tick probed the login")
 
     monkeypatch.setattr(runner, "auth_probe", boom)
     assert tick(conn, procs, NOW, dry_run=True)["claimed"] == []
+    assert tick(conn, procs, NOW)["claimed"] == []
 
 
 def test_d13_the_tick_never_calls_git_or_gh(

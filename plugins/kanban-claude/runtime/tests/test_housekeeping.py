@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import housekeeping, store
+from kanban_claude import dispatcher, housekeeping, store
 from kanban_claude.paths import card_tmp, ensure_dir, run_files
 
 
@@ -77,3 +77,18 @@ def test_cleanup_card_removes_the_tmpdir_even_when_the_worktree_is_gone(
     )
     housekeeping.cleanup_card(conn, store.get_task(conn, t["id"]))
     assert not card_tmp(t["id"]).exists()
+
+
+def test_housekeeping_reprobes_paused_logins_and_survives_a_failure(
+    conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+
+    def reprobe(_conn: Any, ts: int) -> None:
+        calls.append(ts)
+        raise RuntimeError("probe crashed")
+
+    monkeypatch.setattr(dispatcher, "reprobe_logins", reprobe)
+    monkeypatch.setattr(housekeeping, "sweep", lambda _c: None)
+    housekeeping.run_due(conn, 1000)
+    assert calls == [1000]

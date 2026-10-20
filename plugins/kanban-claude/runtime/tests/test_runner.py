@@ -79,8 +79,8 @@ def test_r1_the_argv_is_exactly_the_contract(
     ]  # fmt: skip
     assert "Agent(kanban-claude:warden)" in deny and "Agent(kanban-claude:card-helper)" not in deny
     assert settings["permissions"]["allow"] == ["Bash(npm publish)"]
-    assert seen["env"]["TMPDIR"] == str(dirs().home / "tmp" / tid)
-    assert (dirs().home / "tmp" / tid).is_dir()
+    assert seen["env"]["TMPDIR"] == str(dirs().work / "tmp" / tid)
+    assert (dirs().work / "tmp" / tid).is_dir()
     assert run["last_output_at"] is None
     assert settings["enabledPlugins"] == {"cc-plugin-you-should-know@builtin": False}
     assert seen["cwd"] == str(dirs().work / "scratch" / tid) or seen["cwd"].endswith(tid)
@@ -702,7 +702,7 @@ def env_for(conn: Any, tid: str, workspace: Path) -> dict[str, str]:
 def test_two_cards_never_share_a_tmpdir(conn: Any, card: Card, tmp_path: Path) -> None:
     one, two = card("one"), card("two")
     a, b = env_for(conn, one, tmp_path), env_for(conn, two, tmp_path)
-    assert a["TMPDIR"] != b["TMPDIR"] and a["TMPDIR"] == str(dirs().home / "tmp" / one)
+    assert a["TMPDIR"] != b["TMPDIR"] and a["TMPDIR"] == str(dirs().work / "tmp" / one)
 
 
 @pytest.mark.parametrize(

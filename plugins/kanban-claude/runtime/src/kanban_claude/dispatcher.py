@@ -96,7 +96,7 @@ def expire_walls(conn: sqlite3.Connection, ts: int) -> None:
 def reprobe_logins(conn: sqlite3.Connection, ts: int) -> None:
     """P0-9: a paused login is probed again after 5, 15, then every 60 minutes; the pause lifts when
     the probe passes. The probe and its due time live in the `auth_paused` state, so `kanban resume`
-    resets them. A probe runs claude for seconds (120 s at most), so the tick waits for it."""
+    resets them. A probe runs claude for up to 120 s, so housekeeping calls it, never the tick."""
     for row in conn.execute("SELECT key FROM state WHERE key LIKE 'account:%'").fetchall():
         config_dir = row["key"].removeprefix("account:")
         with isolated(f"account {config_dir}"):
@@ -262,7 +262,6 @@ def dispatch_once(
         report["reconciled"] = reconcile(conn, ts, procs)
         repair_running(conn)
         expire_walls(conn, ts)
-        reprobe_logins(conn, ts)
         report["promoted"] = promote(conn)
     if store.state_get(conn, "dispatch_paused"):
         report["paused"] = True

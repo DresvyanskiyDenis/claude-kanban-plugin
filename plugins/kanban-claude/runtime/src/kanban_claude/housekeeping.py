@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from . import ghops, gitops, jira, protection, store, views
+from . import dispatcher, ghops, gitops, jira, protection, store, views
 from .errors import Error
 from .paths import card_tmp, dirs
 
@@ -255,6 +255,10 @@ def run_due(conn: sqlite3.Connection, ts: int | None = None) -> None:
             merge_one(conn, t)
         except Exception:
             log.exception("merge job for %s failed", t["id"])
+    try:
+        dispatcher.reprobe_logins(conn, ts)
+    except Exception:
+        log.exception("login re-probe failed")
     due = store.state_get(conn, "housekeeping") or {}
     jobs: tuple[tuple[str, int, Callable[[], object]], ...] = (
         ("sweep", SWEEP_S, lambda: sweep(conn)),
