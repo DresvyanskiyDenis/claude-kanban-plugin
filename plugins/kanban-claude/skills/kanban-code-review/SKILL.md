@@ -10,12 +10,12 @@ You review the PR of card `$KANBAN_TASK` and end with exactly one verdict. You a
 Run `python3 "${CLAUDE_SKILL_DIR}/scripts/preflight.py"` (add a PR number or URL when the card does not name one). It reads the card with `kanban show --json` and the PR with `gh`, and prints one fact per line:
 
 - `ok`: checked, nothing to do.
-- `CHECK`: resolve it, or make it a finding. Missing or stale `Gate:` line, CI failing or running on the head, a dirty working tree, non-conventional commits (minor), a fix PR with no test change, a simplify PR that grows the code or touches tests, changed paths inside the card's Out of scope, new dependency lines, secret-like strings, hidden characters, new URL hosts.
+- `CHECK`: resolve it, or make it a finding. Missing or stale `Gate:` line (a gate sha that is an ancestor of the head with only merge commits since is fine: a base merge needs no new local gate run, while CI and your own gate still run on the head), CI failing or running on the head, a dirty working tree, non-conventional commits (minor), a fix PR with no test change, a simplify PR that grows the code or touches tests, changed paths inside the card's Out of scope, new dependency lines, secret-like strings, hidden characters, new URL hosts.
 - `TIER`: the depth to review at, see section 3.
 - `SIZE`: `oversized` means review a stated subset of the files and list it under `PARTIAL REVIEW` in the verdict.
-- `INFO`: the PR, its head sha, the review round, the previous ledger's head, and the `git status --porcelain` count the verdict depends on.
+- `INFO`: the PR, its head sha, the review round, the previous ledger's head, and the `git status --porcelain` count the verdict depends on. `merge-only since APPROVED @ <approved7>: every commit since then is a merge and the PR's own diff against origin/<base> is unchanged` is absent unless it holds. When it is there, confirm CI is green on the head and check the merge resolution (`git diff-tree --cc <merge>` is empty for a clean merge), then approve without a full read; when it is absent, review normally.
 
-The script decides nothing. A `CHECK` is a question for you. A commit that merges the base into the card branch fails the commit-message check, and that is not a finding when the repo squash-merges (the daemon's merge always does): its message never reaches the base.
+The script decides nothing. A `CHECK` is a question for you.
 
 ## 2. Read order
 
@@ -55,7 +55,7 @@ Every `blocker` and `major` carries proof: a repro you ran, with the command and
 
 ## 8. Ledger and rounds
 
-Post one comment per round, before the verdict (`kanban comment $KANBAN_TASK -` reads stdin):
+Post one comment per round, before the verdict (`kanban comment $KANBAN_TASK -` reads stdin). A follow-up worth a separate card goes in its own comment that starts `FOLLOW-UP:`.
 
 ```text
 REVIEW LEDGER @ <full head sha>
@@ -72,6 +72,6 @@ First compare `git status --porcelain` with the count pre-flight printed. If it 
 
 Then exactly one of:
 
-- No open `blocker` or `major`, CI green on the head, gate verified: `kanban complete $KANBAN_TASK --summary "WARDEN: APPROVED PR #<n> @ <head sha> ..."`. After the sha you may add `PARTIAL REVIEW` with its file list, minors, unverified concerns and unverifiable contract items. The marker `WARDEN: APPROVED PR #<n> @ <sha>` must be exact: the board refuses an approval without it.
+- No open `blocker` or `major`, CI green on the head, gate verified: `kanban complete $KANBAN_TASK --summary "WARDEN: APPROVED PR #<n> @ <head sha> ..."`. After the sha you may add `PARTIAL REVIEW` with its file list, minors, unverified concerns and unverifiable contract items. The marker `WARDEN: APPROVED PR #<n> @ <sha>` must be exact: the board refuses an approval without it. A `PARTIAL REVIEW` approval goes to the owner to merge: the daemon never auto-merges it and emits `awaiting_owner_merge`, so say in the summary what was left unread.
 - Otherwise: post the ledger, then `kanban request-changes $KANBAN_TASK --reason "<the required changes, by finding ID>"`.
 - Something only the owner can settle, or a finding stuck for two rounds: `kanban block $KANBAN_TASK --kind needs_input --reason "<what and why>"`.

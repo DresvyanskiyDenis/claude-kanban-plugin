@@ -44,7 +44,7 @@ Use a feature branch when several cards must land together, or when the default 
 
 ## Rules
 
-- The daemon merges an approved part PR into the feature branch (squash) and records `merged`. If it records `merge_failed`, tell the owner; `kanban merge-retry <id>` tries again after the cause is fixed.
+- The daemon merges an approved part PR into the feature branch (squash unless the card sets `--merge-method`) and records `merged`; a `PARTIAL REVIEW` approval waits for the owner. If it records `merge_failed`, tell the owner; `kanban merge-retry <id>` tries again after the cause is fixed.
 - Only the finalize card may use the branch `feature/<slug>` itself. Part branches are `feature/<slug>-<part>`.
 - A PR into the default branch is never merged by the system or by a role.
 
