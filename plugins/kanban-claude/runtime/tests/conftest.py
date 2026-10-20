@@ -165,6 +165,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     install_fake(bindir / "launchctl", LAUNCHCTL_SCRIPT)
     install_fake(bindir / "uv", UV_SCRIPT)
     install_fake(bindir / "claude", NO_CLAUDE_SCRIPT)
+    # the fakes stand in for the Mac, so setup's macOS check passes on a Linux CI runner too
+    monkeypatch.setattr(install.sys, "platform", "darwin")
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("LAUNCHCTL_FAKE_LOG", str(tmp_path / "launchctl.log"))
     monkeypatch.setenv("LAUNCHCTL_FAKE_STATE", str(tmp_path / "launchctl.state"))
