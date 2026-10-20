@@ -785,7 +785,8 @@ def test_u3_the_migration_recomputes_old_counts_from_the_model_usage_delta(env: 
     home = env / "kb-home"
     home.mkdir(exist_ok=True)
     old = sqlite3.connect(home / "kanban.db")
-    for step in store.MIGRATIONS[:-1]:
+    before = store.MIGRATIONS.index(store.METRICS_SCHEMA)
+    for step in store.MIGRATIONS[:before]:
         old.executescript(step)
     old.execute("INSERT INTO boards(slug, name, created_at) VALUES ('main', 'main', 1)")
     old.execute(
@@ -800,7 +801,7 @@ def test_u3_the_migration_recomputes_old_counts_from_the_model_usage_delta(env: 
             "cache_write_tokens, cache_read_tokens, model_usage) VALUES ('t_1', ?, 'work', 'ended', 1, 9, 9, 9, 9, ?)",
             (n, None if mu is None else json.dumps(mu)),
         )  # fmt: skip
-    old.execute(f"PRAGMA user_version = {len(store.MIGRATIONS) - 1}")
+    old.execute(f"PRAGMA user_version = {before}")
     old.commit()
     old.close()
     c = store.connect()
