@@ -582,3 +582,39 @@ def test_the_housekeeping_wake_up_runs_the_pass_every_poll_interval(
     assert len(gh_fake.calls()) == calls
     housekeeping.run_due(conn, ts + 120)
     assert len(gh_fake.calls()) > calls
+
+
+def test_an_owner_merge_shows_a_conflict_while_the_card_is_in_review_that_clears_by_itself(
+    conn: sqlite3.Connection, gh_fake: Fake, card: Card, sync: Sync
+) -> None:
+    tid = card("A")
+    sync()
+    run = store.claim(conn, tid)
+    assert run
+    store.request_review(conn, run, "PR #12", pr_number=12, pr_url="https://github.com/o/r/pull/12")
+    sync()
+    gh_fake.edit(1, state="closed")
+    sync()
+    assert status(conn, tid) == "review" and "review" in link(conn, tid)["conflict"]
+    store.mark_done(conn, tid, "merged")
+    writes = len(gh_fake.writes())
+    sync()
+    assert link(conn, tid)["conflict"] is None and status(conn, tid) == "done"
+    assert len(gh_fake.writes()) == writes
+
+
+def test_the_verbs_an_owner_types_pair_link_and_unlink_through_the_parser(
+    conn: sqlite3.Connection, gh_fake: Fake, card: Card, kb: Kb
+) -> None:
+    code, _, _ = kb("boards", "edit", "main", "--github-repo", "o/r", "--github-project", "o/7")
+    assert code == 0
+    b = store.get_board(conn, "main")
+    assert (b["github_repo"], b["github_project"]) == (REPO, "o/7")
+    code, _, err = kb("boards", "create", "x", "--default-workdir", "/", "--github-off")
+    assert code != 0 and "github-off" in err
+    n = gh_fake.add("Outside", labels=())
+    tid = card("Mine")
+    assert kb("github", "link", tid, str(n))[0] == 0
+    assert link(conn, tid)["number"] == n
+    assert kb("github", "unlink", tid)[0] == 0
+    assert not conn.execute("SELECT 1 FROM github_links").fetchone()
