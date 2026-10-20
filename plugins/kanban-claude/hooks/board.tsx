@@ -81,6 +81,19 @@ function fit(s: string, n: number, left = false): string {
   return left ? pad + flat : flat + pad
 }
 
+// A hint ends in the command to run, after its last arrow: cut the words before it, never the command.
+function fitHint(s: string, n: number): string {
+  const at = s.lastIndexOf(' → ')
+  const room = n - cells(s.slice(at + 3)) - 3
+  return cells(s) <= n || at < 0 || room < 12 ? fit(s, n) : `${fit(s.slice(0, at), room)} → ${s.slice(at + 3)}`
+}
+
+// Under a need, the reason and the command share a line when they fit, else the command gets its own.
+function hintLines(s: string, n: number): string[] {
+  const at = s.lastIndexOf(' → ')
+  return cells(s) <= n || at < 0 ? [fit(s, n)] : [fit(s.slice(0, at), n), fit(s.slice(at + 1), n)]
+}
+
 // Cells per segment, rounded on the running total so the segments always fill `width` exactly.
 // shortcut: a status holding a sliver of a big board can round to no cell; its lane still lists it.
 function segments(parts: { color: string; n: number }[], width: number) {
@@ -617,7 +630,7 @@ export const register: Register = on => {
               <Text key="label" color="warning">
                 {fit(a.label, LABEL)}
               </Text>,
-              <Text key="title">{' ' + fit(oneLine ? join(' · ', a.title, a.hint) : a.title, width - 3 - LABEL)}</Text>,
+              <Text key="title">{' ' + (oneLine ? fitHint(join(' · ', a.title, a.hint), width - 3 - LABEL) : fit(a.title, width - 3 - LABEL))}</Text>,
             ]
             return (
               <Box key={String(i)} flexDirection="column">
@@ -628,7 +641,13 @@ export const register: Register = on => {
                 ) : (
                   <Box flexDirection="row">{lead}</Box>
                 )}
-                {!oneLine && a.hint && <Text dimColor>{' '.repeat(LABEL + 3) + fit(a.hint, width - 3 - LABEL)}</Text>}
+                {!oneLine &&
+                  a.hint &&
+                  hintLines(a.hint, width - 3 - LABEL).map((s, j) => (
+                    <Text key={`hint:${j}`} dimColor>
+                      {' '.repeat(LABEL + 3) + s}
+                    </Text>
+                  ))}
               </Box>
             )
           })}

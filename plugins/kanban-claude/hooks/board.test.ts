@@ -141,7 +141,9 @@ test('the needs-you strip leads with what waits on the owner and how to answer i
   const ui = await $.ui.mount(pane())
   expect(await ui.find({ type: 'Text', text: /^Needs you$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^question/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /Which IdP\? → kanban unblock/ })).toBeDefined()
+  // Too long for one line at 48 columns: the command moves to its own line, whole.
+  expect(await ui.find({ type: 'Text', text: /^ +Which IdP\? *$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ +→ kanban unblock t_blk --reason "…" *$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /hard quota wall · 3 cards wait/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /lifts by itself in 1h/ })).toBeDefined()
   await ui.unmount()
@@ -351,13 +353,19 @@ test('recently merged cards close the dock', async ($, on) => {
 })
 
 test('inline and wide, the lanes sit side by side; narrow, the meta column goes', async ($, on) => {
-  world(on)
+  const w = world(on)
   await $.command.run(command())
   const wide = await $.ui.mount(pane({ placement: 'inline', bodyColumns: 120, bodyRows: 12 }))
   const run = await wide.find({ type: 'Button', key: 'card:t_run' })
   expect(run?.text.length).toBe(Math.floor((120 - 2 * 3) / 4))
   expect(await wide.find({ type: 'Text', text: /Which IdP\?/ })).toBeDefined()
   await wide.unmount()
+  // Inline the need is one line: the words before the command give way, the command stays whole.
+  w.answers.digest = () => ok({ ...DIGEST, needs_you: [{ ...NEED, reason: 'Okta or Entra, and which tenant?' }] })
+  await w.clk.advance(15_000)
+  const mid = await $.ui.mount(pane({ placement: 'inline', bodyColumns: 80, bodyRows: 12 }))
+  expect(await mid.find({ type: 'Text', text: /^ Wire SSO · .*… → kanban unblock t_blk --reason "…"$/ })).toBeDefined()
+  await mid.unmount()
   const narrow = await $.ui.mount(pane({ bodyColumns: 26 }))
   expect(await narrow.find({ type: 'Text', text: /builder/ })).toBeUndefined()
   expect((await narrow.find({ type: 'Button', key: 'card:t_run' }))?.text.length).toBe(26)
