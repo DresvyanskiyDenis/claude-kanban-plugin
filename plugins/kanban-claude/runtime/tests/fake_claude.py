@@ -10,6 +10,26 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# every flag the runner, `auth_probe`, setup's probes and the isolation flags pass; a typo fails loudly
+VALUED = {
+    "-p", "--agent", "--model", "--effort", "--permission-mode", "--permission-prompts", "--settings",
+    "--mcp-config", "--output-format", "--name", "--max-budget-usd", "--max-turns", "--resume",
+    "--session-id", "--tools", "--setting-sources", "--plugin-dir",
+}  # fmt: skip
+SWITCHES = {"--verbose", "--no-chrome", "--no-session-persistence", "--strict-mcp-config"}
+
+
+def unknown_flag(argv: list[str]) -> str | None:
+    """The first flag that is not in the allowed set, skipping the value of a valued flag."""
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+        elif arg in VALUED:
+            skip = True
+        elif arg.startswith("-") and arg not in SWITCHES:
+            return arg
+    return None
 
 
 def main() -> None:
@@ -20,6 +40,8 @@ def main() -> None:
     if argv == ["--version"]:
         print(env.get("FAKE_CLAUDE_VERSION", "2.1.286 (Claude Code)"))
         return
+    if bad := unknown_flag(argv):
+        sys.exit(f"error: unknown option '{bad}'")
     if log := env.get("FAKE_CLAUDE_LOG"):
         with open(log, "a") as f:
             f.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "env": dict(os.environ)}) + "\n")

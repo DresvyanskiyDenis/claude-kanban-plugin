@@ -59,7 +59,7 @@ def test_r1_the_argv_is_exactly_the_contract(
     run = execute(tid, terminal=["complete", tid, "--summary", "ok"])
     seen = dumped(env, run["id"])
     argv = seen["argv"]
-    assert argv[0] == "-p" and "kanban context" in argv[1] and "npm publish" in argv[1]
+    assert argv[0] == "-p" and "kanban context" in argv[1] and "npm publish" not in argv[1]
     assert flag(argv, "--agent") == "kanban-claude:smith"
     assert (flag(argv, "--model"), flag(argv, "--effort")) == ("sonnet", "xhigh")
     assert (flag(argv, "--permission-mode"), flag(argv, "--permission-prompts")) == ("auto", "none")
@@ -76,6 +76,9 @@ def test_r1_the_argv_is_exactly_the_contract(
         "Bash(kanban grant:*)", f"Edit(/{dirs().home}/**)",
     ]  # fmt: skip
     assert settings["permissions"]["allow"] == ["Bash(npm publish)"]
+    assert seen["env"]["TMPDIR"] == str(dirs().home / "tmp" / tid)
+    assert (dirs().home / "tmp" / tid).is_dir()
+    assert run["last_output_at"] is None
     assert settings["enabledPlugins"] == {"cc-plugin-you-should-know@builtin": False}
     assert seen["cwd"] == str(dirs().work / "scratch" / tid) or seen["cwd"].endswith(tid)
 
@@ -549,3 +552,130 @@ def test_infrastructure_failures_stop_being_free_after_a_few_in_a_row(
         assert (attempt > runner.INFRA_RETRIES) == bool(t["consecutive_failures"])
     assert t["status"] == "blocked" and t["block_kind"] == "gave_up"
     assert attempt == runner.INFRA_RETRIES + limit
+
+
+# --- per-card TMPDIR, GH_HOST, effort, prompts ------------------------------------------------
+
+
+def git_repo(path: Path, origin: str) -> Path:
+    path.mkdir(parents=True)
+    for args in (["init"], ["remote", "add", "origin", origin]):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
+    return path
+
+
+def env_for(conn: Any, tid: str, workspace: Path) -> dict[str, str]:
+    return runner.worker_env(conn, store.get_task(conn, tid), 1, workspace, "/cfg")
+
+
+def test_two_cards_never_share_a_tmpdir(conn: Any, card: Card, tmp_path: Path) -> None:
+    one, two = card("one"), card("two")
+    a, b = env_for(conn, one, tmp_path), env_for(conn, two, tmp_path)
+    assert a["TMPDIR"] != b["TMPDIR"] and a["TMPDIR"] == str(dirs().home / "tmp" / one)
+
+
+@pytest.mark.parametrize(
+    ("origin", "host"),
+    [
+        ("git@ghe.example.com:acme/proj.git", "ghe.example.com"),
+        ("https://ghe.example.com/acme/proj", "ghe.example.com"),
+        ("https://github.com/acme/proj.git", None),
+        ("/some/local/path.git", None),
+    ],
+)
+def test_gh_host_follows_a_non_github_origin(
+    conn: Any, tmp_path: Path, origin: str, host: str | None
+) -> None:
+    store.board_create(conn, "w", default_workdir=str(tmp_path))
+    repo = git_repo(tmp_path / "repo", origin)
+    tid = str(
+        store.create(conn, "w", "t", body="b", assignee="smith", workspace=f"worktree:{repo}",
+                     branch="feat/x")["id"]
+    )  # fmt: skip
+    assert env_for(conn, tid, repo).get("GH_HOST") == host
+
+
+def test_an_explicit_gh_host_is_kept(
+    conn: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store.board_create(conn, "w", default_workdir=str(tmp_path))
+    repo = git_repo(tmp_path / "repo", "git@ghe.example.com:acme/proj.git")
+    tid = str(
+        store.create(conn, "w", "t", body="b", assignee="smith", workspace=f"worktree:{repo}",
+                     branch="feat/x")["id"]
+    )  # fmt: skip
+    monkeypatch.setenv("GH_HOST", "other.example.com")
+    assert env_for(conn, tid, repo)["GH_HOST"] == "other.example.com"
+
+
+def test_effort_is_the_card_then_the_role_then_the_kind_then_the_default(
+    conn: Any, card: Card, claim: Claim
+) -> None:
+    def effort(tid: str, run: int) -> str:
+        row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
+        return runner.model_effort(conn, store.get_task(conn, tid), row)[1]
+
+    plain, own = card("plain"), card("own", effort="low")
+    run_plain, run_own = claim(plain), claim(own)
+    assert effort(plain, run_plain) == "xhigh"
+    store.config_set(conn, "effort.smith", "medium")
+    assert effort(plain, run_plain) == "medium" and effort(own, run_own) == "low"
+    scouting = card("s", assignee="scout")
+    assert effort(scouting, claim(scouting)) == "high"
+    store.request_review(
+        conn, run_plain, "PR #7", pr_number=7, pr_url="https://example.invalid/p/7"
+    )
+    review = claim(plain)
+    assert effort(plain, review) == "high"
+    store.config_set(conn, "effort.warden", "max")
+    assert effort(plain, review) == "max"
+
+
+def prompt_for(conn: Any, tid: str, *, resumed: bool, review: bool) -> str:
+    return runner.build_prompt(conn, store.get_task(conn, tid), Path("/w"), "/cfg", resumed, review)
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_the_prompt_lists_the_terminal_calls_of_the_run_kind(
+    conn: Any, card: Card, resumed: bool
+) -> None:
+    tid = card()
+    work = prompt_for(conn, tid, resumed=resumed, review=False)
+    review = prompt_for(conn, tid, resumed=resumed, review=True)
+    assert "kanban request-review" in work and "request-changes" not in work
+    assert "kanban request-changes" in review and "WARDEN: APPROVED" in review
+    assert "--reviewer warden" not in review
+    for text in (work, review):
+        assert tid in text and "$" not in text.replace("$KANBAN", "")
+        assert "kanban wait-ci" in text and "--retry-after <duration>" in text
+        assert "--watch" not in text and "sleep 30" not in text and "sleep in" not in text
+        assert "does not retry by itself" not in text
+
+
+def test_the_prompt_does_not_repeat_the_grants(conn: Any, card: Card) -> None:
+    tid = card()
+    store.grant_add(conn, tid, ["Bash(npm publish)"], "owner, chat, today")
+    assert "npm publish" not in prompt_for(conn, tid, resumed=False, review=False)
+
+
+def test_the_fake_claude_rejects_a_flag_it_does_not_know(tmp_path: Path) -> None:
+    fake = Path(__file__).with_name("fake_claude.py")
+    for argv, code in (
+        (["-p", "x", "--effort", "high", "--verbose"], 0),
+        (["-p", "x", "--efort", "high"], 1),
+    ):
+        p = subprocess.run([sys.executable, str(fake), *argv], capture_output=True, text=True,
+                           env={**os.environ, "FAKE_CLAUDE_FIXTURES": str(fake.parent / "fixtures")})  # fmt: skip
+        assert p.returncode == code, p.stderr
+    assert "--efort" in p.stderr
+
+
+def test_the_account_paused_event_names_the_card_the_error_and_the_login_command(
+    conn: Any, card: Card, execute: Execute
+) -> None:
+    tid = card()
+    execute(tid, "auth401", exit_code=1)
+    event = conn.execute("SELECT payload FROM task_events WHERE kind = 'account_paused'").fetchone()
+    payload = json.loads(event["payload"])
+    assert payload["task"] == tid and payload["error"].startswith("Invalid API key")
+    assert payload["login"] == "claude /login" and payload["config_dir"]

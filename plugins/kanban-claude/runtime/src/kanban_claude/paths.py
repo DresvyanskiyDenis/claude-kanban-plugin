@@ -61,6 +61,12 @@ def run_files(board: str, task: str, n: int) -> tuple[Path, Path]:
     )
 
 
+def card_tmp(task: str) -> Path:
+    """TMPDIR of a card's workers: one per card, so a resumed run finds its files and no card
+    writes into another's."""
+    return dirs().home / "tmp" / task
+
+
 def nudge() -> None:
     """Wake the dispatcher's tick early (DSP-01); a failure only costs one tick interval."""
     with contextlib.suppress(OSError):

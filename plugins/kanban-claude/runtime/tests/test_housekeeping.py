@@ -1,13 +1,14 @@
 """OBS-04: retention of runner logs and stream sidecars."""
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from kanban_claude import housekeeping, store
-from kanban_claude.paths import ensure_dir, run_files
+from kanban_claude.paths import card_tmp, ensure_dir, run_files
 
 
 def make(board: str, task: str, n: int, age_days: float) -> list[Path]:
@@ -45,3 +46,34 @@ def test_a_file_that_vanishes_during_the_sweep_does_not_end_it(
     monkeypatch.setattr(Path, "unlink", vanishing)
     housekeeping.retention(conn, store.now())
     assert not any(f.exists() for f in [*first, *second])
+
+
+def card_with_tmp(conn: Any, tid: str, status: str, kind: str = "scratch") -> Any:
+    conn.execute(
+        "UPDATE tasks SET status = ?, workspace_kind = ? WHERE id = ?", (status, kind, tid)
+    )
+    ensure_dir(card_tmp(tid)).joinpath("pr.md").write_text("body")
+    return store.get_task(conn, tid)
+
+
+def test_the_sweep_removes_the_tmpdir_of_an_archived_scratch_card(
+    conn: Any, card: Callable[..., str]
+) -> None:
+    done, archived = (
+        card_with_tmp(conn, card("a"), "done"),
+        card_with_tmp(conn, card("b"), "archived"),
+    )
+    housekeeping.sweep(conn)
+    assert not card_tmp(archived["id"]).exists() and card_tmp(done["id"]).exists()
+
+
+def test_cleanup_card_removes_the_tmpdir_even_when_the_worktree_is_gone(
+    conn: Any, card: Callable[..., str]
+) -> None:
+    t = card_with_tmp(conn, card(), "done", "worktree")
+    conn.execute(
+        "UPDATE tasks SET workspace_path = '/nonexistent', branch_name = 'b' WHERE id = ?",
+        (t["id"],),
+    )
+    housekeeping.cleanup_card(conn, store.get_task(conn, t["id"]))
+    assert not card_tmp(t["id"]).exists()

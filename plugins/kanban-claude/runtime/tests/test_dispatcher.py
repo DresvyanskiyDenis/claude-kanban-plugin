@@ -255,10 +255,66 @@ def test_d12_a_paused_account_does_not_hold_another(conn: Any, env: Path, procs:
         store.board_create(conn, slug, default_workdir=str(work), claude_config_dir=str(cfg_dir))
         ids[slug] = str(store.create(conn, slug, "t", body="b", assignee="smith")["id"])
     with store.tx(conn):
-        store.account_set(conn, str(dirs_["a"]), auth_paused={"since": 1, "error": "x"})
+        store.account_set(
+            conn, str(dirs_["a"]), auth_paused={"since": int(time.time()), "error": "x"}
+        )
     report = tick(conn, procs)
     assert report["skipped"] == {ids["a"]: "account_paused"}
     assert [c["id"] for c in report["claimed"]] == [ids["b"]]
+
+
+def paused_account(conn: Any, since: int) -> str:
+    cfg = str(store.effective_config_dir(conn, store.get_board(conn, "main")))
+    with store.tx(conn):
+        store.account_set(conn, cfg, auth_paused={"since": since, "error": "Not logged in"})
+    return cfg
+
+
+def test_a_paused_login_is_probed_after_5_15_then_60_minutes_and_lifts_when_it_passes(
+    conn: Any, card: Card, procs: FakeProcs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tid = card()
+    cfg = paused_account(conn, NOW)
+    answers: list[str | None] = []
+    monkeypatch.setattr(runner, "auth_probe", lambda _c, _d: answers.pop(0))
+
+    def probes() -> int:
+        return store.account_get(conn, cfg)["auth_paused"].get("probes", 0)
+
+    answers[:] = ["login failed"]
+    assert tick(conn, procs, NOW + 299)["skipped"] == {tid: "account_paused"}
+    assert answers and probes() == 0
+    tick(conn, procs, NOW + 300)
+    assert not answers and probes() == 1
+    answers[:] = ["login failed"]
+    tick(conn, procs, NOW + 300 + 899)
+    assert answers and probes() == 1
+    tick(conn, procs, NOW + 300 + 900)
+    assert not answers and probes() == 2
+    answers[:] = ["login failed"]
+    tick(conn, procs, NOW + 1200 + 3599)
+    assert answers
+    tick(conn, procs, NOW + 1200 + 3600)
+    assert not answers and probes() == 3
+    assert store.account_get(conn, cfg)["auth_paused"]["next_probe_at"] == NOW + 1200 + 7200
+    answers[:] = [None]
+    report = tick(conn, procs, NOW + 1200 + 7200)
+    assert not store.account_get(conn, cfg).get("auth_paused")
+    assert [c["id"] for c in report["claimed"]] == [tid]
+    assert "account_resumed" in kinds(conn)
+
+
+def test_a_dry_run_does_not_probe_a_paused_login(
+    conn: Any, card: Card, procs: FakeProcs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    card()
+    paused_account(conn, 1)
+
+    def boom(*_a: Any) -> None:
+        raise AssertionError("a dry run probed the login")
+
+    monkeypatch.setattr(runner, "auth_probe", boom)
+    assert tick(conn, procs, NOW, dry_run=True)["claimed"] == []
 
 
 def test_d13_the_tick_never_calls_git_or_gh(

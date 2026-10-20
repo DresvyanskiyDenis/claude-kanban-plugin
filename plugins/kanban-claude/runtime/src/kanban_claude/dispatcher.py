@@ -7,12 +7,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from . import jira, store, validate
+from . import jira, runner, store, validate
 from .errors import Error
 from .paths import run_files
 from .procs import Procs
 
 CRASH_GRACE_S = 30
+PROBE_BACKOFF_S = (300, 900, 3600)
 log = logging.getLogger("kanban.daemon")
 Row = sqlite3.Row
 Report = dict[str, Any]
@@ -90,6 +91,37 @@ def expire_walls(conn: sqlite3.Connection, ts: int) -> None:
                     store.event(
                         conn, None, "account_resumed", "dispatcher", {"config_dir": config_dir}
                     )
+
+
+def reprobe_logins(conn: sqlite3.Connection, ts: int) -> None:
+    """P0-9: a paused login is probed again after 5, 15, then every 60 minutes; the pause lifts when
+    the probe passes. The probe and its due time live in the `auth_paused` state, so `kanban resume`
+    resets them. A probe runs claude for seconds (120 s at most), so the tick waits for it."""
+    for row in conn.execute("SELECT key FROM state WHERE key LIKE 'account:%'").fetchall():
+        config_dir = row["key"].removeprefix("account:")
+        with isolated(f"account {config_dir}"):
+            paused = store.account_get(conn, config_dir).get("auth_paused")
+            if not paused:
+                continue
+            probes = paused.get("probes", 0)
+            if ts < paused.get("next_probe_at", paused["since"] + PROBE_BACKOFF_S[0]):
+                continue
+            reason = runner.auth_probe(conn, config_dir)
+            with store.tx(conn):
+                if store.account_get(conn, config_dir).get("auth_paused") != paused:
+                    continue
+                if reason is None:
+                    store.account_set(conn, config_dir, auth_paused=None)
+                    store.event(
+                        conn, None, "account_resumed", "dispatcher",
+                        {"config_dir": config_dir, "reason": "the login probe passed"},
+                    )  # fmt: skip
+                else:
+                    wait = PROBE_BACKOFF_S[min(probes + 1, len(PROBE_BACKOFF_S) - 1)]
+                    store.account_set(
+                        conn, config_dir,
+                        auth_paused={**paused, "probes": probes + 1, "next_probe_at": ts + wait},
+                    )  # fmt: skip
 
 
 def promote(conn: sqlite3.Connection) -> list[str]:
@@ -230,6 +262,7 @@ def dispatch_once(
         report["reconciled"] = reconcile(conn, ts, procs)
         repair_running(conn)
         expire_walls(conn, ts)
+        reprobe_logins(conn, ts)
         report["promoted"] = promote(conn)
     if store.state_get(conn, "dispatch_paused"):
         report["paused"] = True
