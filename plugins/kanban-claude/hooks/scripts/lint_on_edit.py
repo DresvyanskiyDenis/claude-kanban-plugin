@@ -18,6 +18,8 @@ BUILDERS = {"kanban-claude:smith", "kanban-claude:designer", "kanban-claude:card
 PY_RULES = "F401,F841,SIM,PIE,RET,C4,ERA,S110,S112,BLE001"
 JS_SUFFIXES = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".svelte")
 MAX_HITS = 20
+# The version runtime/uv.lock resolves, so the hook and the runtime gate agree.
+RUFF = "ruff@0.16.10"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.M)
 
 
@@ -49,7 +51,7 @@ def changed_lines(path: str, cwd: str) -> set[int] | None:
 
 def ruff_hits(path: str, cwd: str) -> list[tuple[int, str, str]]:
     r = run(
-        ["uvx", "ruff", "check", "--isolated", "--no-cache", "--no-fix", "--select", PY_RULES,
+        ["uvx", RUFF, "check", "--isolated", "--no-cache", "--no-fix", "--select", PY_RULES,
          "--output-format", "json", "--", path],
         cwd,
     )  # fmt: skip

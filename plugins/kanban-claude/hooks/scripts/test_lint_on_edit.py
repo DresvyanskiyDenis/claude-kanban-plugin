@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import lint_on_edit as hook
@@ -133,3 +134,9 @@ def test_garbage_stdin_is_silent():
         [sys.executable, str(SCRIPT)], input="not json", text=True, capture_output=True
     )
     assert (r.returncode, r.stderr) == (0, "")
+
+
+def test_ruff_pin_matches_the_runtime_lock():
+    lock = tomllib.loads((SCRIPT.parents[2] / "runtime" / "uv.lock").read_text())
+    locked = next(p["version"] for p in lock["package"] if p["name"] == "ruff")
+    assert f"ruff@{locked}" == hook.RUFF

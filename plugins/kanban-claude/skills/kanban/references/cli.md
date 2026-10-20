@@ -17,10 +17,11 @@ Usage: `kanban [--board SLUG] [--json] <verb> ...`. `--board` and `--json` are a
 | Command | Notes |
 |---|---|
 | `kanban show [ID]` | The card. `--json`: `task` (`id`, `status`, `body`, `branch_name`, `base_branch`, `pr_url`, `pr_number`, `block_kind`, `merge_state`, `implementer`), `parents`, `children`, `comments` (`body`, `author`), `runs`, `events`, `grants`, `attachments`, `latest_summary`; for the wait fields see "Links and waiting" |
-| `kanban context [ID]` | Markdown for a run: body, attachments, prior attempts, parent results, comment thread, grants. Quoted worker text is framed as data |
-| `kanban comment ID TEXT` | Notifies nobody; `--author` is set for workers |
+| `kanban context [ID]` | Markdown for a run. Its header names the card's branch, PR base, PR number and worktree path, then body, attachments, prior attempts, parent results, comment thread, grants. Quoted worker text is framed as data |
+| `kanban comment ID TEXT` | Notifies nobody; `--author` is set for workers. `comment ID -` reads the text from stdin (there is no `--body-file`). A comment starting `FOLLOW-UP:` marks work for a separate card; `followups` collects them |
 | `kanban attach ID PATH` | Copies a file (25 MiB at most) next to the card |
-| `kanban block ID --kind needs_input\|capability\|transient --reason TEXT` | Terminal |
+| `kanban block ID --kind needs_input\|capability\|transient --reason TEXT [--retry-after DUR]` | Terminal. `--kind transient --retry-after 30m` retries by itself after the wait, capped by the card's failure limit; without it a transient block waits for `unblock` |
+| `kanban wait-ci [ID]` | Waits for the PR's checks and returns within 540 s: exit 0 passed, 1 failed, 2 still pending (also when no checks exist yet). Run it again while it exits 2; never in the background, never under Monitor, never in a `sleep` loop |
 | `kanban complete ID [--summary TEXT \| --summary-file -]` | Terminal. A repeat within the same run is a no-op |
 | `kanban request-review ID --reviewer warden --summary TEXT` | Terminal. The summary must name `PR #<n>` or a PR URL; the PR must be open with the card's head and base |
 | `kanban request-changes ID --reason TEXT` | Terminal, review runs only. The owner has a form of its own, see Moves |
@@ -31,9 +32,9 @@ Cards:
 
 | Command | Notes |
 |---|---|
-| `kanban create TITLE` | `--assignee --workspace worktree:<root>\|dir:<abs> --branch --base --priority --max-runtime 30m\|2h --max-retries --skill --model --effort --budget --body \| --body-file - --idempotency-key --parent ID (repeatable) --triage`, and `--grant RULE` (repeatable) with `--approved "WORDS · SOURCE · DATE"` to attach exact grants at creation. A `--parent` in `triage` prints a warning: the child would never start |
+| `kanban create TITLE` | `--assignee --workspace worktree:<root>\|dir:<abs> --branch --base --priority --max-runtime 30m\|2h --max-retries --skill --model --effort --budget --touches GLOB (repeatable) --merge-method squash\|merge\|rebase --body \| --body-file - --idempotency-key --parent ID (repeatable) --triage`, and `--grant RULE` (repeatable) with `--approved "WORDS · SOURCE · DATE"` to attach exact grants at creation. A `--parent` in `triage` prints a warning: the child would never start. `--touches` globs make the dispatcher hold back the card while a running card's touches overlap (skip reason `overlaps:<id>`). `--merge-method` (default squash) is for the daemon's merge into a feature branch; a merge into the default branch stays the owner's |
 | `kanban specify ID` | Same fields plus `--title`; takes a `triage` card to `ready`, or to `todo` while a parent is open. The card starts at once, so stage its inputs first |
-| `kanban edit ID` | The same fields; `--allow-empty-body`. Changes text and settings, never the status |
+| `kanban edit ID` | The same fields, including `--touches` and `--merge-method`; `--allow-empty-body`. Changes text and settings, never the status |
 | `kanban list` | `--status --assignee --sort created\|priority\|completed-desc --limit`; needs a resolvable board. Prints why a card waits and marks a `done` PR card `awaiting merge` (see "Links and waiting") |
 | `kanban assign ID ROLE`, `kanban reassign ID ROLE [--reclaim]` | Roles: smith, designer, scout, warden, and atlassian when `roles.atlassian.enabled` is set |
 | `kanban link PARENT CHILD`, `kanban unlink PARENT CHILD` | Dependencies. `link` warns when PARENT is in `triage`: the child would never start |
@@ -59,7 +60,8 @@ Links and waiting:
 - A child stays `todo` until every parent is `done` or `archived` and has no merge state or the state `merged`.
 - A scout card is `done` when its run completes; its children start at once.
 - A builder card is `done` when warden approves its PR. That is approval, not merge:
-  - PR into a feature branch: the daemon sets the merge state `pending`, then `merged`. The child waits for `merged`; a `failed` merge holds it too (`merge-retry`, or `promote CHILD --ignore-merge`).
+  - PR into a feature branch: the daemon sets the merge state `pending`, then `merged`, with the card's `--merge-method` (squash by default). The child waits for `merged`; a `failed` merge holds it too (`merge-retry`, or `promote CHILD --ignore-merge`).
+  - An approval marked `PARTIAL REVIEW`, on any base: merge state `owner` and an `awaiting_owner_merge` event. The daemon never merges it; the child waits until the owner has.
   - PR into the default branch: no merge state, so the child starts at approval, before the owner merges. If the child needs the parent's code in its base, use a feature branch.
 - `list` and `show` print why a card waits, e.g. `waits for t_0001 (blocked: transient)`. JSON: `waiting_for`.
 - A `done` card whose PR still waits for the owner's merge shows `awaiting merge` until the daemon's sweep (every ten minutes) sees the PR merged. JSON: `awaiting_merge`.
@@ -84,13 +86,14 @@ Observing:
 
 | Command | Notes |
 |---|---|
-| `kanban watch` | `--kinds a,b --since EVENT_ID \| --since-start --follow`; spans all boards unless `--board` is given. Starts at the end of the log by default. One line per event: `[time] #<event id> <card> <kind> (@role) {payload}` |
+| `kanban watch` | `--kinds a,b --since EVENT_ID \| --since-start --follow --actionable`; spans all boards unless `--board` is given. Starts at the end of the log by default. `--actionable` keeps only the events that need the owner (blocks, review verdicts, `merge_failed`, `awaiting_owner_merge`, `account_paused`, `quota_wall` and similar). One line per event: `[time] #<event id> <card> <kind> (@role) {payload}`, with the actor |
+| `kanban digest [--since DUR]` | Read-only summary of the last `DUR` (default `2h`). Opens with "Needs you: N" and those items, then what merged, what is in review, what is running, and the cost |
+| `kanban followups [--since DUR]` | Lists the `FOLLOW-UP:` comments of that window, for the owner to turn into `create --triage` cards. Creates nothing |
 | `kanban runs ID` | Every run of the card with its outcome |
 | `kanban log ID [--run N] [--tail N]`, `kanban tail ID` | A run's log; `tail` follows the live run |
 | `kanban stats [--days N]` | Cost by role, model and day; outcomes; review rounds |
 | `kanban dispatch --dry-run` | What the next tick would claim, and why each other card is skipped |
 | `kanban snapshot REPO [--ref REF]` | Prints the path of a fresh detached checkout of `origin/HEAD`, or of the branch, tag or sha `--ref` names, for the card check. Each ref keeps its own checkout, so two refs of one repo do not move each other's tree |
-| `kanban board [--revoke] [--no-open]` | Opens the web board with a one-time login; `--revoke` invalidates every board token |
 
 Boards and system:
 
