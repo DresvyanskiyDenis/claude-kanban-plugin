@@ -561,16 +561,12 @@ def test_a3_the_pr_is_checked_like_the_workers_and_the_card_stays_blocked(
 ) -> None:
     tid = worktree_card(conn, board, repo)
     store.block(conn, claim_run(conn, tid), "needs_input", "why")
-    for pr, summary in (
-        ({**PR12, "state": "MERGED"}, "PR #12"),
-        ({**PR12, "headRefName": "feat/other"}, "PR #12"),
-        (PR12, "no number here"),
-    ):
+    for pr in ({**PR12, "state": "MERGED"}, {**PR12, "headRefName": "feat/other"}):
         set_prs({"12": pr})
-        assert kb("request-review", tid, "--summary", summary)[0] == 4
+        assert kb("request-review", tid, "--summary", "PR #12")[0] == 4
         assert row(conn, tid)["status"] == "blocked"
     set_prs({})
-    assert kb("request-review", tid, "--summary", "PR #12")[0] != 0
+    assert kb("request-review", tid, "--summary", "PR #12")[0] == 4
     assert row(conn, tid)["status"] == "blocked"
 
 

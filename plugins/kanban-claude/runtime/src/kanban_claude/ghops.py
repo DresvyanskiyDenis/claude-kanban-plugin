@@ -9,11 +9,16 @@ from . import gitops
 from .errors import Error
 
 
-def gh(*args: str, timeout: int = 60) -> str:
+def gh_rc(*args: str, timeout: int = 60) -> "subprocess.CompletedProcess[str]":
+    """Run `gh`; a non-zero exit is the caller's to read (`pr checks` exits 8 while pending)."""
     try:
-        p = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Error(f"gh failed: {e}") from e
+
+
+def gh(*args: str, timeout: int = 60) -> str:
+    p = gh_rc(*args, timeout=timeout)
     if p.returncode != 0:
         raise Error(f"gh {args[0]} failed: {p.stderr.strip()[:300]}")
     return p.stdout
@@ -43,6 +48,19 @@ def pr_view(
         raise Error("gh returned unreadable JSON for the PR") from e
     if not isinstance(data, dict):
         raise Error("gh returned unreadable JSON for the PR")
+    return data
+
+
+def pr_list(repo: str, head: str, base: str) -> list[dict[str, Any]]:
+    """The open PRs from `head` into `base`: GitHub allows one, so more than one is a problem."""
+    out = gh("pr", "list", "-R", repo, "--head", head, "--base", base, "--state", "open",
+             "--json", "number,url")  # fmt: skip
+    try:
+        data = json.loads(out)
+    except ValueError as e:
+        raise Error("gh returned unreadable JSON for the PR list") from e
+    if not isinstance(data, list):
+        raise Error("gh returned unreadable JSON for the PR list")
     return data
 
 

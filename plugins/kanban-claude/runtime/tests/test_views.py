@@ -220,3 +220,11 @@ def test_show_text_prints_the_touches_only_when_set(conn: Any, card: Card) -> No
     plain, scoped = card("plain"), card("scoped", touches=["docs/**", "*.md"])
     assert "touches" not in views.show_text(views.show_data(conn, plain))
     assert "touches: docs/**, *.md" in views.show_text(views.show_data(conn, scoped))
+
+
+def test_watch_line_names_the_actor_not_the_assignee(conn: Any, card: Card) -> None:
+    tid = card("Task", assignee="smith")
+    store.comment(conn, tid, "from the owner", author="owner", actor="owner:cli")
+    ev = next(e for e in store.events_since(conn, 0) if e["kind"] == "commented")
+    line = views.watch_line(ev)
+    assert f" {tid} commented (owner:cli)" in line and "@smith" not in line

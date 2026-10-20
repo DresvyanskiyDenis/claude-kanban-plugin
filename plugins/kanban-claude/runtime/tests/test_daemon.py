@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from kanban_claude import __version__, daemon, dispatcher, housekeeping, paths, store
+from kanban_claude.errors import Refused
 
 Card = Callable[..., str]
 
@@ -207,3 +208,100 @@ def test_a_log_that_launchd_created_world_readable_is_made_private(tmp_path: Pat
     logger.removeHandler(handler)
     handler.close()
     assert log.stat().st_mode & 0o777 == 0o600
+
+
+# --- notify.command (P1-4) ------------------------------------------------------------------
+
+
+def notifier(env: Path) -> Path:
+    """A command that appends its stdin to `notified.txt`."""
+    path = env / "notify.sh"
+    path.write_text(f"#!/bin/sh\ncat >> {env / 'notified.txt'}\n")
+    path.chmod(0o755)
+    return path
+
+
+def raise_events(conn: Any, card: Card, *kinds: str) -> None:
+    t = store.get_task(conn, card())
+    with store.tx(conn):
+        for kind in kinds:
+            store.event(conn, t, kind, "worker:smith#1", {"kind": "needs_input"})
+
+
+def sent(env: Path) -> list[str]:
+    f = env / "notified.txt"
+    return f.read_text().splitlines() if f.exists() else []
+
+
+def test_notify_runs_the_command_once_per_new_actionable_event(
+    conn: Any, card: Card, env: Path
+) -> None:
+    store.config_set(conn, "notify.command", f"{notifier(env)}")
+    daemon.notify_new(conn)  # the first pass only marks where "new" begins
+    raise_events(conn, card, "blocked", "commented", "merge_failed")
+    daemon.notify_new(conn)
+    lines = sent(env)
+    assert [ln.split()[3] for ln in lines] == ["blocked", "merge_failed"]
+    assert "(worker:smith#1)" in lines[0]
+    daemon.notify_new(conn)
+    assert sent(env) == lines
+
+
+def test_notify_does_not_replay_old_events_after_a_restart_or_a_late_config(
+    conn: Any, card: Card, env: Path
+) -> None:
+    raise_events(conn, card, "blocked")
+    daemon.notify_new(conn)  # no command yet: the event is passed over, not queued
+    store.config_set(conn, "notify.command", str(notifier(env)))
+    daemon.notify_new(conn)
+    assert sent(env) == []
+    raise_events(conn, card, "gave_up")
+    daemon.notify_new(store.connect())  # a restarted daemon: a new connection, the saved cursor
+    assert [ln.split()[3] for ln in sent(env)] == ["gave_up"]
+
+
+def test_notify_failures_are_logged_and_never_fatal(
+    conn: Any,
+    card: Card,
+    env: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daemon.notify_new(conn)
+    monkeypatch.setattr(daemon, "NOTIFY_TIMEOUT_S", 0.3)
+    for command, why in (
+        ("sh -c 'exit 3'", "exit status 3"),
+        ("sleep 30", "timed out"),
+        (str(env / "no-such-command"), "No such file"),
+    ):
+        store.config_set(conn, "notify.command", command)
+        raise_events(conn, card, "blocked")
+        with caplog.at_level(logging.WARNING, logger="kanban.daemon"):
+            daemon.notify_new(conn)
+        assert why in caplog.text, caplog.text
+    monkeypatch.setattr(daemon, "NOTIFY_TIMEOUT_S", 10.0)
+    store.config_set(conn, "notify.command", str(notifier(env)))
+    raise_events(conn, card, "blocked")
+    daemon.notify_new(conn)
+    assert len(sent(env)) == 1
+
+
+def test_notify_takes_an_argv_list_and_a_junk_value_cannot_stall_it(
+    conn: Any, card: Card, env: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    daemon.notify_new(conn)
+    store.config_set(conn, "notify.command", [str(notifier(env))])
+    raise_events(conn, card, "blocked")
+    daemon.notify_new(conn)
+    assert len(sent(env)) == 1
+    for junk in (42, [], [1], "  ", {"a": 1}):
+        with pytest.raises(Refused):
+            store.config_set(conn, "notify.command", junk)
+    with store.tx(conn):  # a value that got in some other way
+        conn.execute("UPDATE config SET value = '42' WHERE key = 'notify.command'")
+    raise_events(conn, card, "blocked")
+    with caplog.at_level(logging.WARNING, logger="kanban.daemon"):
+        daemon.notify_new(conn)
+    assert "not a command" in caplog.text
+    daemon.notify_new(conn)
+    assert len(sent(env)) == 1 and "not a command" in caplog.text

@@ -169,7 +169,8 @@ def build() -> argparse.ArgumentParser:
     add("context", ("id", "?"))
     add("comment", "id", "text", "--author")
     add("attach", "id", "path")
-    add("block", "id", ("--kind", "required"), ("--reason", "required"))
+    add("block", "id", ("--kind", "required"), ("--reason", "required"), "--retry-after")
+    add("wait-ci", ("--pr", int))
     add("complete", "id", "--summary", "--summary-file")
     add("request-review", "id", "--reviewer", "--summary", "--summary-file")
     add("request-changes", "id", ("--reason", "required"))
@@ -202,7 +203,8 @@ def build() -> argparse.ArgumentParser:
     add("grant", "id", ("--allow", "append"), "--approved", ("--revoke", "flag"))
     add("grants", "id")
     add(
-        "watch", "--kinds", ("--since", int), ("--since-start", "flag"), ("--follow", "flag"),
+        "watch", "--kinds", ("--actionable", "flag"), ("--since", int), ("--since-start", "flag"),
+        ("--follow", "flag"),
     )  # fmt: skip
     add("runs", "id")
     add("log", "id", ("--run", int), ("--tail", int))
@@ -452,7 +454,7 @@ def v_request_review(
     summary = text_arg(a.summary, a.summary_file) or ""
     t = store.get_task(conn, a.id)
     store.owner_builder(conn, t)
-    number, url = worker._check_pr(t, summary)
+    number, url = worker._check_pr(t)
     done = store.request_review_owner(
         conn, a.id, summary, pr_number=number, pr_url=url, reviewer=a.reviewer
     )
@@ -489,6 +491,10 @@ def v_grants(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
 def v_watch(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
     board = find_board(conn, a)
     kinds = [k for k in (a.kinds or "").split(",") if k]
+    if a.actionable:
+        if kinds:
+            raise Usage("pass --actionable or --kinds, not both")
+        kinds = list(store.ACTIONABLE_EVENTS)
     if a.since is not None:
         cursor = a.since
     elif a.since_start:
@@ -501,6 +507,8 @@ def v_watch(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, 
             batch = store.events_since(conn, cursor, kinds=kinds, board=board, limit=500)
             for ev in batch:
                 cursor = ev["id"]
+                if a.actionable and not store.actionable(ev):
+                    continue
                 if a.json:
                     ev = {**ev, "payload": json.loads(ev["payload"]) if ev["payload"] else None}
                     print(json.dumps(views.clean_obj({"schema": 1, **ev})), flush=True)
@@ -723,7 +731,9 @@ def worker_args(a: argparse.Namespace) -> dict[str, Any]:
             args["filename"] = os.path.basename(a.path)
             args["data"] = read_upload(a.path)
         case "block":
-            args.update(kind=a.kind, reason=a.reason)
+            args.update(kind=a.kind, reason=a.reason, retry_after=a.retry_after)
+        case "wait-ci":
+            args["pr"] = a.pr
         case "complete" | "request-review":
             args["summary"] = text_arg(a.summary, a.summary_file)
             args["reviewer"] = getattr(a, "reviewer", None)
@@ -752,12 +762,17 @@ def run_as_worker(a: argparse.Namespace) -> int:
         present(a, data, views.show_text(data))
     elif a.verb == "context":
         present(a, data, data["text"].rstrip("\n"))
+    elif a.verb == "wait-ci":
+        present(a, data, data["summary"])
+        return worker.CI_EXIT[data["state"]]
     else:
         present(a, data, "already done" if data.get("noop") else None)
     return 0
 
 
 def owner(a: argparse.Namespace) -> int:
+    if a.verb == "wait-ci":
+        raise NotAllowed("wait-ci is a worker verb; it waits on the CI of the run's own card")
     if a.verb in RUN_ONLY:
         raise NotAllowed(
             f"{a.verb} ends a worker's run, so only a worker can use it; "
