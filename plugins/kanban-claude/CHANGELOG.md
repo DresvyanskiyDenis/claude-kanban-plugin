@@ -23,6 +23,7 @@
 
 ### Changed
 
+- The `/kanban-board` pane is reworked: a needs-you strip with the command that answers each need, a health header (daemon, pause, 24 h spend), richer rows, card detail, recently merged, toasts, and dock and inline layouts. It keeps the last good read through a failed refresh, reopens per folder and finds `~/.local/bin/kanban` when PATH lacks it. `kanban --json digest` adds event ids, block reasons, the pause and the daemon's state; `list` adds `block_kind`. After upgrading, run `/kanban-board` once in each folder where you want the pane back.
 - Workers are isolated from the owner's setup. Every plugin the account enables is off in a run except kanban-claude, its declared dependency and `worker.plugin_allowlist`. Workers start with `--strict-mcp-config` and a private 0600 MCP file per run, holding the role's servers plus `worker.mcp_allowlist`. Per-role permission denies are passed with `--settings`.
 - Each card's workers get their own `TMPDIR` under `$KANBAN_WORK/tmp/<card>`. A worker in a repo whose origin is not github.com gets `GH_HOST`.
 - A paused login is re-probed after 5, 15, then 60 minutes, and `account_paused` carries the card, the error and the login command.

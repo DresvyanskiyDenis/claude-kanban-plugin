@@ -69,7 +69,17 @@ To follow the board from a session, run `kanban watch --actionable --wait --boar
 
 ## Board pane
 
-`/kanban-board` docks a short board beside the transcript. Under the board's name and its open count, a bar across the pane shows the board's cards by status, done on the left and triage on the right. Below it, each lane with cards (running, in review, blocked, up next) is a round card in its status color, listing up to four cards, then `+N more`, each with its priority, role and the age of its last change. The footer is the bar's legend for done and triage. Colors are Claude Code theme keys, so the pane follows your theme. While the pane has the keyboard (click it, or Ctrl+X then Tab), `r` reloads it. It reads `kanban --json list --sort priority` for the board of the session's folder every 15 s while the pane is open, and only then. `/kanban-board SLUG` pins another board; `/kanban-board close` closes it. A pane left open reopens in the next session; one closed by hand stays closed. Card workers never load it. `kanban list`, `show` and `watch` are the full view.
+`/kanban-board` opens the board of the session's folder beside the transcript; `/kanban-board SLUG` pins another board and `/kanban-board close` closes it. It reads `kanban --json list` and `kanban --json digest --since 24h` every 15 s while the pane is open, and only then; `r` refreshes now while the pane has the keyboard (click it, or Ctrl+X then Tab).
+
+- **Needs you** comes first: questions, grants, merges, logins and quota walls, each with its reason and the command that answers it. A new need raises one toast.
+- A health line shows whether the daemon is live, whether dispatch is paused, and the last 24 hours' spend.
+- Running, Review, Blocked and Up next list each card's priority, owner, age, and PR number or block kind; then Recently merged and a bar of the board's spread.
+- Select a card for its detail (branch, PR, last run, comments); `back` (or `b`) returns.
+- Inline from 72 columns the lanes sit side by side; in a dock or narrower they stack. Colors are Claude Code theme keys, so the pane follows your theme.
+- A failed refresh keeps the last good read and says how stale it is and why.
+- The pane reopens next session only in the same folder, and only if that board still reads; one closed by hand stays closed. It needs `kanban` on PATH or at `~/.local/bin/kanban`. Card workers never load it.
+
+`kanban list`, `show` and `watch` are the full view.
 
 It is a Claude Code mod and needs Claude Code 2.1.287 or later; an organization's managed settings can disable mods. Narrower than 144 columns, Claude Code places a pane it was not asked for only from 110 columns, so a reopened pane may wait until the terminal is wide enough.
 
