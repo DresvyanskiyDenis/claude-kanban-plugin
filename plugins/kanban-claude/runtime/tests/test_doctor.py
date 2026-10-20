@@ -14,9 +14,10 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import __version__, install, jira, launchd, paths, store, views
+from kanban_claude import __version__, github, install, jira, launchd, paths, store, views
 
 from .conftest import PLUGIN, Kb, enable
+from .fake_gh import Fake as GhFake
 from .fake_jira_mcp import Fake
 
 Report = dict[str, Any]
@@ -50,10 +51,10 @@ def edit_stamp(**fields: Any) -> None:
     install.write_stamp({**stamp, **fields})
 
 
-def test_a_healthy_install_passes_all_twenty_checks(doctor: Doctor) -> None:
+def test_a_healthy_install_passes_all_twenty_one_checks(doctor: Doctor) -> None:
     report = doctor()
-    assert [c["n"] for c in report["checks"]] == list(range(1, 21))
-    assert [c["status"] for c in report["checks"]] == ["ok"] * 20, report["checks"]
+    assert [c["n"] for c in report["checks"]] == list(range(1, 22))
+    assert [c["status"] for c in report["checks"]] == ["ok"] * 21, report["checks"]
     assert report["ok"] and report["code"] == 0 and report["fixed"] == []
 
 
@@ -122,7 +123,7 @@ def test_a_config_row_for_the_removed_web_port_does_not_trip_the_doctor(
     doctor: Doctor, conn: Any
 ) -> None:
     store.config_put(conn, "web.port", 9129)
-    assert [c["status"] for c in doctor()["checks"]] == ["ok"] * 20
+    assert [c["status"] for c in doctor()["checks"]] == ["ok"] * 21
 
 
 def test_a_released_daemon_lock_fails_check_2(doctor: Doctor, daemon_up: int) -> None:
@@ -518,3 +519,40 @@ def test_probe_starts_the_server_and_wants_the_seven_tools(
     jira_fake.mode(start=True)
     check = got(doctor("--probe"), 20)
     assert check["status"] == "fail" and "did not start" in check["detail"]
+
+
+def test_check_21_is_ok_while_no_board_is_paired_with_github(doctor: Doctor) -> None:
+    assert got(doctor(), 21)["detail"] == "no board is paired with a GitHub repository"
+
+
+def test_check_21_needs_the_project_scope_only_for_a_board_with_a_project(
+    doctor: Doctor, conn: Any, gh_fake: GhFake
+) -> None:
+    gh_fake.update(scopes="'repo'")
+    assert got(doctor(), 21)["status"] == "ok"
+    store.board_edit(conn, "main", github_project="o/7")
+    check = got(doctor(), 21)
+    assert check["status"] == "fail" and "no project scope" in check["detail"]
+    assert check["fix"] == "gh auth refresh -h github.com -s project"
+    gh_fake.update(scopes="'repo', 'project'")
+    assert got(doctor(), 21)["status"] == "ok"
+
+
+def test_check_21_probe_reads_the_repository_and_the_project(
+    doctor: Doctor, conn: Any, gh_fake: GhFake
+) -> None:
+    store.board_edit(conn, "main", github_project="o/7")
+    assert "repository and project read" in got(doctor("--probe"), 21)["detail"]
+    gh_fake.update(project=False)
+    check = got(doctor("--probe"), 21)
+    assert check["status"] == "fail" and "project o/7 not found" in check["detail"]
+
+
+def test_a_paused_github_sync_warns_with_its_reason(
+    doctor: Doctor, conn: Any, gh_fake: GhFake
+) -> None:
+    gh_fake.update(auth="bad")
+    github.sync_all(conn)
+    check = got(doctor(), 21)
+    assert check["status"] == "warn" and "main: " in check["detail"] and "401" in check["detail"]
+    assert check["fix"] == "kanban github sync"

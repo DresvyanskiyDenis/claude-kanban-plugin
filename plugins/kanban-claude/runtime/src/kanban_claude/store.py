@@ -170,6 +170,25 @@ UPDATE task_runs SET
 WHERE model_usage IS NOT NULL;
 """
 
+# GitHub sync: the pairing (repo as `host/owner/repo`, an optional search query, an optional Projects v2
+# board as `owner/number`), the id of every comment that crossed, and one link per card. A link keeps
+# what each side held at the last sync, as `jira_links` does, plus the issue's and the project item's
+# node ids. `base_state` is `done` or `open`: the issue's state, the only thing read back from GitHub
+# besides the text.
+GITHUB_SCHEMA = """
+ALTER TABLE boards ADD COLUMN github_repo TEXT;
+ALTER TABLE boards ADD COLUMN github_query TEXT;
+ALTER TABLE boards ADD COLUMN github_project TEXT;
+ALTER TABLE task_comments ADD COLUMN gh_comment_id TEXT;
+CREATE UNIQUE INDEX idx_comments_github ON task_comments(gh_comment_id);
+CREATE TABLE github_links (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id), repo TEXT NOT NULL, number INTEGER NOT NULL,
+  node_id TEXT NOT NULL, project_item_id TEXT, base_title TEXT NOT NULL, base_body TEXT NOT NULL,
+  card_title TEXT NOT NULL, card_body TEXT NOT NULL, base_state TEXT, gh_updated TEXT,
+  synced_status TEXT NOT NULL, synced_version INTEGER NOT NULL, conflict TEXT, error TEXT,
+  created_at INTEGER NOT NULL, UNIQUE (repo, number));
+"""
+
 # Forward-only: MIGRATIONS[i] takes user_version i to i + 1 (STO-03).
 MIGRATIONS: list[str] = [
     SCHEMA,
@@ -178,6 +197,7 @@ MIGRATIONS: list[str] = [
     CLAIM_SCHEMA,
     MODERNIZE_SCHEMA,
     METRICS_SCHEMA,
+    GITHUB_SCHEMA,
 ]
 BACKUPS_KEPT = 5
 
@@ -268,10 +288,18 @@ DEFAULTS: dict[str, Any] = {
         "triage": "To Do", "todo": "To Do", "ready": "To Do",
         "running": "In Progress", "review": "In Progress", "done": "Done",
     },
+    "github.label": "kanban-claude",
+    "github.poll_s": 120,
+    # the Status options of a new Projects v2 board; only used when a board has --github-project
+    "github.status_map": {
+        "triage": "Todo", "todo": "Todo", "ready": "Todo",
+        "running": "In Progress", "review": "In Progress", "done": "Done",
+    },
 }  # fmt: skip
 
 BOUNDS: dict[str, tuple[int, int | None]] = {
     "jira.poll_s": (1, None),
+    "github.poll_s": (1, None),
     "dispatch.max_in_progress": (1, None),
     "dispatch.tick_seconds": (1, None),
     "dispatch.failure_limit": (1, None),
@@ -460,11 +488,13 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         )
     ):
         raise Refused("notify.command must be a command line or a non-empty list of strings (argv)")
-    if key == "jira.status_map" and not (
+    if key in ("jira.status_map", "github.status_map") and not (
         isinstance(value, dict)
         and all(k in STATUSES and isinstance(v, str) and v for k, v in value.items())
     ):
-        raise Refused(f"jira.status_map maps card statuses ({', '.join(STATUSES)}) to status names")
+        raise Refused(f"{key} maps card statuses ({', '.join(STATUSES)}) to status names")
+    if key == "github.label" and not value.strip():
+        raise Refused("github.label must not be empty")
     with tx(conn):
         config_put(conn, key, value)
         event(conn, None, "config_changed", actor, {"key": key, "value": value})
@@ -675,6 +705,42 @@ def _jira_fields(
     return fields
 
 
+REPO_RE = re.compile(r"(?:([A-Za-z0-9.-]+)/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
+
+
+def _github_fields(
+    current: str | None, repo: str | None, query: str | None, project: str | None, off: bool
+) -> dict[str, Any]:
+    """The GitHub pairing, with the repo stored as `host/owner/repo`. `--github-off` unpairs and
+    keeps the links."""
+    if off:
+        if repo or query is not None or project is not None:
+            raise Refused("--github-off cannot be combined with the other --github-* flags")
+        return {"github_repo": None, "github_query": None, "github_project": None}
+    fields: dict[str, Any] = {}
+    if repo is not None:
+        m = REPO_RE.fullmatch(repo)
+        if not m:
+            raise Refused(f"--github-repo {repo!r} must look like [HOST/]OWNER/REPO")
+        fields["github_repo"] = f"{m[1] or 'github.com'}/{m[2]}/{m[3]}"
+        if fields["github_repo"] != current:
+            fields |= {"github_query": None, "github_project": None}
+    if (query is not None or project is not None) and not (repo or current):
+        raise Refused("--github-query and --github-project need a paired board; pass --github-repo")
+    if query is not None:
+        fields["github_query"] = query or None
+    if project is not None:
+        if project and not re.fullmatch(r"[A-Za-z0-9_.-]+/[1-9][0-9]*", project):
+            raise Refused(f"--github-project {project!r} must look like OWNER/NUMBER")
+        fields["github_project"] = project or None
+    return fields
+
+
+def _one_tracker(jira_project: str | None, github_repo: str | None) -> None:
+    if jira_project and github_repo:
+        raise Refused("a board pairs with Jira or with GitHub, not both; unpair one first")
+
+
 def board_create(
     conn: sqlite3.Connection,
     slug: str,
@@ -684,6 +750,9 @@ def board_create(
     claude_config_dir: str | None = None,
     jira_project: str | None = None,
     jira_jql: str | None = None,
+    github_repo: str | None = None,
+    github_query: str | None = None,
+    github_project: str | None = None,
     actor: str = OWNER,
 ) -> dict[str, Any]:
     validate.slug(slug)
@@ -692,12 +761,22 @@ def board_create(
         if conn.execute("SELECT 1 FROM boards WHERE slug = ?", (slug,)).fetchone():
             raise Refused(f"board {slug!r} already exists; edit it with: kanban boards edit {slug}")
         jira = _jira_fields(conn, None, jira_project, jira_jql, False)
+        gh = _github_fields(None, github_repo, github_query, github_project, False)
+        _one_tracker(jira.get("jira_project"), gh.get("github_repo"))
+        cols = {
+            "slug": slug,
+            "name": name or slug,
+            "default_workdir": workdir,
+            "claude_config_dir": claude_config_dir,
+            "jira_project": jira.get("jira_project"),
+            "jira_jql": jira.get("jira_jql"),
+            **gh,  # only the GitHub columns that are set, so a board can still be made before the migration
+            "created_at": now(),
+        }
         conn.execute(
-            "INSERT INTO boards(slug, name, default_workdir, claude_config_dir, jira_project, "
-            "jira_jql, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (slug, name or slug, workdir, claude_config_dir, jira.get("jira_project"),
-             jira.get("jira_jql"), now()),
-        )  # fmt: skip
+            f"INSERT INTO boards({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+            tuple(cols.values()),
+        )
         event(conn, {"board": slug, "id": None}, "board_created", actor, {"slug": slug})
     return {"slug": slug}
 
@@ -712,6 +791,10 @@ def board_edit(
     jira_project: str | None = None,
     jira_jql: str | None = None,
     jira_off: bool = False,
+    github_repo: str | None = None,
+    github_query: str | None = None,
+    github_project: str | None = None,
+    github_off: bool = False,
     actor: str = OWNER,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {}
@@ -721,14 +804,25 @@ def board_edit(
         fields["name"] = name
     if claude_config_dir is not None:
         fields["claude_config_dir"] = claude_config_dir
-    if not (fields or jira_project or jira_jql is not None or jira_off):
+    if not (
+        fields or jira_project or jira_jql is not None or jira_off
+        or github_repo or github_query is not None or github_project is not None or github_off
+    ):  # fmt: skip
         raise Refused(
             "nothing to change; pass --default-workdir, --name, --claude-config-dir, "
-            "--jira-project, --jira-jql or --jira-off"
+            "--jira-project, --jira-jql, --jira-off, --github-repo, --github-query, "
+            "--github-project or --github-off"
         )
     with tx(conn):
         b = get_board(conn, slug)
         fields |= _jira_fields(conn, b["jira_project"], jira_project, jira_jql, jira_off)
+        fields |= _github_fields(
+            b["github_repo"], github_repo, github_query, github_project, github_off
+        )
+        _one_tracker(
+            fields.get("jira_project", b["jira_project"]),
+            fields.get("github_repo", b["github_repo"]),
+        )
         sets = ", ".join(f"{k} = ?" for k in fields)
         conn.execute(f"UPDATE boards SET {sets} WHERE slug = ?", [*fields.values(), slug])
         event(conn, {"board": slug, "id": None}, "board_edited", actor, {"fields": sorted(fields)})
@@ -1255,7 +1349,10 @@ def reopen(
             owner_merge=0, retry_after=None, assignee=t["implementer"] or t["assignee"],
             ignore_merge=0,
         )  # fmt: skip
-        if actor != "jira":  # jira.py pushes owner comments to the issue it just reopened from
+        if actor not in (
+            "jira",
+            "github",
+        ):  # the sync pushes owner comments to the issue it reopened from
             _comment(conn, t, "owner", f"REOPEN: {reason}", actor)
         event(conn, t, "reopened", actor, {"reason": reason})
         children = conn.execute(
@@ -1402,15 +1499,27 @@ def archive(
                     actor,
                     {"key": key, "reason": "deleted"},
                 )
+            gh_linked = conn.execute(
+                "SELECT repo, number FROM github_links WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if gh_linked:
+                event(
+                    conn,
+                    {"board": t["board"], "id": None},
+                    "github_unlinked",
+                    actor,
+                    {"issue": f"{gh_linked['repo']}#{gh_linked['number']}", "reason": "deleted"},
+                )
             conn.execute(
-                "UPDATE task_events SET task_id = NULL WHERE task_id = ? AND kind = 'jira_unlinked'",
+                "UPDATE task_events SET task_id = NULL WHERE task_id = ? "
+                "AND kind IN ('jira_unlinked', 'github_unlinked')",
                 (task_id,),
             )
             conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
             for table, col in (
                 ("task_attachments", "task_id"), ("task_comments", "task_id"), ("grants", "task_id"),
                 ("task_runs", "task_id"), ("task_links", "parent_id"), ("task_links", "child_id"),
-                ("jira_links", "task_id"),
+                ("jira_links", "task_id"), ("github_links", "task_id"),
             ):  # fmt: skip
                 conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (task_id,))
             conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))

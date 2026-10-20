@@ -16,6 +16,7 @@ from . import (
     daemon,
     dispatcher,
     doctor,
+    github,
     gitops,
     install,
     jira,
@@ -84,6 +85,7 @@ VERB_HELP = {
     "gate": "run a gate command; the full output goes to a log, a short digest is printed",
     "boards": "list, create, edit or archive boards",
     "jira": "import, link, unlink or sync Jira issues",
+    "github": "import, link, unlink or sync GitHub issues",
     "create": "create a card",
     "specify": "fill in a triage card and start it",
     "list": "list the board's cards and why each waits",
@@ -180,9 +182,11 @@ def build() -> argparse.ArgumentParser:
     add("request-changes", "id", ("--reason", "required"))
     add(
         "boards", "action", ("slug", "?"), "--default-workdir", "--name", "--claude-config-dir",
-        "--jira-project", "--jira-jql", ("--jira-off", "flag"),
+        "--jira-project", "--jira-jql", ("--jira-off", "flag"), "--github-repo", "--github-query",
+        "--github-project", ("--github-off", "flag"),
     )  # fmt: skip
     add("jira", "action", ("ref", "?"), ("issue", "?"))
+    add("github", "action", ("ref", "?"), ("issue", "?"))
     add(
         "create", "title", *card, *text, "--idempotency-key", ("--parent", "append"),
         ("--triage", "flag"), ("--grant", "append"), "--approved",
@@ -343,11 +347,19 @@ def v_boards(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
         "claude_config_dir": a.claude_config_dir,
         "jira_project": a.jira_project,
         "jira_jql": a.jira_jql,
+        "github_repo": a.github_repo,
+        "github_query": a.github_query,
+        "github_project": a.github_project,
     }
     if a.action == "edit":
-        return store.board_edit(conn, a.slug, **opts, jira_off=a.jira_off), None
-    if not a.default_workdir or a.jira_off:
-        raise Usage("boards create needs --default-workdir PATH and cannot take --jira-off")
+        edited = store.board_edit(
+            conn, a.slug, **opts, jira_off=a.jira_off, github_off=a.github_off
+        )
+        return edited, None
+    if not a.default_workdir or a.jira_off or a.github_off:
+        raise Usage(
+            "boards create needs --default-workdir PATH and cannot take --jira-off or --github-off"
+        )
     return store.board_create(conn, a.slug, **opts), None
 
 
@@ -369,6 +381,58 @@ def v_jira(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, A
         case "status", None, None:
             return jira_status(conn)
     raise Usage("usage: kanban jira import ISSUE | link ID ISSUE | unlink ID | sync | status")
+
+
+@owner_verb("github")
+def v_github(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    """`sync` runs a pass now, in this process, under the daemon's lock."""
+    match a.action, a.ref, a.issue:
+        case "import", ref, None if ref:
+            got = github.import_issue(conn, need_board(conn, a), ref)
+            return got, f"card {got['id']} created for {got['issue']}"
+        case "link", ref, issue if ref and issue:
+            got = github.link_card(conn, ref, issue)
+            return got, f"card {got['id']} linked to {got['issue']}"
+        case "unlink", ref, None if ref:
+            got = github.unlink_card(conn, ref)
+            return got, f"card {got['id']} unlinked from {got['issue']}"
+        case "sync", None, None:
+            return github_sync(conn, find_board(conn, a))
+        case "status", None, None:
+            return github_status(conn)
+    raise Usage("usage: kanban github import ISSUE | link ID ISSUE | unlink ID | sync | status")
+
+
+def github_sync(conn: sqlite3.Connection, board: str | None) -> tuple[dict[str, Any], str | None]:
+    done = github.sync_all(conn, board)
+    stuck = [
+        b
+        for b in github.status(conn)["boards"]
+        if b["board"] not in done and board in (None, b["board"])
+    ]
+    lines = [f"{slug}: synced" for slug in done]
+    lines += [f"{b['board']}: paused: {b['paused']['detail']}" for b in stuck]
+    if stuck:
+        raise Error("\n".join(lines))
+    return {"boards": done}, "\n".join(lines) or "no board is paired with a GitHub repository"
+
+
+def github_status(conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    data = github.status(conn)
+    lines = []
+    for b in data["boards"]:
+        pull = views.local(b["last_pull_at"]) if b.get("last_pull_at") else "never"
+        paused = b.get("paused")
+        note = (
+            f"  PAUSED since {views.local(paused['since'])}: {paused['detail']}" if paused else ""
+        )
+        project = f"  project {b['project']}" if b["project"] else ""
+        lines.append(f"{b['board']}  {b['repo']}{project}  last pull {pull}{note}")
+    lines += [
+        f"{ln['repo'].partition('/')[2]}#{ln['number']}  card {ln['task_id']}  {ln['conflict'] or ln['error']}"
+        for ln in data["links"]
+    ]
+    return data, "\n".join(lines) or "no board is paired with a GitHub repository"
 
 
 def jira_sync(conn: sqlite3.Connection, board: str | None) -> tuple[dict[str, Any], str | None]:
