@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 // A short board beside the transcript: what runs, what waits for review, what is next.
-// The web board stays the full view; this pane only reads `kanban --json list`.
+// This pane only reads `kanban --json list`.
 
 const PANE = 'kanban'
 const POLL_MS = 15_000
@@ -35,14 +35,6 @@ async function load($: EngineInterface, board: string | null): Promise<Snapshot>
   } catch (err) {
     return { error: `kanban did not run: ${err instanceof Error ? err.message : String(err)}` }
   }
-}
-
-// `kanban board` mints a one-time login link and hands it to the browser.
-async function openBoard($: EngineInterface) {
-  const r = await $.process
-    .run(['kanban', 'board'], { cwd: await $.session.cwd(), timeoutMs: 5_000 })
-    .catch((err: unknown) => ({ exitCode: -1, stderr: `kanban did not run: ${String(err)}` }))
-  if (r.exitCode !== 0) $.ui.toast(r.stderr.trim() || `kanban board exited ${r.exitCode}`)
 }
 
 function ago(seconds: number): string {
@@ -128,7 +120,6 @@ export const register: Register = on => {
     const controls = (
       <Box flexDirection="row" gap={2}>
         <Button key="refresh" label="refresh" hotkey="r" plain dimColor onPress={() => refresh($)} />
-        <Button key="open" label="web board" hotkey="o" plain dimColor onPress={() => openBoard($)} />
       </Box>
     )
     if ('error' in s) {

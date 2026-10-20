@@ -3,14 +3,13 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from kanban_claude import cli, install, launchd, paths, store, web
+from kanban_claude import cli, daemon, install, launchd, paths, store
 from kanban_claude.procs import Procs
 
 from .fake_jira_mcp import Fake
@@ -384,21 +383,23 @@ def knobs(fake_claude: Path) -> Callable[..., None]:
 
 
 @pytest.fixture
-def board_up(
-    env: Path, knobs: Callable[..., None], monkeypatch: pytest.MonkeyPatch
-) -> Iterator[int]:
-    """What the daemon would serve once launchd starts it, plus the `kanban` entry point uv installs."""
+def entry_point(env: Path, knobs: Callable[..., None], monkeypatch: pytest.MonkeyPatch) -> None:
+    """The `kanban` entry point uv installs; the daemon is not started."""
     entry = Path.home() / ".local" / "bin"
     entry.mkdir(parents=True)
     (entry / "kanban").write_text("#!/bin/sh\n")
     (entry / "kanban").chmod(0o755)
     knobs(FAKE_CLAUDE_LOG=str(env / "claude.log"))
     monkeypatch.setattr(install, "HEALTH_WAIT_S", 0.5)
-    server = web.make_server(paths.dirs(), port=0)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    yield server.port
-    server.shutdown()
-    server.server_close()
+
+
+@pytest.fixture
+def daemon_up(entry_point: None) -> Iterator[int]:
+    """What launchd would start: a process holding `daemon.lock`, as the real daemon does."""
+    fd = daemon.take_lock(paths.ensure_dir(paths.dirs().home) / "daemon.lock")
+    assert fd is not None
+    yield fd
+    os.close(fd)
 
 
 Go = Callable[..., "subprocess.CompletedProcess[str]"]
@@ -473,14 +474,13 @@ def execute(conn: Any, claim: Callable[[str], int], go: Go) -> Execute:
 
 
 @pytest.fixture
-def healthy(kb: Kb, board_up: int, env: Path) -> int:
+def healthy(kb: Kb, daemon_up: int, env: Path) -> None:
     for tool in ("npx", "node"):
         (env / "bin" / tool).write_text("#!/bin/sh\n")
         (env / "bin" / tool).chmod(0o755)
     enable(Path.home() / ".claude")
-    code, _, err = kb("setup", "--port", str(board_up))
+    code, _, err = kb("setup")
     assert code == 0, err
-    return board_up
 
 
 def enable(config_dir: Path, on: bool = True) -> None:

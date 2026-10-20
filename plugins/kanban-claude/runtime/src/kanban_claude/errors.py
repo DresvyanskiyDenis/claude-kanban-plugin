@@ -20,7 +20,7 @@ class Refused(Error):
 
 
 class Stale(Refused):
-    """The card changed after the caller read it (WEB-09); the web board answers 409."""
+    """The card changed after the caller read it."""
 
 
 class NotAllowed(Error):

@@ -3,7 +3,6 @@ import fcntl
 import json
 import os
 import shutil
-import socket
 import stat
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -22,8 +21,8 @@ Setup = Callable[..., tuple[int, str, str]]
 
 
 @pytest.fixture
-def setup(kb: Kb, board_up: int) -> Setup:
-    return lambda *args: kb("setup", "--port", str(board_up), *args)
+def setup(kb: Kb, daemon_up: int) -> Setup:
+    return lambda *args: kb("setup", *args)
 
 
 def claude_calls(env: Path) -> list[dict[str, Any]]:
@@ -46,8 +45,8 @@ def untouched(launchctl_calls: Calls) -> None:
     assert not (paths.dirs().home / "installed.json").exists()
 
 
-def test_setup_loads_the_agent_stamps_the_version_and_names_the_board(
-    setup: Setup, board_up: int, agent_loaded: Callable[[], bool], env: Path
+def test_setup_loads_the_agent_and_stamps_the_version(
+    setup: Setup, agent_loaded: Callable[[], bool], env: Path
 ) -> None:
     code, out, err = setup()
     assert code == 0, err
@@ -56,7 +55,7 @@ def test_setup_loads_the_agent_stamps_the_version_and_names_the_board(
     assert plist and plist["ProgramArguments"] == [str(Path.home() / ".local/bin/kanban"), "daemon"]
     assert stat.S_IMODE(launchd.plist_path().stat().st_mode) == 0o600
     got = stamp()
-    assert got["version"] == __version__ and got["schema"] == 1 and got["port"] == board_up
+    assert got["version"] == __version__ and got["schema"] == 1
     assert got["claude_bin"] == str(env / "bin" / "claude")
     assert got["claude_config_dir"] == str(Path.home() / ".claude")
     path = got["env"]["PATH"].split(":")
@@ -66,10 +65,9 @@ def test_setup_loads_the_agent_stamps_the_version_and_names_the_board(
         '"version":"' in raw
         and stat.S_IMODE(os.stat(paths.dirs().home / "installed.json").st_mode) == 0o600
     )
-    assert "kanban board" in out and f"http://127.0.0.1:{board_up}/" in out
+    assert "is set up" in out
     assert f"using claude at {env / 'bin' / 'claude'}" in err
     assert cfg("claude.bin") == str(env / "bin" / "claude")
-    assert cfg("web.port") == board_up
 
 
 def test_the_probes_run_with_the_worker_flags_from_the_work_directory(
@@ -260,21 +258,21 @@ def test_an_agent_that_does_not_resolve_says_how_to_enable_the_plugin(
     assert agent_loaded() and stamp()["version"] == __version__
 
 
-def test_no_daemon_installs_no_agent_and_does_not_look_for_a_board(
-    kb: Kb, board_up: int, env: Path, launchctl_calls: Calls
+def test_no_daemon_installs_no_agent_and_does_not_wait_for_the_daemon(
+    kb: Kb, entry_point: None, env: Path, launchctl_calls: Calls
 ) -> None:
-    code, out, err = kb("setup", "--port", "1", "--no-daemon")
+    code, out, err = kb("setup", "--no-daemon")
     assert code == 0, err
     assert launchctl_calls() == [] and not launchd.plist_path().exists()
-    assert stamp()["version"] == __version__ and stamp()["port"] == 1
+    assert stamp()["version"] == __version__
 
 
-def test_a_board_that_never_answers_is_reported_with_the_daemon_log(kb: Kb, board_up: int) -> None:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        free = s.getsockname()[1]
-    code, _, err = kb("setup", "--port", str(free))
-    assert code == 1 and f"127.0.0.1:{free}" in err and "daemon.log" in err
+def test_a_daemon_that_never_starts_is_reported_with_the_lock_and_the_daemon_log(
+    kb: Kb, entry_point: None
+) -> None:
+    code, _, err = kb("setup")
+    assert code == 1 and "daemon.lock" in err and "daemon did not start" in err
+    assert "daemon.log" in err
 
 
 # --- upgrade (INS-09) -----------------------------------------------------------------------
@@ -283,7 +281,7 @@ def test_a_board_that_never_answers_is_reported_with_the_daemon_log(kb: Kb, boar
 @pytest.fixture
 def installed(setup: Setup, kb: Kb, monkeypatch: pytest.MonkeyPatch) -> Setup:
     """Setup done by an older release; the process then runs as the current one, as
-    `bootstrap.sh` starts it: with no flags, so the port comes from the stamp."""
+    `bootstrap.sh` starts it: with no flags, so the settings come from the stamp."""
     with monkeypatch.context() as old:
         old.setattr(install, "__version__", OLD)
         assert setup()[0] == 0

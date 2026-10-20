@@ -1,4 +1,6 @@
-"""Jira sync (JIR): a paired board and its issues stay in step through the owner's own Atlassian MCP
+"""Frozen: bug fixes only; delete this module when the `cake` board stops using Jira.
+
+Jira sync (JIR): a paired board and its issues stay in step through the owner's own Atlassian MCP
 server, with no model in the loop. Jira owns the text, the board owns execution.
 
 Every pass runs outside a transaction while it talks to the server; each link is then written in

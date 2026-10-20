@@ -23,7 +23,6 @@ from . import (
     store,
     validate,
     views,
-    web,
     worker,
 )
 from .errors import Error, NotAllowed, NotFound, Refused, Usage
@@ -214,10 +213,8 @@ def build() -> argparse.ArgumentParser:
     add("resume")
     add("config", "action", ("key", "?"), ("value", "?"))
     add("migrate")
-    add("board", ("--revoke", "flag"), ("--no-open", "flag"))
     add(
-        "setup", "--claude-bin", "--claude-config-dir", ("--port", int), ("--no-daemon", "flag"),
-        ("--yes", "flag"),
+        "setup", "--claude-bin", "--claude-config-dir", ("--no-daemon", "flag"), ("--yes", "flag"),
     )  # fmt: skip
     add("doctor", ("--probe", "flag"), ("--fix", "flag"))
     add("uninstall", ("--purge", "flag"), ("--force", "flag"), ("--yes", "flag"))
@@ -667,9 +664,6 @@ def v_config(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
         store.config_set(conn, a.key, value)
         return {"key": a.key, "value": value}, f"{a.key} = {json.dumps(value)}"
     raise Usage("usage: kanban config list | get KEY | set KEY VALUE")
-
-
-OWNER["board"] = web.cli
 
 
 def v_setup(a: argparse.Namespace) -> int:

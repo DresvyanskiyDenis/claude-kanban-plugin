@@ -46,7 +46,7 @@ def set_stamp(text: str | None) -> None:
 @pytest.fixture
 def hook(root: Path, monkeypatch: pytest.MonkeyPatch) -> Hook:
     monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(root))
-    set_stamp(store.dumps({"version": "1.1.0", "schema": 1, "port": 9129}))
+    set_stamp(store.dumps({"version": "1.1.0", "schema": 1}))
 
     def run() -> subprocess.CompletedProcess[str]:
         return subprocess.run(["sh", str(HOOK)], capture_output=True, text=True, check=False)

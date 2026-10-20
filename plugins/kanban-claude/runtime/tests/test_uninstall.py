@@ -21,7 +21,7 @@ def removed(uv_calls: Calls) -> bool:
 
 
 def test_uninstall_unloads_the_daemon_deletes_the_plist_and_the_tool_but_keeps_the_data(
-    kb: Kb, healthy: int, agent_loaded: Callable[[], bool], uv_calls: Calls
+    kb: Kb, healthy: None, agent_loaded: Callable[[], bool], uv_calls: Calls
 ) -> None:
     code, out, err = kb("uninstall")
     assert code == 0, err
@@ -32,7 +32,7 @@ def test_uninstall_unloads_the_daemon_deletes_the_plist_and_the_tool_but_keeps_t
 
 def test_active_runs_refuse_the_uninstall_and_nothing_is_touched(
     kb: Kb,
-    healthy: int,
+    healthy: None,
     conn: Any,
     board: str,
     card: Callable[..., str],
@@ -48,7 +48,7 @@ def test_active_runs_refuse_the_uninstall_and_nothing_is_touched(
 
 def test_force_stops_active_runs_in_the_database_and_leaves_their_runners_to_the_poll(
     kb: Kb,
-    healthy: int,
+    healthy: None,
     conn: Any,
     board: str,
     card: Callable[..., str],
@@ -98,7 +98,7 @@ def worktree_card(conn: Any, repo: Path, branch: str) -> tuple[str, Path]:
 
 
 def test_dirty_and_unpushed_worktrees_are_listed_and_never_removed(
-    kb: Kb, healthy: int, conn: Any, repo: Path
+    kb: Kb, healthy: None, conn: Any, repo: Path
 ) -> None:
     dirty_id, dirty = worktree_card(conn, repo, "feat/dirty")
     (dirty / "scratch.txt").write_text("x")
@@ -115,7 +115,9 @@ def test_dirty_and_unpushed_worktrees_are_listed_and_never_removed(
     assert out.splitlines()[-1] == LAST
 
 
-def test_a_clean_pushed_worktree_is_not_listed(kb: Kb, healthy: int, conn: Any, repo: Path) -> None:
+def test_a_clean_pushed_worktree_is_not_listed(
+    kb: Kb, healthy: None, conn: Any, repo: Path
+) -> None:
     tid, path = worktree_card(conn, repo, "feat/clean")
     git("push", "-q", "-u", "origin", "feat/clean", cwd=path)
     code, out, _ = kb("uninstall")
@@ -123,14 +125,14 @@ def test_a_clean_pushed_worktree_is_not_listed(kb: Kb, healthy: int, conn: Any, 
 
 
 def test_purge_without_yes_is_a_usage_error_and_changes_nothing(
-    kb: Kb, healthy: int, agent_loaded: Callable[[], bool]
+    kb: Kb, healthy: None, agent_loaded: Callable[[], bool]
 ) -> None:
     code, _, err = kb("uninstall", "--purge")
     assert code == 2 and "--yes" in err
     assert agent_loaded()
 
 
-def test_purge_prints_sizes_and_paths_then_deletes_both_directories(kb: Kb, healthy: int) -> None:
+def test_purge_prints_sizes_and_paths_then_deletes_both_directories(kb: Kb, healthy: None) -> None:
     d = paths.dirs()
     (d.work / "scratch").mkdir()
     (d.work / "scratch" / "blob").write_bytes(b"x" * 5000)
@@ -164,7 +166,7 @@ def test_purge_refuses_a_home_that_holds_no_board_database(
 
 
 def test_purge_refuses_a_work_directory_that_holds_anything_kanban_did_not_create(
-    kb: Kb, healthy: int, agent_loaded: Callable[[], bool]
+    kb: Kb, healthy: None, agent_loaded: Callable[[], bool]
 ) -> None:
     d = paths.dirs()
     (d.work / "scratch").mkdir()
@@ -182,7 +184,7 @@ def test_uninstalling_what_was_never_installed_is_quiet_and_creates_nothing(
     assert not (env / "kb-home").exists() and removed(uv_calls)
 
 
-def test_json_lists_what_was_done(kb: Kb, healthy: int, conn: Any, repo: Path) -> None:
+def test_json_lists_what_was_done(kb: Kb, healthy: None, conn: Any, repo: Path) -> None:
     tid, _ = worktree_card(conn, repo, "feat/dirty")
     (repo / ".worktrees" / tid / "x").write_text("x")
     code, out, _ = kb("uninstall", "--json")
