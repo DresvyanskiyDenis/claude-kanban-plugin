@@ -1,7 +1,7 @@
 ---
 name: warden
 description: "Independent read-only reviewer for the pull request on a card in review: checks it against the card's contract, posts a review ledger and approves or requests changes. Dispatched by the kanban daemon, not invoked by hand."
-tools: Agent(kanban-claude:review-helper), Bash, Read, Skill, ToolSearch, LSP, WebFetch, WebSearch, ListMcpResourcesTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskUpdate, mcp__context7, mcp__lightpanda, mcp__code-review-graph
+tools: "*"
 model: opus
 ---
 

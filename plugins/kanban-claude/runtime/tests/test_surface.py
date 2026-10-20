@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 import kanban_claude
-from kanban_claude import cli
+from kanban_claude import cli, runner, store
 
 PLUGIN = Path(__file__).resolve().parents[2]
 REPO = PLUGIN.parents[1]
@@ -47,6 +47,7 @@ SPAWNS = {
     "warden": {"review-helper"},
 }
 WRITERS = {"Edit", "Write"}
+ROLES = ("smith", "designer", "scout", "warden", "atlassian")
 ATLASSIAN_WRITES = {
     "jira_create_issue", "jira_update_issue", "jira_add_comment", "jira_transition_issue",
     "jira_create_issue_link", "confluence_create_page", "confluence_update_page",
@@ -66,6 +67,10 @@ def frontmatter(path: Path) -> dict[str, str]:
 
 
 def tools(role: str) -> list[str]:
+    """A dispatched role gets the runner's `--tools` list; a helper keeps its own allowlist."""
+    if role in ROLES:
+        out: list[str] = store.DEFAULTS[f"tools.{role}"]
+        return out
     return [t.strip() for t in frontmatter(AGENTS[role])["tools"].split(",")]
 
 
@@ -84,7 +89,10 @@ def test_agent_frontmatter(role: str):
     assert re.fullmatch(r'"(?:[^"\\]|\\.)+"', fm["description"]), "description must be quoted"
     assert (fm["model"], fm.get("effort")) == MODEL_EFFORT[role]
     assert not IGNORED_FOR_PLUGIN_AGENTS & fm.keys()
-    assert "tools" in fm and fm["tools"], "tools must be an explicit allowlist"
+    if role in ROLES:
+        assert fm["tools"] == '"*"', "the runner forms a dispatched role's tool list"
+    else:
+        assert fm.get("tools") and fm["tools"] != '"*"', "a helper keeps an explicit allowlist"
 
 
 @pytest.mark.parametrize("role", MODEL_EFFORT)
@@ -96,7 +104,7 @@ def test_tools_are_known_builtins_namespaced_agents_or_pinned_mcp_names(role: st
             m = MCP_NAME.fullmatch(tool)
             assert m and m[1] in MCP_SERVERS, tool
         else:
-            assert tool in BUILTIN, tool
+            assert tool in BUILTIN, tool  # --tools drops a name it does not know
 
 
 @pytest.mark.parametrize("role", MODEL_EFFORT)
@@ -104,42 +112,43 @@ def test_no_agent_is_denied_through_disallowed_tools(role: str):
     assert "Agent(" not in frontmatter(AGENTS[role]).get("disallowedTools", "")
 
 
-@pytest.mark.parametrize("role", MODEL_EFFORT)
-def test_each_role_spawns_only_its_own_helper(role: str):
-    spawned = {
-        t[len("Agent(") : -1].removeprefix(f"{NS}:") for t in tools(role) if t.startswith("Agent(")
-    }
-    assert spawned == SPAWNS.get(role, set())
-    assert "Agent" not in tools(role)
+def test_only_a_role_with_a_helper_gets_the_agent_tool_and_only_for_that_helper():
+    assert {r for r in AGENTS if [t for t in tools(r) if t.startswith("Agent")]} == set(SPAWNS)
+    assert {r: {h} for r, h in runner.HELPERS.items()} == SPAWNS
 
 
 def test_card_checker_has_exactly_the_three_read_tools():
     assert tools("card-checker") == ["Read", "Grep", "Glob"]
 
 
-def test_read_only_roles_cannot_write_files():
-    for role in ("warden", "review-helper", "card-checker"):
+def test_read_only_roles_cannot_write_files_whatever_the_config_says():
+    for role in ("warden", "atlassian", "review-helper", "card-checker"):
         assert not WRITERS & set(tools(role)), role
+    for role in ("warden", "atlassian"):
+        assert set(runner.role_denies(role)) >= WRITERS, role
 
 
 def test_scout_writes_reports_but_cannot_edit():
     assert "Write" in tools("scout") and "Edit" not in tools("scout")
+    assert "Edit" in runner.role_denies("scout")
 
 
 def test_only_the_designer_gets_the_browser():
-    with_browser = {r for r in AGENTS if "mcp__playwright" in tools(r)}
-    assert with_browser == {"designer"}
+    pinned = {
+        p.stem for p in runner.MCP_DIR.glob("*.json") if "playwright" in load_json(p)["mcpServers"]
+    }
+    assert pinned == {"designer"}
+    assert "playwright" not in store.DEFAULTS["worker.mcp_allowlist"]
+    assert not [r for r in AGENTS if "mcp__playwright" in tools(r)]
 
 
 def test_only_the_atlassian_role_has_atlassian():
-    with_atlassian = {r for r in AGENTS if [t for t in tools(r) if "atlassian" in t]}
-    assert with_atlassian == {"atlassian"}
+    assert runner.ROLE_SERVERS == {"atlassian": ("atlassian",)}
+    assert not [r for r in AGENTS if [t for t in tools(r) if "atlassian" in t]]
 
 
-def test_the_atlassian_role_names_its_tools_exactly_and_has_no_destructive_one():
-    mcp = [t for t in tools("atlassian") if t.startswith("mcp__atlassian")]
-    assert all(t.startswith("mcp__atlassian__") for t in mcp)
-    names = {t.removeprefix("mcp__atlassian__") for t in mcp}
+def test_the_atlassian_role_is_limited_to_named_tools_and_none_destructive():
+    names = set(runner.ATLASSIAN_TOOLS)
     assert {n for n in names if "_get_" not in n and "_search" not in n} == ATLASSIAN_WRITES
     assert not [n for n in names if re.search(r"delete|move|remove|sprint|batch|assign", n)]
 

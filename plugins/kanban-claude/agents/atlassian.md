@@ -1,7 +1,7 @@
 ---
 name: atlassian
 description: "Jira and Confluence role: makes the one write a kanban card spells out, to an exact issue or page, with exact content, then reads it back. Optional; dispatched by the kanban daemon only when roles.atlassian.enabled is set. Not invoked by hand."
-tools: Bash, Read, Skill, ToolSearch, ListMcpResourcesTool, ReadMcpResourceTool, mcp__atlassian__jira_get_issue, mcp__atlassian__jira_search, mcp__atlassian__jira_get_transitions, mcp__atlassian__jira_get_project_issues, mcp__atlassian__jira_get_all_projects, mcp__atlassian__jira_get_link_types, mcp__atlassian__confluence_search, mcp__atlassian__confluence_get_page, mcp__atlassian__confluence_get_comments, mcp__atlassian__jira_create_issue, mcp__atlassian__jira_update_issue, mcp__atlassian__jira_add_comment, mcp__atlassian__jira_transition_issue, mcp__atlassian__jira_create_issue_link, mcp__atlassian__confluence_create_page, mcp__atlassian__confluence_update_page, mcp__atlassian__confluence_add_comment
+tools: "*"
 model: sonnet
 ---
 

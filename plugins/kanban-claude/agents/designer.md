@@ -1,7 +1,7 @@
 ---
 name: designer
 description: "Builder role for UI and UX cards: designs and implements interfaces in the card's git worktree, checks them with browser screenshots, opens a pull request and requests review. Dispatched by the kanban daemon, not invoked by hand."
-tools: Agent(kanban-claude:card-helper), Bash, Read, Edit, Write, Skill, ToolSearch, LSP, WebFetch, WebSearch, ListMcpResourcesTool, ReadMcpResourceTool, TaskCreate, TaskGet, TaskList, TaskUpdate, mcp__context7, mcp__lightpanda, mcp__code-review-graph, mcp__playwright
+tools: "*"
 model: sonnet
 ---
 

@@ -91,14 +91,30 @@ def test_r1_the_mcp_config_is_strict_and_always_passed_and_the_rest_follows(
 ) -> None:
     def argv(turns: int | None, resumed: bool) -> list[str]:
         return runner.build_argv(
-            "claude", "p", "scout", "t_1", "m", "e", "{}", 1.5, turns, "sid", resumed, "/m.json"
-        )
+            "claude", "p", "scout", "t_1", "m", "e", "{}", 1.5, turns, "sid", resumed, "/m.json",
+            ["Bash", "Read"],
+        )  # fmt: skip
 
     first, again = argv(7, True), argv(None, False)
     assert "--strict-mcp-config" in first and flag(first, "--mcp-config") == "/m.json"
     assert flag(first, "--max-turns") == "7" and flag(first, "--resume") == "sid"
     assert "--max-turns" not in again and flag(again, "--session-id") == "sid"
     assert flag(again, "--max-budget-usd") == "1.5"
+    assert flag(first, "--tools") == "Bash,Read"
+
+
+def test_d1_the_runner_passes_the_roles_tool_list_and_config_can_shorten_it(
+    conn: Any, card: Card, execute: Execute, env: Path, dump: Path
+) -> None:
+    run = execute(card())
+    assert flag(dumped(env, run["id"])["argv"], "--tools") == ",".join(
+        store.cfg(conn, "tools.smith")
+    )
+    store.config_set(conn, "tools.smith", ["Bash", "Read"])
+    run = execute(card())
+    assert flag(dumped(env, run["id"])["argv"], "--tools") == "Bash,Read"
+    with pytest.raises(store.Refused):
+        store.config_set(conn, "tools.smith", ["Bash", 1])
 
 
 def user_config(config_dir: Path, plugins: dict[str, bool]) -> None:
@@ -163,11 +179,35 @@ def test_d1_the_deny_list_leaves_each_role_only_its_helper_and_what_its_job_need
     assert "Agent(kanban-claude:review-helper)" not in deny("warden")
     assert "Agent(kanban-claude:card-helper)" in deny("warden")
     for role in ("warden", "atlassian"):
-        assert {"Edit", "Write"} <= {*deny(role)}
-    assert "Edit" in deny("scout") and "Write" not in deny("scout")
+        assert {"Edit", "Write", "NotebookEdit"} <= {*deny(role)}
+    assert {"Edit", "NotebookEdit"} <= {*deny("scout")} and "Write" not in deny("scout")
     assert "Edit" not in deny("smith") and "Write" not in deny("smith")
     assert not any(d.startswith("Agent(") for d in deny("atlassian"))
     assert deny("") == deny("card-checker")[:5] == deny("smith")[:5]
+
+
+def test_d1_a_role_may_spawn_only_its_own_helper_and_nothing_else() -> None:
+    def spawn(role: str, agent: str | None, inside: dict[str, str] | None = None) -> int:
+        (entry,) = json.loads(runner.settings_json(Path("/h"), [], role))["hooks"]["PreToolUse"]
+        assert re.fullmatch(entry["matcher"], "Agent") and re.fullmatch(entry["matcher"], "Task")
+        given = {"subagent_type": agent} if agent is not None else {}
+        event = {"tool_name": "Agent", "tool_input": {"prompt": "x", **given}, **(inside or {})}
+        payload = json.dumps(event)
+        cmd = ["/bin/sh", "-c", entry["hooks"][0]["command"]]
+        return subprocess.run(cmd, input=payload, text=True, capture_output=True).returncode  # noqa: S603
+
+    assert spawn("smith", "kanban-claude:card-helper") == 0
+    assert spawn("warden", "kanban-claude:review-helper") == 0
+    blocked = [
+        ("smith", "Explore"), ("smith", "debugger"), ("smith", None),
+        ("warden", "kanban-claude:card-helper"), ("atlassian", "kanban-claude:card-helper"),
+        ("atlassian", ""),
+    ]  # fmt: skip
+    for role, agent in blocked:
+        assert spawn(role, agent) == 2, (role, agent)
+    # a helper inherits the role's Agent tool, so the guard also stops a helper spawning a helper
+    helper = {"agent_id": "a1", "agent_type": "kanban-claude:card-helper"}
+    assert spawn("smith", "kanban-claude:card-helper", helper) == 2
 
 
 def write_mcp(path: Path, servers: dict[str, Any]) -> None:
@@ -186,9 +226,12 @@ def test_p21_only_the_allowlisted_user_servers_and_the_roles_own_reach_the_worke
     default = str(Path.home() / ".claude")
     got = runner.mcp_config(conn, "smith", ws, default)
     assert got == {"mcpServers": {"context7": {"command": "npx"}, "lightpanda": {"command": "lp"}}}
-    assert set(runner.mcp_config(conn, "atlassian", ws, default)["mcpServers"]) == {
-        "context7", "lightpanda", "atlassian",
-    }  # fmt: skip
+    # its agent file used to filter the shared servers out; now the runner leaves them out
+    assert set(runner.mcp_config(conn, "atlassian", ws, default)["mcpServers"]) == {"atlassian"}
+    own = runner.mcp_config(conn, "atlassian", ws, default)["mcpServers"]["atlassian"]
+    assert own == {"command": "uvx", "env": {"ENABLED_TOOLS": ",".join(runner.ATLASSIAN_TOOLS)}}
+    store.config_set(conn, "worker.mcp_allowlist", ["context7", "atlassian"])
+    assert set(runner.mcp_config(conn, "scout", ws, default)["mcpServers"]) == {"context7"}
     store.config_set(conn, "worker.mcp_allowlist", [])
     assert runner.mcp_config(conn, "smith", ws, default) == {"mcpServers": {}}
     assert set(runner.mcp_config(conn, "designer", ws, default)["mcpServers"]) == {"playwright"}
