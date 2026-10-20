@@ -107,7 +107,7 @@ Run `kanban watch --follow --actionable --board <slug>` under the Monitor tool. 
 | `merge_failed` | tell the owner the reason; `kanban merge-retry <id>`, or `promote <child> --ignore-merge --reason` when a child should start anyway |
 | `gave_up`, `stopped` | read `kanban runs <id>` and `kanban log <id> --tail 80`, then decide with the owner |
 | `quota_wall` | nothing to fix. One per wall, for every board on the account: `kind` is `hard` (the limit was hit) or `soft` (close to it, new runs hold), `until` is when it lifts (epoch seconds), `cards` is how many cards wait. Dispatch resumes by itself. Tell the owner when `until` is hours away |
-| `auth_lost`, `account_paused` | the Claude login is gone: tell the owner; after they sign in, `kanban resume` |
+| `auth_lost`, `account_paused` | the Claude login is gone: tell the owner the `login` command the payload names; after they sign in, `kanban resume`. The daemon also probes the login again after 5, 15, then every 60 minutes and lifts the pause itself (`account_resumed`) |
 | `crashed`, `timed_out`, `interrupted` | the dispatcher retries; no action unless it becomes `gave_up` |
 
 The owner's own feedback goes back to the builder by the card's status: `kanban reopen-review <id> --reason "<feedback>"` on a card in `review`, `kanban reopen <id> --reason "<feedback>"` on a card already `done` (PR open or merged). A comment alone moves nothing. Both write the reason as a `REOPEN:` comment, which the builder's next run reads.
