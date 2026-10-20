@@ -402,6 +402,18 @@ def test_digest_and_followups_verbs(
     assert json.loads(kb("followups", "--json")[1])["followups"][0]["text"] == "tidy the flags"
 
 
+def test_digest_json_says_whether_the_daemon_holds_its_lock(
+    kb: Kb, workdirs: tuple[Path, Path], env: Path
+) -> None:
+    assert json.loads(kb("digest", "--json")[1])["daemon"] == {"alive": False, "version": None}
+    with (env / "kb-home" / "daemon.lock").open("w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write('{"pid": 1, "version": "9.9"}')
+        f.flush()
+        held = json.loads(kb("digest", "--json")[1])["daemon"]
+    assert held == {"alive": True, "version": "9.9"}
+
+
 def test_stats_reports_account_walls_and_pauses(kb: Kb, workdirs: tuple[Path, Path]) -> None:
     conn = store.connect()
     store.account_set(conn, "/acct", hard_until=store.now() + 600)

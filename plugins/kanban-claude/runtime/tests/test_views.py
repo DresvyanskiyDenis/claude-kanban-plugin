@@ -174,6 +174,21 @@ def test_digest_opens_with_what_still_needs_the_owner(
     assert text.index(stuck) < text.index(merged)
 
 
+def test_digest_items_carry_the_event_id_and_the_block_reason_and_the_pause(
+    conn: Any, card: Card, board: str
+) -> None:
+    tid = card("Stuck")
+    run = store.claim(conn, tid)
+    assert run
+    store.block(conn, run, "needs_input", "which db?")
+    d = views.digest(conn, board, 7200)
+    assert d["needs_you"][0]["reason"] == "which db?" and isinstance(d["needs_you"][0]["id"], int)
+    assert d["paused"] is None
+    assert views.cards_list(conn, board)[0]["block_kind"] == "needs_input"
+    store.pause(conn, "lunch")
+    assert views.digest(conn, board, 7200)["paused"]["detail"] == "lunch"
+
+
 def test_digest_window_and_empty_board(conn: Any, card: Card, clock: Any, board: str) -> None:
     tid = card("Old")
     store.event(conn, store.get_task(conn, tid), "merged", "housekeeping", {"pr": 1})
