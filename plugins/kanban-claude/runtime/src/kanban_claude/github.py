@@ -262,6 +262,13 @@ def norm(text: str | None) -> str:
     return "\n".join(line.rstrip() for line in lines).strip()
 
 
+def is_public(info: Issue) -> bool:
+    """A created issue cannot be unpublished, so a repository not shown to be private is treated as
+    public. `internal` (GitHub Enterprise) is visible only inside the enterprise."""
+    vis = info.get("visibility")
+    return vis not in ("private", "internal") if vis else info.get("private") is not True
+
+
 def is_done(issue: Issue) -> bool:
     return issue.get("state") == "closed"
 
@@ -449,6 +456,9 @@ def push(
             edit["state_reason"] = "completed"
     try:
         if edit:
+            # the PATCH carries text from the pass's snapshot: GitHub edited since would be overwritten
+            if m.push and repo.get(lk["number"]).get("updated_at") != issue.get("updated_at"):
+                raise LinkError("issue changed in GitHub during the pass; merged on the next one")
             call(repo.host, f"{repo.path}/issues/{lk['number']}", method="PATCH", body=edit)
             pushed += sorted(m.push) + (["status"] if plan.state else [])
         if repo.project and (plan.option or item is None):
@@ -643,6 +653,11 @@ def last_error(conn: sqlite3.Connection, t: Row) -> str | None:
     return None if row is None else str(row[0])
 
 
+def detail_of(e: Exception) -> str:
+    """The message of an error this module raises; the type too for any other, whose text may be a bare key."""
+    return str(e) if isinstance(e, Error | sqlite3.Error) else f"{type(e).__name__}: {e}"
+
+
 def export(conn: sqlite3.Connection, repo: Repo, label: str) -> None:
     """An issue for each card without one. A card that was unlinked, or whose issue is gone, stays out;
     so do finished cards, which would only be history. A `github_exporting` marker goes in before the
@@ -687,11 +702,14 @@ def export(conn: sqlite3.Connection, repo: Repo, label: str) -> None:
                     body={"title": t["title"], "body": t["body"], "labels": [label]},
                 )  # fmt: skip
             issue = repo.comments(hit)
-        except LinkError as e:
-            log.warning("%s: %s", t["id"], e)
+        except Paused:
+            raise
+        except Exception as e:  # noqa: BLE001 - one card's failure must not stop the others
+            detail = detail_of(e)
+            log.warning("%s: %s", t["id"], detail)
             with store.tx(conn):
-                if last_error(conn, t) != str(e):
-                    store.event(conn, t, "github_error", "github", {"detail": str(e)})
+                if last_error(conn, t) != detail:
+                    store.event(conn, t, "github_error", "github", {"detail": detail})
             continue
         with store.tx(conn):
             add_link(conn, t, repo.name, issue, "github", adopted=adopted, extra={"created": True})
@@ -742,7 +760,11 @@ def sync_board(conn: sqlite3.Connection, repo: Repo) -> None:
     card."""
     slug, started, label = repo.slug, store.now(), store.cfg(conn, "github.label")
     repo.use_project()
-    export(conn, repo, label)
+    public = is_public(call(repo.host, repo.path) or {})
+    if public:
+        log.warning("%s is public: cards are not exported to it", repo.name)
+    else:
+        export(conn, repo, label)
     since = (store.state_get(conn, f"github:{slug}") or {}).get("last_pull_at")
     window = None if since is None else iso(since - 120)
     links = {
@@ -773,13 +795,18 @@ def sync_board(conn: sqlite3.Connection, repo: Repo) -> None:
     for n, issue in found.items():
         try:
             sync_one(conn, repo, n, issue)
-        except (LinkError, Refused, sqlite3.Error) as e:
+        except Paused:
+            raise
+        except Exception as e:  # noqa: BLE001 - one link's failure must not stop the others
             clean = False
-            log.warning("%s: %s", repo.ref(n), e)
-            link_error(conn, repo.name, n, str(e))
+            log.warning("%s: %s", repo.ref(n), detail_of(e))
+            link_error(conn, repo.name, n, detail_of(e))
     with store.tx(conn):
         st = store.state_get(conn, f"github:{slug}") or {}
         st.pop("paused", None)
+        st.pop("export_skipped", None)
+        if public:
+            st["export_skipped"] = f"{repo.name} is public; cards are not exported to it"
         if clean:
             st["last_pull_at"] = started
         store.state_put(conn, f"github:{slug}", st)

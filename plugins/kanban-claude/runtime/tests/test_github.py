@@ -1,11 +1,13 @@
 """The GitHub sync against tests/fake_gh.py: a real `gh` process per call, state in a JSON file."""
 
+import logging
 import sqlite3
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
-from kanban_claude import github, housekeeping, store, views
+from kanban_claude import cli, github, housekeeping, store, views
 from kanban_claude.errors import Refused
 
 from .conftest import Kb
@@ -108,6 +110,27 @@ def test_both_changed_a_field_github_wins_and_the_cards_text_is_kept_in_a_commen
     writes = len(gh_fake.writes())
     sync()
     assert len(gh_fake.writes()) == writes
+
+
+def test_an_edit_made_in_github_during_the_pass_is_not_overwritten_by_the_cards_push(
+    conn: sqlite3.Connection, gh_fake: Fake, card: Card, sync: Sync
+) -> None:
+    tid = card("Title", body="body")
+    sync()
+    store.edit(conn, tid, {"title": "Card title v2"})
+    store.comment(conn, tid, "owner note")
+    gh_fake.after("GET repos/o/r/issues", 1, title="GitHub title v2")
+    sync()
+    assert gh_fake.issue(1)["title"] == "GitHub title v2"
+    assert not [c for c in gh_fake.writes() if c["method"] == "PATCH"]
+    assert "changed in GitHub" in link(conn, tid)["error"]
+    assert gh_fake.comments(1) == ["owner note"]
+    sync()
+    assert store.get_task(conn, tid)["title"] == "GitHub title v2"
+    [(_, text)] = [c for c in comments(conn, tid) if c[1].startswith("[github] conflict")]
+    assert "Card title v2" in text
+    assert gh_fake.issue(1)["title"] == "GitHub title v2"
+    assert link(conn, tid)["error"] is None
 
 
 def test_github_text_on_an_approved_card_sends_it_to_triage_and_a_running_card_waits(
@@ -409,6 +432,102 @@ def test_archive_rm_leaves_a_tombstone_so_the_issue_is_not_imported_again(
     sync()
     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     assert len(gh_fake.get()["issues"]) == 1
+
+
+# --- one bad link, a public repository ------------------------------------------------------
+
+
+def test_a_link_that_raises_anything_does_not_stop_the_pass_for_the_others(
+    conn: sqlite3.Connection, gh_fake: Fake, card: Card, sync: Sync,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    bad, good = card("Bad"), card("Good")
+    sync()
+    gh_fake.edit(1, title="Bad v2")
+    gh_fake.edit(2, title="Good v2")
+    real = github.sync_link
+
+    def sync_link(c: sqlite3.Connection, repo: github.Repo, lk: sqlite3.Row, issue: Any) -> None:
+        if lk["number"] == 1:
+            raise KeyError("body")
+        real(c, repo, lk, issue)
+
+    monkeypatch.setattr(github, "sync_link", sync_link)
+    assert sync() == ["main"]
+    assert store.get_task(conn, good)["title"] == "Good v2"
+    assert "KeyError" in link(conn, bad)["error"]
+    assert link(conn, good)["error"] is None
+    assert paused(conn) is None
+    assert kinds(conn, "github_error") == ["github_error"]
+
+
+def test_a_card_whose_export_raises_anything_does_not_stop_the_others(
+    conn: sqlite3.Connection, gh_fake: Fake, card: Card, sync: Sync,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    bad, good = card("Bad"), card("Good")
+    real = github.call
+
+    def call(host: str, endpoint: str, **kw: Any) -> Any:
+        if (kw.get("body") or {}).get("title") == "Bad":
+            raise KeyError("title")
+        return real(host, endpoint, **kw)
+
+    monkeypatch.setattr(github, "call", call)
+    sync()
+    assert link(conn, good)
+    assert not conn.execute("SELECT 1 FROM github_links WHERE task_id = ?", (bad,)).fetchone()
+    assert kinds(conn, "github_error") == ["github_error"]
+
+
+def exports(gh_fake: Fake) -> list[dict[str, Any]]:
+    return [
+        c for c in gh_fake.writes() if (c["method"], c["endpoint"]) == ("POST", "repos/o/r/issues")
+    ]
+
+
+def test_cards_are_not_exported_to_a_public_repository_but_its_issues_still_sync(
+    conn: sqlite3.Connection, gh_fake: Fake, card: Card, sync: Sync,
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    linked = card("Linked")
+    sync()
+    assert len(exports(gh_fake)) == 1
+    assert "export_skipped" not in github.status(conn)["boards"][0]
+    gh_fake.update(visibility="public")
+    new = card("New")
+    store.edit(conn, linked, {"title": "Linked v2"})
+    gh_fake.add("From GitHub")
+    with caplog.at_level(logging.WARNING, logger="kanban.github"):
+        assert sync() == ["main"]
+    assert len(exports(gh_fake)) == 1
+    assert not conn.execute("SELECT 1 FROM github_links WHERE task_id = ?", (new,)).fetchone()
+    assert gh_fake.issue(1)["title"] == "Linked v2"
+    assert conn.execute("SELECT COUNT(*) FROM tasks WHERE title = 'From GitHub'").fetchone()[0] == 1
+    assert "public" in github.status(conn)["boards"][0]["export_skipped"]
+    assert "EXPORT OFF" in (cli.github_status(conn)[1] or "")
+    assert len([r for r in caplog.records if "public" in r.getMessage()]) == 1
+    gh_fake.update(visibility="private")
+    sync()
+    assert len(exports(gh_fake)) == 2
+    assert "export_skipped" not in github.status(conn)["boards"][0]
+
+
+@pytest.mark.parametrize(
+    ("info", "public"),
+    [
+        ({"visibility": "private", "private": True}, False),
+        ({"visibility": "internal", "private": True}, False),
+        ({"visibility": "public", "private": False}, True),
+        ({"private": True}, False),
+        ({"private": False}, True),
+        ({}, True),
+    ],
+)
+def test_a_repository_not_shown_to_be_private_counts_as_public(
+    info: dict[str, Any], public: bool
+) -> None:
+    assert github.is_public(info) is public
 
 
 # --- pausing --------------------------------------------------------------------------------

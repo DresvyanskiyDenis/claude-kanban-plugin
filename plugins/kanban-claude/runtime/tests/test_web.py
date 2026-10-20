@@ -394,6 +394,11 @@ def test_stats_need_the_v6_columns_and_say_so_on_a_v5_database(
 # --- streams --------------------------------------------------------------------------------
 
 
+def test_a_stream_line_of_an_odd_shape_is_shown_raw_not_a_server_error() -> None:
+    line = b'{"type":"assistant","message":"x"}\n'
+    assert [e["k"] for e in web.decode(line, 7)] == ["raw"]
+
+
 def test_stream_events_are_readable_and_noise_is_dropped(
     get: Get, run_row: Callable[..., int]
 ) -> None:

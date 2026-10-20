@@ -8,6 +8,7 @@ themselves, except what only a result carries: API time, permission denials and 
 import collections
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -158,18 +159,22 @@ class Measure:
 
     def init_params(self) -> dict[str, Any]:
         i = self.init or {}
+
+        def seq(key: str) -> list[Any]:  # a field of another shape counts as empty, never a crash
+            v = i.get(key)
+            return list(v) if isinstance(v, list) else []
+
         servers = [
             {"name": s.get("name"), "status": s.get("status")}
-            for s in i.get("mcp_servers", ()) if isinstance(s, dict)
+            for s in seq("mcp_servers") if isinstance(s, dict)
         ]  # fmt: skip
-        plugins = [p.get("name") if isinstance(p, dict) else p for p in i.get("plugins") or ()]
+        plugins = [p.get("name") if isinstance(p, dict) else p for p in seq("plugins")]
         return {
             "model": i.get("model"),
             "permissionMode": i.get("permissionMode") or i.get("permission_mode"),
             "claude_code_version": i.get("claude_code_version") or i.get("claudeCodeVersion"),
-            "tools": list(i.get("tools") or ()), "mcp_servers": servers,
-            "skills": list(i.get("skills") or ()), "plugins": plugins,
-            "agents": list(i.get("agents") or ()),
+            "tools": seq("tools"), "mcp_servers": servers,
+            "skills": seq("skills"), "plugins": plugins, "agents": seq("agents"),
         }  # fmt: skip
 
 
@@ -205,6 +210,11 @@ def backfill(conn: sqlite3.Connection) -> dict[str, int]:
                 if m is None:
                     skipped += 1  # the sidecar is gone (retention) or unreadable
                     continue
-                store.record_measure(conn, run, m, advisor="inherit")
+                try:
+                    store.record_measure(conn, run, m, advisor="inherit")
+                except Exception as e:  # noqa: BLE001 - one odd stream must not stop the rest
+                    print(f"backfill: run {run['id']} skipped: {e!r}", file=sys.stderr)
+                    skipped += 1
+                    continue
                 filled += 1
     return {"filled": filled, "skipped": skipped}

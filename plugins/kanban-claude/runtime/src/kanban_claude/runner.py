@@ -696,7 +696,10 @@ class Runner:
             verdict = classify.Verdict("interrupted", "the runner was signalled")
         with store.tx(self.conn):
             store.record_result(self.conn, run, code, res)
-            store.record_measure(self.conn, run, self.measure)
+            try:
+                store.record_measure(self.conn, run, self.measure)
+            except Exception:  # noqa: BLE001 - counting must never cost a paid run its result
+                traceback.print_exc()
             ended = store.end_run(
                 self.conn, self.run_id, verdict.outcome, "retry", actor="runner",
                 event_kind=verdict.outcome, retry_after=verdict.retry_after, error=verdict.error,

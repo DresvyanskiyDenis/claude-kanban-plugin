@@ -444,6 +444,14 @@ def test_r7_the_run_line_is_posted_as_a_comment(conn: Any, card: Card, execute: 
     ), lines[0]
 
 
+def test_an_init_event_of_an_odd_shape_never_costs_the_run_its_result(
+    conn: Any, card: Card, execute: Execute
+) -> None:
+    tid = card()
+    row = execute(tid, "odd_init", terminal=["complete", tid, "--summary", "ok"])
+    assert row["outcome"] == "completed" and row["cost_usd"] == 0.12, dict(row)
+
+
 def test_the_log_says_when_the_worker_already_ended_the_run(
     card: Card, claim: Claim, go: Go
 ) -> None:

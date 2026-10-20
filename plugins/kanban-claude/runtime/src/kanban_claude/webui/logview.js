@@ -1,7 +1,7 @@
 // The transcript of one run, read from /api/run/stream: paged back and forward by byte offset,
 // optionally following a live run. Also the raw text log, and the controls that wrap both.
 
-import { ApiError, api, compact, copyBtn, debounce, dur, emptyState, h, highlight, icon, int, md, money, qs, shortModel } from "./util.js";
+import { ApiError, api, compact, copyBtn, debounce, dur, emptyState, h, highlight, icon, int, md, money, qs, safeUrl, shortModel } from "./util.js";
 
 const GROUPS = {
   text: "messages", user: "messages", thinking: "messages", advisor: "messages", final: "messages", init: "messages",
@@ -324,7 +324,7 @@ export class Transcript {
   }
 
   b_note(ev) {
-    const text = ev.url ? h("a", { href: ev.url, target: "_blank", rel: "noopener noreferrer" }, ev.text) : ev.text;
+    const text = safeUrl(ev.url) ? h("a", { href: ev.url, target: "_blank", rel: "noopener noreferrer" }, ev.text) : ev.text;
     return h("div", { class: "blk b-line dim" }, h("span", { class: "dot" }), h("span", { class: "mono" }, ev.title), h("span", { class: "mono wrap" }, text));
   }
 

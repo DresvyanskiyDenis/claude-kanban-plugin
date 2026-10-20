@@ -430,6 +430,8 @@ def github_status(conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]
         note = (
             f"  PAUSED since {views.local(paused['since'])}: {paused['detail']}" if paused else ""
         )
+        if b.get("export_skipped"):
+            note += f"  EXPORT OFF: {b['export_skipped']}"
         project = f"  project {b['project']}" if b["project"] else ""
         lines.append(f"{b['board']}  {b['repo']}{project}  last pull {pull}{note}")
     lines += [

@@ -21,6 +21,9 @@ function fmt(key, v) {
 
 const nice = (k) => k.replace(/_m?s$/, "").replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 
+// an object of numbers as a strip of labelled values; nested objects are left out
+const kv = (o) => h("dl", { class: "strip tight" }, Object.entries(o).filter(([, v]) => typeof v !== "object").map(([k, v]) => h("div", null, h("dt", null, nice(k)), h("dd", { class: "mono num" }, fmt(k, v)))));
+
 function table(rows, opts = {}) {
   if (!rows || !rows.length) return null;
   const cols = opts.cols || Object.keys(rows[0]).filter((k) => typeof rows[0][k] !== "object" || rows[0][k] === null);
@@ -208,13 +211,13 @@ export function createStats(root, S, nav) {
       add(panel("Spend per day", chart, null, true));
     }
     add(panel("Spend by role", table(roles.map((r) => ({ ...r, per_run: r.runs ? r.cost / r.runs : null })), { cols: ["role", "runs", "cost", "per_run"], bars: ["cost"], labels: { per_run: "Per run" } })));
-    add(panel("Runtime by role", table(d.runtime_by_role, { bars: ["total_seconds", "seconds", "runtime_seconds"] })));
+    add(panel("Runtime by role", table(d.runtime_by_role, { bars: ["total_s"] })));
     add(panel("Role by model", table(d.cost_by_role_model, { bars: ["cost"] }), null, true));
     add(panel("Tokens by model", table(d.tokens_by_model, { cols: ["model", "runs", "input", "output", "cache_write", "cache_read", "cost"], bars: ["input", "output", "cache_write", "cache_read"], labels: { cache_write: "Cache write", cache_read: "Cache read" } }), "bars scale per column", true));
     const arms = d.advisor_arms;
     add(panel("Advisor arms", Array.isArray(arms) ? table(arms) : null, "same cards, different advisor setting", true));
     const pac = d.per_approved_card;
-    add(panel("Cost per approved card", Array.isArray(pac) ? table(pac) : pac && typeof pac === "object" ? h("dl", { class: "strip tight" }, Object.entries(pac).filter(([, v]) => typeof v !== "object").map(([k, v]) => h("div", null, h("dt", null, nice(k)), h("dd", { class: "mono num" }, fmt(k, v))))) : null));
+    add(panel("Cost per approved card", Array.isArray(pac) ? table(pac) : pac && typeof pac === "object" ? kv(pac) : null));
     add(panel("Cost by model", table(d.cost_by_model, { cols: ["model", "cost"], bars: ["cost"] })));
     if (outcomes.length) {
       const sum = outcomes.reduce((a, o) => a + o.runs, 0);
@@ -225,9 +228,9 @@ export function createStats(root, S, nav) {
       if (Array.isArray(d[key]) && d[key].length) add(panel(title, bars(d[key])));
     }
     if (d.harness_totals && typeof d.harness_totals === "object") {
-      add(panel("Harness health", h("dl", { class: "strip tight" }, Object.entries(d.harness_totals).filter(([, v]) => typeof v !== "object").map(([k, v]) => h("div", null, h("dt", null, nice(k)), h("dd", { class: "mono num" }, fmt(k, v)))))));
+      add(panel("Harness health", kv(d.harness_totals)));
     }
-    add(panel("Guards", Array.isArray(d.guards) ? table(d.guards) : null));
+    add(panel("Guards", d.guards && typeof d.guards === "object" ? kv(d.guards) : null, "warden reviews"));
     const acc = d.accounts || [];
     if (acc.length) add(panel("Accounts", table(acc.map((a) => ({ name: a.name || a.account || a.id, state: a.state || a.status, detail: a.detail || a.reason || "" })), { cols: ["name", "state", "detail"] })));
     out.append(grid);

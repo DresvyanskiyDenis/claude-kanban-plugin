@@ -334,7 +334,7 @@ def align(path: Path, offset: int) -> int:
 def decode(line: bytes, at: int, caps: bool = True) -> list[dict[str, Any]]:
     try:
         return convert(json.loads(line), at, caps)
-    except ValueError:
+    except Exception:  # noqa: BLE001 - a line of any shape shows raw, never as a server error
         text, t = clip(line.decode(errors="replace").rstrip("\n"), TEXT_CAP)
         return [{"k": "raw", "at": at, "i": 0, "text": text, "trunc": t}]
 

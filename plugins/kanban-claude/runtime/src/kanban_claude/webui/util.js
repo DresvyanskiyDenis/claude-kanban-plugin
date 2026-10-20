@@ -250,6 +250,8 @@ export function debounce(fn, ms) {
 
 const INLINE = /`([^`]+)`|\*\*([^*]+)\*\*|(?<![\w*])\*([^*\n]+)\*(?!\w)|\[([^\]]+)\]\(([^)\s]+)\)|(https?:\/\/[^\s<>)\]]+)/g;
 const SAFE_URL = /^(https?:\/\/|mailto:)/i;
+// a link only to the web or mail; anything else (javascript:, data:) is no link
+export const safeUrl = (u) => (typeof u === "string" && SAFE_URL.test(u) ? u : null);
 
 export function inline(text) {
   const frag = document.createDocumentFragment();

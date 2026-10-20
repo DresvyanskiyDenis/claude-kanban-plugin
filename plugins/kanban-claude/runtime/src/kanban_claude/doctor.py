@@ -481,6 +481,9 @@ def jira_pairing(c: Ctx) -> Result:
 
 @check(21, "GitHub pairing")
 def github_pairing(c: Ctx) -> Result:
+    have = c.conn.execute("PRAGMA user_version").fetchone()[0]
+    if have < len(store.MIGRATIONS):
+        return warn(f"not checked: the database is at schema {have}; see check 5")
     boards = github.paired(c.conn)
     if not boards:
         return ok("no board is paired with a GitHub repository")

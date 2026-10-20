@@ -142,6 +142,13 @@ def test_init_params_keep_the_shape_of_the_init_event() -> None:
     assert p["mcp_servers"] == [{"name": "c7", "status": "connected"}]
 
 
+def test_init_params_take_an_init_event_of_any_shape() -> None:
+    m = feed({"type": "system", "subtype": "init", "mcp_servers": None, "tools": 5, "plugins": 5,
+              "skills": "x", "agents": {"a": 1}})  # fmt: skip
+    p = m.init_params()
+    assert [p[k] for k in ("tools", "mcp_servers", "plugins", "skills", "agents")] == [[]] * 5
+
+
 def test_the_param_env_allowlist_holds_no_secret_name() -> None:
     assert not [
         k for k in measure.PARAM_ENV if any(w in k for w in ("TOKEN", "KEY", "SECRET", "PASS"))
@@ -242,6 +249,28 @@ def test_backfill_leaves_a_run_that_has_not_ended_alone(
     side.write_text(stream(result(1)))
     conn.execute("UPDATE task_runs SET stream_path = ? WHERE id = ?", (str(side), run))
     assert measure.backfill(conn) == {"filled": 0, "skipped": 0}
+
+
+def test_backfill_skips_a_run_it_cannot_measure_and_fills_the_rest(
+    conn: Any, card: Card, execute: Execute, tmp_path: Path, monkeypatch: Any
+) -> None:
+    bad, good = execute(card()), execute(card())
+    for run in (bad, good):
+        side = tmp_path / f"{run['id']}.jsonl"
+        side.write_text(stream(result(1)))
+        conn.execute("UPDATE task_runs SET harness = NULL, stream_path = ? WHERE id = ?",
+                     (str(side), run["id"]))  # fmt: skip
+    real = store.record_measure
+
+    def flaky(c: Any, run: Any, m: Any, **kw: Any) -> Any:
+        if run["id"] == bad["id"]:
+            raise TypeError("a stream nobody expected")
+        return real(c, run, m, **kw)
+
+    monkeypatch.setattr(store, "record_measure", flaky)
+    assert measure.backfill(conn) == {"filled": 1, "skipped": 1}
+    got = conn.execute("SELECT harness FROM task_runs WHERE id = ?", (good["id"],)).fetchone()[0]
+    assert got is not None
 
 
 def test_stats_new_keys_on_a_measured_board(conn: Any, card: Card, execute: Execute) -> None:

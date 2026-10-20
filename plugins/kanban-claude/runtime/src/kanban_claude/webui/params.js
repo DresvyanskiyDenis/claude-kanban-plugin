@@ -1,7 +1,7 @@
 // The Parameters tab: every field the card carries, then every run's launch parameters and what
 // its session actually loaded. Parts a run did not record (runs older than schema 6) are left out.
 
-import { chips, copyBtn, dur, emptyState, h, icon, int, kv, money, qs, sectionHead, shellQuote, shortModel, stamp } from "./util.js";
+import { chips, copyBtn, dur, emptyState, h, icon, int, kv, money, qs, safeUrl, sectionHead, shellQuote, shortModel, stamp } from "./util.js";
 
 const GROUPS = [
   ["Execution", ["assignee", "implementer", "model_override", "reasoning_effort", "budget_usd", "max_runtime_seconds", "max_retries", "skills", "touches", "idempotency_key"]],
@@ -27,7 +27,7 @@ function value(key, v) {
   if (/_at$/.test(key) || key === "retry_after") return typeof v === "number" ? `${stamp(v)}` : String(v);
   if (key === "budget_usd") return money(v);
   if (key === "max_runtime_seconds") return dur(v);
-  if (key === "pr_url") return h("a", { href: v, target: "_blank", rel: "noopener noreferrer" }, v);
+  if (key === "pr_url" && safeUrl(v)) return h("a", { href: v, target: "_blank", rel: "noopener noreferrer" }, v);
   if (typeof v === "object") return h("code", null, JSON.stringify(v));
   return String(v);
 }

@@ -1,6 +1,6 @@
 // The card dialog: Overview, Parameters, Runs, Logs, Comments. One <dialog> slid in from the right.
 
-import { ApiError, ago, api, compact, dur, emptyState, h, icon, int, kv, md, money, pill, qs, sectionHead, shortModel, stamp, statusPill, trimId } from "./util.js";
+import { ApiError, ago, api, compact, dur, emptyState, h, icon, int, kv, md, money, pill, qs, safeUrl, sectionHead, shortModel, stamp, statusPill, trimId } from "./util.js";
 import { logsPanel } from "./logview.js";
 import { paramsPanel } from "./params.js";
 
@@ -114,7 +114,7 @@ export function createDrawer(dlg, nav, getNow) {
         t.priority ? pill("p" + t.priority, "prio") : null,
         run && (run.model || t.model_override) && h("span", { class: "mono dim" }, [shortModel(run.model || t.model_override), run.effort || t.reasoning_effort].filter(Boolean).join(" · ")),
         h("span", { class: "mono" }, money(card.cost)),
-        t.pr_url && h("a", { class: "pill pr " + (t.merge_state ? "m-" + t.merge_state : ""), href: t.pr_url, target: "_blank", rel: "noopener noreferrer" }, icon("pr"), "PR #" + t.pr_number + (t.merge_state ? " " + t.merge_state : ""))));
+        safeUrl(t.pr_url) && h("a", { class: "pill pr " + (t.merge_state ? "m-" + t.merge_state : ""), href: t.pr_url, target: "_blank", rel: "noopener noreferrer" }, icon("pr"), "PR #" + t.pr_number + (t.merge_state ? " " + t.merge_state : ""))));
     dlg.setAttribute("aria-labelledby", "dr-title");
   }
 
@@ -179,7 +179,7 @@ export function createDrawer(dlg, nav, getNow) {
       ["Branch", t.branch_name && h("span", { class: "mono" }, t.branch_name, t.base_branch ? ` from ${t.base_branch}` : "")],
       ["Worktree", [t.workspace_kind, t.worktree_state].filter(Boolean).join(", ") || null],
       ["Workdir", t.workspace_path && h("code", null, t.workspace_path)],
-      ["Pull request", t.pr_url && h("a", { href: t.pr_url, target: "_blank", rel: "noopener noreferrer" }, `#${t.pr_number} (${t.merge_state || "open"})`)],
+      ["Pull request", safeUrl(t.pr_url) && h("a", { href: t.pr_url, target: "_blank", rel: "noopener noreferrer" }, `#${t.pr_number} (${t.merge_state || "open"})`)],
       ["Created", `${stamp(t.created_at)} (${ago(t.created_at, now)})`, "mono"],
       ["Updated", `${stamp(t.updated_at)} (${ago(t.updated_at, now)})`, "mono"],
       ["Finished", t.completed_at ? stamp(t.completed_at) : undefined, "mono"],

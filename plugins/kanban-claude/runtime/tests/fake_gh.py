@@ -70,6 +70,13 @@ class Fake:
         s["issues"][str(n)]["updated_at"] = iso(s["now"])
         self.put(s)
 
+    def after(self, line: str, n: int, **fields: Any) -> None:
+        """Once, right after the call `METHOD endpoint` is answered, issue `n` is edited in GitHub: the
+        answer a pass already holds goes stale."""
+        s = self.get()
+        s.setdefault("after", {})[line] = {str(n): fields}
+        self.put(s)
+
     def comment(self, n: int, body: str, login: str = "alice") -> str:
         s = self.get()
         s["cseq"] = s.get("cseq", 0) + 1
@@ -226,7 +233,11 @@ def api(s: dict[str, Any], args: list[str]) -> Any:
     if s["hidden"] and parts[0] == "repos":
         die("gh: Not Found (HTTP 404)")
     if len(parts) == 3:
-        return {"full_name": "/".join(parts[1:])}
+        visibility = s.get("visibility", "private")
+        return {
+            "full_name": "/".join(parts[1:]), "visibility": visibility,
+            "private": visibility != "public",
+        }  # fmt: skip
     if len(parts) == 4 and method == "GET":
         return page(issues_get(s, params), params)
     if len(parts) == 4:
@@ -280,10 +291,14 @@ def main() -> None:
         sys.exit(2)
     try:
         out = api(s, args[1:])
+        text = json.dumps(out)
+        last = s["calls"][-1]
+        for n, fields in s.get("after", {}).pop(f"{last['method']} {last['endpoint']}", {}).items():
+            s["issues"][n].update(fields, updated_at=iso(s["now"]))
     finally:
         save(s)
     if out is not None:
-        print(json.dumps(out))
+        print(text)
 
 
 if __name__ == "__main__":

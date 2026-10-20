@@ -525,6 +525,15 @@ def test_check_21_is_ok_while_no_board_is_paired_with_github(doctor: Doctor) -> 
     assert got(doctor(), 21)["detail"] == "no board is paired with a GitHub repository"
 
 
+def test_check_21_waits_for_the_schema_upgrade_on_an_older_database(
+    doctor: Doctor, conn: Any
+) -> None:
+    conn.execute("ALTER TABLE boards DROP COLUMN github_repo")
+    conn.execute(f"PRAGMA user_version = {len(store.MIGRATIONS) - 1}")
+    check = got(doctor(), 21)
+    assert check["status"] == "warn" and "check 5" in check["detail"], check
+
+
 def test_check_21_needs_the_project_scope_only_for_a_board_with_a_project(
     doctor: Doctor, conn: Any, gh_fake: GhFake
 ) -> None:

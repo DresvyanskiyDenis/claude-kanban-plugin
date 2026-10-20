@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-x","permissionMode":"auto","mcp_servers":null,"tools":5,"plugins":5,"skills":"x","agents":{"a":1}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":3,"result":"Done.","total_cost_usd":__COST__,"session_id":"s1"}

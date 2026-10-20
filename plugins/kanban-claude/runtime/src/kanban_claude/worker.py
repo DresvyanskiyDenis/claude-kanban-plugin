@@ -9,7 +9,8 @@ import re
 import sqlite3
 import subprocess
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -172,13 +173,19 @@ def gate_log(t: sqlite3.Row, run: sqlite3.Row) -> Path:
             k += 1
 
 
-def gate_digest(lines: list[str], limit: int) -> list[str]:
-    """At most `limit` lines of a gate's output: the failure-looking ones first (once each, in
-    order, half the budget at most), then the tail, which is where test runners print their summary."""
-    bad = list(dict.fromkeys(x for x in lines if GATE_RE.search(x)))[: limit - limit // 2]
+def gate_digest(lines: Iterable[str], limit: int) -> tuple[int, list[str]]:
+    """The line count of a gate's output and at most `limit` lines of it: the failure-looking ones
+    first (once each, in order, half the budget at most), then the tail, which is where test runners
+    print their summary. Streams the lines, so a huge log never sits in memory."""
+    cap, bad, last, n = limit - limit // 2, dict[str, None](), deque[str](maxlen=limit), 0
+    for x in lines:
+        n += 1
+        if len(bad) < cap and GATE_RE.search(x):
+            bad.setdefault(x)
+        last.append(x)
     room = limit - len(bad) - (1 if bad else 0)
-    tail = [x for x in lines[-room:] if x not in bad] if room > 0 else []
-    return [*bad, *(["--- last lines ---"] if bad and tail else []), *tail][:limit]
+    tail = [x for x in list(last)[-room:] if x not in bad] if room > 0 else []
+    return n, [*bad, *(["--- last lines ---"] if bad and tail else []), *tail][:limit]
 
 
 def gate(t: sqlite3.Row, run: sqlite3.Row, command: list[str], limit: int | None) -> dict[str, Any]:
@@ -201,9 +208,12 @@ def gate(t: sqlite3.Row, run: sqlite3.Row, command: list[str], limit: int | None
             f.write(f"kanban gate: cannot run {argv[0]}: {e.strerror}\n".encode())
             code = 127
     code = code if code >= 0 else 128 - code
-    lines = log.read_text(errors="replace").splitlines()
-    head = f"gate: exit {code} after {round(time.monotonic() - started)}s, {len(lines)} lines; full log: {log}"
-    return {"exit": code, "text": "\n".join([head, *gate_digest(lines, limit)]), "log": str(log)}
+    with log.open(errors="replace") as f:
+        n, digest = gate_digest((x.rstrip("\n") for x in f), limit)
+    head = (
+        f"gate: exit {code} after {round(time.monotonic() - started)}s, {n} lines; full log: {log}"
+    )
+    return {"exit": code, "text": "\n".join([head, *digest]), "log": str(log)}
 
 
 def act(conn: sqlite3.Connection, run_id: int, verb: str, args: dict[str, Any]) -> Any:
