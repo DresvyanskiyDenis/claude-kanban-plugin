@@ -78,6 +78,15 @@ def test_a_dead_thread_makes_the_daemon_exit_non_zero(
     assert "thread tick died" in (env / "kb-home" / "logs" / "daemon.log").read_text()
 
 
+def test_the_daemon_runs_the_notify_thread(
+    env: Path, in_process_daemon: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(daemon, "tick_loop", lambda stop, memory: stop.wait(10))
+    monkeypatch.setattr(daemon, "notify_loop", lambda stop: None)
+    assert daemon.serve() == 1
+    assert "thread notify died" in (env / "kb-home" / "logs" / "daemon.log").read_text()
+
+
 def test_the_housekeeping_loop_runs_what_is_due_after_each_wakeup(
     env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
