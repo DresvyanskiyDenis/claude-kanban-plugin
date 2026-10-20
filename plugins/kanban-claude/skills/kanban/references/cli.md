@@ -61,7 +61,7 @@ Links and waiting:
 - A scout card is `done` when its run completes; its children start at once.
 - A builder card is `done` when warden approves its PR. That is approval, not merge:
   - PR into a feature branch: the daemon sets the merge state `pending`, then `merged`, with the card's `--merge-method` (squash by default). The child waits for `merged`; a `failed` merge holds it too (`merge-retry`, or `promote CHILD --ignore-merge`).
-  - An approval marked `PARTIAL REVIEW`, on any base: merge state `owner` and an `awaiting_owner_merge` event. The daemon never merges it; the child waits until the owner has.
+  - An approval marked `PARTIAL REVIEW` into a feature branch: the merge state stays `pending`, the board records `awaiting_owner_merge`, and `show` prints `merge: pending (owner merges)`. The daemon never merges it; the owner merges the PR on GitHub, the sweep records `merged`, and the child starts then.
   - PR into the default branch: no merge state, so the child starts at approval, before the owner merges. If the child needs the parent's code in its base, use a feature branch.
 - `list` and `show` print why a card waits, e.g. `waits for t_0001 (blocked: transient)`. JSON: `waiting_for`.
 - A `done` card whose PR still waits for the owner's merge shows `awaiting merge` until the daemon's sweep (every ten minutes) sees the PR merged. JSON: `awaiting_merge`.
