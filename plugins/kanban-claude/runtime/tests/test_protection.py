@@ -93,13 +93,6 @@ def test_the_housekeeping_wakeup_refreshes_it_and_then_waits_six_hours(
     assert state(conn)["boards"] == {}
 
 
-def test_publish_replaces_the_daemons_map_key_by_key(conn: Any, used: Path) -> None:
-    live = {"gone": ["x"], "main": ["old"]}
-    store.state_put(conn, protection.STATE_KEY, {"boards": {"main": [SLUG]}})
-    protection.publish(conn, live)
-    assert live == {"main": [SLUG]}
-
-
 def test_a_worktree_card_in_another_repo_counts_for_its_board(
     conn: Any, used: Path, env: Path, set_api: Api
 ) -> None:

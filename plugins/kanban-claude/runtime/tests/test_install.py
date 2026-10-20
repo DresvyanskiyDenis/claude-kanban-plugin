@@ -46,11 +46,11 @@ def bootstrap(plugin: Path, *args: str) -> subprocess.CompletedProcess[str]:
 def test_bootstrap_installs_the_shipped_runtime_and_hands_over_to_its_setup(
     plugin: Path, env: Path, uv_calls: Calls
 ) -> None:
-    p = bootstrap(plugin, "--port", "9130", "--yes")
+    p = bootstrap(plugin, "--no-daemon", "--yes")
     assert p.returncode == 0, p.stderr
     installs = [c for c in uv_calls() if c[:2] == ["tool", "install"]]
     assert installs == [["tool", "install", "--force", "--quiet", f"{plugin}/runtime"]]
-    assert (env / "kanban.log").read_text().split() == ["setup", "--port", "9130", "--yes"]
+    assert (env / "kanban.log").read_text().split() == ["setup", "--no-daemon", "--yes"]
 
 
 @pytest.mark.parametrize("manifest", [COMPACT, PRETTY], ids=["compact", "pretty-printed"])

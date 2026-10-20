@@ -201,8 +201,6 @@ DEFAULTS: dict[str, Any] = {
     "worker.env_passthrough": [],
     "worker.plugin_allowlist": [],
     "worker.mcp_allowlist": ["context7", "lightpanda", "code-review-graph"],
-    "web.port": 9129,
-    "web.jira_base_url": None,
     "retention.stream_days": 30,
     "roles.atlassian.enabled": False,
     "jira.mcp_command": None,
@@ -225,7 +223,6 @@ BOUNDS: dict[str, tuple[int, int | None]] = {
     "dispatch.failure_limit": (1, None),
     "retention.stream_days": (1, None),
     "worker.max_turns": (1, None),
-    "web.port": (1, 65535),
 }
 
 Row = sqlite3.Row

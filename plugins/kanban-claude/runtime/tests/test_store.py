@@ -643,10 +643,6 @@ def test_config_validation(conn: Any) -> None:
 @pytest.mark.parametrize(
     ("key", "value"),
     [
-        ("web.port", 0),
-        ("web.port", 65536),
-        ("web.port", -1),
-        ("web.port", True),
         ("dispatch.tick_seconds", 0),
         ("dispatch.tick_seconds", -5),
         ("dispatch.failure_limit", 0),
@@ -668,7 +664,7 @@ def test_config_set_refuses_values_outside_the_bounds(conn: Any, key: str, value
 
 @pytest.mark.parametrize(
     ("key", "value"),
-    [("web.port", 1), ("web.port", 65535), ("dispatch.tick_seconds", 1), ("worker.max_turns", 1)],
+    [("dispatch.tick_seconds", 1), ("worker.max_turns", 1)],
 )
 def test_config_set_accepts_the_edges_of_the_bounds(conn: Any, key: str, value: Any) -> None:
     store.config_set(conn, key, value)

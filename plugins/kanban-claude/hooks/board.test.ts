@@ -63,14 +63,12 @@ test('the status bar spans the pane, one segment per status that has cards', asy
   await ui.unmount()
 })
 
-test('r reloads the board and o opens the web board', async ($, on) => {
+test('r reloads the board', async ($, on) => {
   const runs = kanban(on, 0, JSON.stringify({ schema: 1, board: 'main', cards }))
   const ui = await $.ui.mount(pane)
   const before = runs.length
   await $.ui.press({ plugin: 'kanban-claude', key: 'refresh' })
   expect(runs.length).toBe(before + 1)
-  await $.ui.press({ plugin: 'kanban-claude', key: 'open' })
-  expect(runs.at(-1)).toEqual(['kanban', 'board'])
   await ui.unmount()
 })
 

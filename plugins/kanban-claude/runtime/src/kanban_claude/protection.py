@@ -95,12 +95,3 @@ def refresh(conn: sqlite3.Connection) -> dict[str, Any]:
     with store.tx(conn):
         store.state_put(conn, STATE_KEY, data)
     return data
-
-
-def publish(conn: sqlite3.Connection, into: dict[str, list[str]]) -> None:
-    """Copy the persisted list into the daemon's map key by key, so the board's request threads
-    never see it half-built."""
-    boards = (store.state_get(conn, STATE_KEY) or {}).get("boards", {})
-    for slug in set(into) - set(boards):
-        into.pop(slug, None)
-    into.update(boards)

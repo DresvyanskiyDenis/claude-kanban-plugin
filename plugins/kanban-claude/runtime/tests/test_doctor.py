@@ -1,10 +1,10 @@
 """OBS-05: `kanban doctor` against a set-up install under tmp_path; each test breaks one thing."""
 
+import fcntl
 import json
 import os
 import plistlib
 import shutil
-import socket
 import stat
 import time
 from collections.abc import Callable
@@ -24,7 +24,7 @@ Doctor = Callable[..., Report]
 
 
 @pytest.fixture
-def doctor(kb: Kb, healthy: int) -> Doctor:
+def doctor(kb: Kb, healthy: None) -> Doctor:
     def run(*args: str) -> Report:
         code, out, _ = kb("doctor", "--json", *args)
         return {**json.loads(out), "code": code}
@@ -58,7 +58,7 @@ def test_a_healthy_install_passes_all_twenty_checks(doctor: Doctor) -> None:
 
 
 def test_the_text_report_lists_every_check_and_the_fix_for_a_failed_one(
-    kb: Kb, healthy: int
+    kb: Kb, healthy: None
 ) -> None:
     edit_stamp(version="0.0.1")
     code, out, _ = kb("doctor")
@@ -74,7 +74,7 @@ def test_without_a_database_doctor_says_so_and_creates_nothing(kb: Kb, env: Path
 
 
 def test_a_database_sqlite_cannot_open_is_reported_with_where_the_backups_are(
-    kb: Kb, healthy: int
+    kb: Kb, healthy: None
 ) -> None:
     (paths.dirs().home / "kanban.db").write_bytes(b"not a database" * 100)
     code, out, _ = kb("doctor", "--json")
@@ -118,14 +118,32 @@ def test_fix_cannot_rebuild_a_plist_when_the_stamp_has_no_environment(doctor: Do
     assert report["fixed"] == [] and "/kanban-claude:setup" in report["unfixed"][0]
 
 
-def test_a_port_nothing_answers_on_fails_check_2(doctor: Doctor) -> None:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        free = s.getsockname()[1]
-    edit_stamp(port=free)
+def test_a_config_row_for_the_removed_web_port_does_not_trip_the_doctor(
+    doctor: Doctor, conn: Any
+) -> None:
+    store.config_put(conn, "web.port", 9129)
+    assert [c["status"] for c in doctor()["checks"]] == ["ok"] * 20
+
+
+def test_a_released_daemon_lock_fails_check_2(doctor: Doctor, daemon_up: int) -> None:
+    fcntl.flock(daemon_up, fcntl.LOCK_UN)
     check = got(doctor(), 2)
-    assert check["status"] == "fail" and f"nothing answers on 127.0.0.1:{free}" in check["detail"]
+    assert check["status"] == "fail" and "daemon is not running" in check["detail"]
     assert "daemon.log" in check["fix"]
+
+
+def test_a_daemon_that_never_started_fails_check_2(doctor: Doctor) -> None:
+    (paths.dirs().home / "daemon.lock").unlink()
+    check = got(doctor(), 2)
+    assert check["status"] == "fail" and "daemon is not running" in check["detail"]
+
+
+def test_a_daemon_on_other_code_fails_the_version_check(doctor: Doctor, daemon_up: int) -> None:
+    os.ftruncate(daemon_up, 0)
+    os.pwrite(daemon_up, json.dumps({"pid": 1, "version": "0.0.1"}).encode(), 0)
+    assert got(doctor(), 2)["status"] == "ok"
+    check = got(doctor(), 3)
+    assert check["status"] == "fail" and "daemon 0.0.1" in check["detail"]
 
 
 def test_a_stale_stamp_or_plugin_fails_the_version_check_naming_each(

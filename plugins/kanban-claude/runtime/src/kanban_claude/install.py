@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from . import __version__, classify, gitops, launchd, runner, store, web
+from . import __version__, classify, daemon, gitops, launchd, runner, store
 from .errors import Error, Refused, Usage
 from .paths import add_file_log, dirs, ensure_dir, write_private
 from .procs import Procs
@@ -294,15 +294,15 @@ def check_agent(claude: str, env: dict[str, str], config_dir: str) -> None:
     )
 
 
-def wait_for_board(port: int, home: Path) -> None:
+def wait_for_daemon() -> None:
     deadline = time.monotonic() + HEALTH_WAIT_S
-    while True:
-        try:
-            web.verify_board(port, home)
-            return
-        except Error as e:
-            if time.monotonic() >= deadline:
-                raise Error(f"{e}; see {home / 'logs' / 'daemon.log'}") from e
+    while daemon.probe() is None:
+        if time.monotonic() >= deadline:
+            home = dirs().home
+            raise Error(
+                f"nothing holds {home / 'daemon.lock'} after {HEALTH_WAIT_S:.0f} s: "
+                f"the daemon did not start; see {home / 'logs' / 'daemon.log'}"
+            )
         time.sleep(0.25)
 
 
@@ -326,8 +326,6 @@ def kanban_entry() -> str:
 
 
 def setup(a: argparse.Namespace) -> tuple[dict[str, Any], str]:
-    if a.port is not None and not 0 < a.port < 65536:
-        raise Usage("--port must be between 1 and 65535")
     check_host()
     d = dirs()
     ensure_dir(d.home)
@@ -354,7 +352,7 @@ def run_setup(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str
                 f"this plugin ({__version__}) is older than the installed daemon ({old['version']}); "
                 "to go back on purpose run: kanban setup --yes"
             )
-        if before < now and not (a.claude_bin or a.claude_config_dir or a.port):
+        if before < now and not (a.claude_bin or a.claude_config_dir):
             return upgrade(a, conn, old)
     config_dir = config_dir_for(a, conn)
     captured = launchd.capture_env(
@@ -365,8 +363,7 @@ def run_setup(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str
     model = store.cfg(conn, "models.review")
     say(f"probing {claude} with the worker flags (model {model}, config {config_dir})")
     check_probe(claude, model, env, config_dir, conn, a.yes)
-    port = a.port or int(store.cfg(conn, "web.port"))
-    settings = [("claude.bin", claude), ("claude.config_dir", config_dir), ("web.port", port)]
+    settings: list[tuple[str, Any]] = [("claude.bin", claude), ("claude.config_dir", config_dir)]
     atlassian = atlassian_command(config_dir)
     if atlassian:
         say(
@@ -388,26 +385,21 @@ def run_setup(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str
             "schema": STAMP_SCHEMA,
             "claude_bin": claude,
             "claude_config_dir": config_dir,
-            "port": port,
             "env": captured,
         }  # fmt: skip
     )
     if not a.no_daemon:
-        wait_for_board(port, d.home)
-        say(f"the board answers on 127.0.0.1:{port}")
+        wait_for_daemon()
+        say("the daemon holds its lock")
     check_agent(claude, env, config_dir)
     say("the scout agent resolves")
-    url = f"http://127.0.0.1:{port}/"
-    data = {"version": __version__, "port": port, "url": url, "daemon": not a.no_daemon}
+    data = {"version": __version__, "daemon": not a.no_daemon}
     if a.no_daemon:
         return (
             data,
             f"kanban-claude {__version__} is set up without a daemon; start it with: kanban daemon",
         )
-    return (
-        data,
-        f"kanban-claude {__version__} is set up.\nopen the board with: kanban board  ({url})",
-    )
+    return data, f"kanban-claude {__version__} is set up."
 
 
 def stamp(fields: dict[str, Any]) -> None:
@@ -423,7 +415,7 @@ def upgrade(
     say(f"database schema is {conn.execute('PRAGMA user_version').fetchone()[0]}")
     if not a.no_daemon:
         launchd.restart()
-        wait_for_board(int(old.get("port") or store.cfg(conn, "web.port")), dirs().home)
+        wait_for_daemon()
         say("the daemon runs the new code")
     stamp({k: v for k, v in old.items() if k != "setup_at"} | {"version": __version__})
     return (

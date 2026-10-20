@@ -97,6 +97,15 @@ def test_lifecycle_verbs_and_exit_codes(
     assert kb("show", tid)[0] == 3
 
 
+def test_a_config_row_for_a_removed_key_is_ignored_not_fatal(env: Path, kb: Kb, conn: Any) -> None:
+    """A board that once ran `kanban config set web.port ...` keeps the row after the web board went."""
+    store.config_put(conn, "web.port", 9129)
+    assert kb("config", "list")[0] == 0 and "web.port" not in kb("config", "list")[1]
+    assert kb("config", "get", "web.port")[0] == 3
+    assert kb("config", "set", "web.port", "1")[0] != 0
+    assert kb("config", "get", "dispatch.max_in_progress")[0] == 0
+
+
 def test_config_pause_stats_and_stubs(kb: Kb, workdirs: tuple[Path, Path]) -> None:
     assert kb("config", "set", "dispatch.max_in_progress", "3")[0] == 0
     assert kb("config", "get", "dispatch.max_in_progress")[1].strip() == "3"

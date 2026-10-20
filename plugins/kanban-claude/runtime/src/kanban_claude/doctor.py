@@ -14,6 +14,7 @@ from typing import Any
 
 from . import (
     __version__,
+    daemon,
     dispatcher,
     ghops,
     install,
@@ -23,7 +24,6 @@ from . import (
     runner,
     store,
     views,
-    web,
 )
 from .errors import Error
 from .paths import dirs
@@ -55,7 +55,7 @@ class Ctx:
     conn: sqlite3.Connection
     stamp: dict[str, Any]
     probe: bool
-    daemon: dict[str, Any] | None = None  # check 2's /healthz reply, for check 3
+    daemon: dict[str, Any] | None = None  # check 2's lock record, for check 3
 
 
 def ok(detail: str) -> Result:
@@ -81,10 +81,6 @@ def check(n: int, name: str, fix: str | None = None) -> Callable[[Callable[[Ctx]
         return fn
 
     return register
-
-
-def port(c: Ctx) -> int:
-    return int(c.stamp.get("port") or store.cfg(c.conn, "web.port"))
 
 
 def claude_path(c: Ctx) -> str:
@@ -123,13 +119,15 @@ def launchagent(c: Ctx) -> Result:
     return fail(f"{launchd.LABEL} is not loaded in launchd", FIX, "agent")
 
 
-@check(2, "board answers /healthz")
-def healthz(c: Ctx) -> Result:
-    try:
-        _, c.daemon = web.ask_board(port(c), dirs().home)
-    except Error as e:
-        return fail(str(e), f"read {dirs().home / 'logs' / 'daemon.log'}, then rerun {SETUP}")
-    return ok(f"127.0.0.1:{port(c)} answers as this board")
+@check(2, "daemon holds its lock")
+def daemon_lock(c: Ctx) -> Result:
+    c.daemon = daemon.probe()
+    if c.daemon is None:
+        return fail(
+            f"nothing holds {dirs().home / 'daemon.lock'}: the daemon is not running",
+            f"read {dirs().home / 'logs' / 'daemon.log'}, then rerun {SETUP}",
+        )
+    return ok(f"held by pid {c.daemon.get('pid', 'unknown')}")
 
 
 @check(3, "versions match", SETUP)
@@ -376,7 +374,7 @@ def mode_problems() -> list[tuple[Path, int, int]]:
         (p, 0o600)
         for p in (
             home / "kanban.db", home / "kanban.db-wal", home / "kanban.db-shm",
-            home / "web.secret", install.stamp_path(), launchd.plist_path(),
+            install.stamp_path(), launchd.plist_path(),
             *sorted(p for p in (home / "logs").rglob("*") if p.is_file()),
         )
     ]  # fmt: skip
@@ -393,7 +391,7 @@ def mode_problems() -> list[tuple[Path, int, int]]:
 def modes(c: Ctx) -> Result:
     wrong = mode_problems()
     if not wrong:
-        return ok("directories 0700; database, secret, stamp, logs and plist 0600")
+        return ok("directories 0700; database, stamp, logs and plist 0600")
     return fail("; ".join(f"{p} is {h:04o}, want {w:04o}" for p, h, w in wrong), FIX, "modes")
 
 
@@ -507,7 +505,7 @@ def restore_agent(c: Ctx) -> str:
     else:
         raise Error(f"the plist is gone and installed.json cannot rebuild it; run {SETUP}")
     with contextlib.suppress(Error):
-        install.wait_for_board(port(c), d.home)
+        install.wait_for_daemon()
     return f"loaded {launchd.LABEL} from {plist}"
 
 
