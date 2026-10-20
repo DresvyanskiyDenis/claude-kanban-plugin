@@ -102,21 +102,78 @@ function world(on: On, answers: Partial<Record<Verb, Answer>> = {}, store: Recor
   return w
 }
 
-const pane = (props: { bodyColumns?: number; placement?: 'dock' | 'inline'; bodyRows?: number } = {}) => ({
+const pane = (props: { bodyColumns?: number; placement?: 'dock' | 'inline'; bodyRows?: number; isFocused?: boolean } = {}) => ({
   plugin: 'kanban-claude',
   component: 'Pane' as const,
   requestId: 'kanban',
   surface: 'terminal' as const,
-  props: { title: 'Kanban', isFocused: false, bodyColumns: props.bodyColumns ?? 48, placement: props.placement ?? 'dock', scroll: { offset: 0, bodyRows: props.bodyRows ?? 40 }, view: {} },
+  props: { title: 'Kanban', isFocused: props.isFocused ?? true, bodyColumns: props.bodyColumns ?? 48, placement: props.placement ?? 'dock', scroll: { offset: 0, bodyRows: props.bodyRows ?? 40 }, view: {} },
 })
 
 const command = (args = '') => ({ command: 'kanban-board', args, origin: { kind: 'composer' as const }, presentation: { isFullscreen: true, columns: 170 } })
 const start = (cwd = '/work') => ({ cwd, surface: 'terminal' as const, isInteractive: true })
 
-test('the dock draws the lanes with their meta, the bar and the legend', async ($, on) => {
+test('cards are the default: each lane a column of bordered cards, two lanes across a 48-column dock', async ($, on) => {
+  const long = card('t_long', 'running', 'Make the retry backoff configurable per client and document it', { assignee: 'builder', updated_at: S - 300 })
+  world(on, { list: argv => ok({ schema: 1, board: boardOf(argv), cards: [...CARDS, long] }) })
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane())
+  const box = await ui.find({ type: 'Box', key: 'box:t_run' })
+  expect(box?.props.borderStyle).toBe('round')
+  expect(box?.props.borderColor).toBe('claude')
+  expect(box?.props.width).toBe(23)
+  // The first title line is the Button, padded to the card's inside, so the focus marks the whole line.
+  expect((await ui.find({ type: 'Button', key: 'card:t_run' }))?.text).toBe('Fix login'.padEnd(19))
+  expect(await ui.find({ type: 'Text', text: 'builder · 5m' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'P2 ' })).toBeDefined()
+  // A long title wraps onto a second line and ends in an ellipsis there.
+  expect((await ui.find({ type: 'Button', key: 'card:t_long' }))?.text).toBe('Make the retry'.padEnd(19))
+  expect(await ui.find({ type: 'Text', text: 'backoff configurab…' })).toBeDefined()
+  // Running and Review share the first row of lanes, Blocked and Up next the second.
+  const first = (await ui.find({ type: 'Box', key: 'lanes:0' }))?.text ?? ''
+  expect(first).toMatch(/Running[\s\S]*Review/)
+  expect(first).not.toMatch(/Blocked/)
+  expect((await ui.find({ type: 'Box', key: 'lanes:1' }))?.text).toMatch(/Blocked[\s\S]*Up next/)
+  expect((await ui.find({ type: 'Button', key: 'view' }))?.text).toMatch(/list/)
+  await ui.unmount()
+})
+
+test('v switches to the list and back, and the next session opens on the view picked last', async ($, on) => {
+  const w = world(on)
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane())
+  await ui.press({ key: 'view' })
+  expect(await ui.find({ type: 'Box', key: 'box:t_run' })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'card:t_run' }))?.text.length).toBe(48)
+  expect(w.store.get('view')).toBe('list')
+  await ui.press({ key: 'view' })
+  expect(await ui.find({ type: 'Box', key: 'box:t_run' })).toBeDefined()
+  expect(w.store.get('view')).toBe('cards')
+  await ui.unmount()
+
+  w.store.set('view', 'list')
+  await $.session.start(start())
+  const next = await $.ui.mount(pane())
+  expect(await next.find({ type: 'Box', key: 'box:t_run' })).toBeUndefined()
+  await next.unmount()
+})
+
+test('inline and wide, the four lanes of cards sit side by side, as many cards as the frame holds', async ($, on) => {
+  world(on)
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane({ placement: 'inline', bodyColumns: 120, bodyRows: 12 }))
+  expect((await ui.find({ type: 'Box', key: 'box:t_run' }))?.props.width).toBe(Math.floor((120 - 2 * 3) / 4))
+  expect(await ui.find({ type: 'Box', key: 'lanes:1' })).toBeUndefined()
+  expect(await ui.find({ type: 'Box', key: 'box:t_todo' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '  +1 more' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the list view draws the lanes with their meta, the bar and the legend', async ($, on) => {
   world(on)
   await $.command.run(command())
   const ui = await $.ui.mount(pane())
+  await ui.press({ key: 'view' })
   expect(await ui.find({ type: 'Text', text: /^main$/ })).toBeDefined()
   for (const name of ['Running', 'Review', 'Blocked', 'Up next']) expect(await ui.find({ type: 'Text', text: name })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /builder · 5m$/ })).toBeDefined()
@@ -135,10 +192,86 @@ test('the dock draws the lanes with their meta, the bar and the legend', async (
   await ui.unmount()
 })
 
-test('the needs-you strip leads with what waits on the owner and how to answer it', async ($, on) => {
+test('each need is a card on top: the ask, the reason, then the command on its own line', async ($, on) => {
   world(on)
   await $.command.run(command())
   const ui = await $.ui.mount(pane())
+  expect((await ui.find({ type: 'Box', key: 'ask:0' }))?.props.borderColor).toBe('warning')
+  expect((await ui.find({ type: 'Button', key: 'need:0' }))?.text).toMatch(/^question +Wire SSO/)
+  expect(await ui.find({ type: 'Text', text: 'Which IdP?' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '→ kanban unblock t_blk --reason "…"' })).toBeDefined()
+  // A need with no card and no command: no Button, the hint alone.
+  expect(await ui.find({ type: 'Text', text: /hard quota wall · 3 cards wait/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'lifts by itself in 1h' })).toBeDefined()
+  await ui.press({ key: 'need:0' })
+  expect(await ui.find({ type: 'Button', key: 'back' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a failed merge reads in words, with the retry on its own line', async ($, on) => {
+  const merge = { id: 7, task_id: 't_mrg', kind: 'merge_failed', at: S - 30, title: 'Ship the pane', payload: { reason: 'approval_not_clean', pr: 12 } }
+  world(on, { digest: () => ok({ ...DIGEST, needs_you: [merge] }) })
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane())
+  expect(await ui.find({ type: 'Text', text: 'approval not clean' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '→ kanban merge-retry t_mrg' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a need with no reason still shows its command as the action', async ($, on) => {
+  world(on, { digest: () => ok({ ...DIGEST, needs_you: [{ ...NEED, reason: null }] }) })
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane())
+  expect((await ui.find({ type: 'Text', text: '→ kanban unblock t_blk --reason "…"' }))?.props.bold).toBe(true)
+  await ui.unmount()
+})
+
+test('the dock shows as many cards per lane as its height holds, so the footer stays in view', async ($, on) => {
+  const many = Array.from({ length: 6 }, (_, i) => card(`t_n${i}`, 'ready', `Next ${i}`))
+  world(on, { list: argv => ok({ schema: 1, board: boardOf(argv), cards: [...CARDS, ...many] }) })
+  await $.command.run(command())
+  const tall = await $.ui.mount(pane({ bodyRows: 80 }))
+  expect((await tall.find({ type: 'Box', key: 'lane:next' }))?.text).toMatch(/\+5 more/)
+  await tall.unmount()
+  // Header, bar, footer and its margin, the two needs, Merged and the lane heads take 22 rows; a card a lane takes 9 more, two take 13.
+  const short = await $.ui.mount(pane({ bodyRows: 34 }))
+  expect((await short.find({ type: 'Box', key: 'lane:next' }))?.text).toMatch(/Ready a[\s\S]*\+7 more/)
+  expect(await short.find({ type: 'Box', key: 'box:t_todo' })).toBeUndefined()
+  await short.unmount()
+})
+
+test('an unfocused pane says how to reach its keys instead of showing keys that would land in the prompt', async ($, on) => {
+  world(on)
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane({ isFocused: false }))
+  expect(await ui.find({ type: 'Text', text: 'ctrl+x tab: keys' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'view' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('an empty board says so once instead of drawing empty lanes', async ($, on) => {
+  world(on, { list: argv => ok({ schema: 1, board: boardOf(argv), cards: [] }), digest: () => ok({ ...DIGEST, needs_you: [] }) })
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane())
+  expect(await ui.find({ type: 'Text', text: /Nothing running or planned/ })).toBeDefined()
+  expect(await ui.find({ type: 'Box', key: 'lanes:0' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('an empty lane keeps its place in the card grid, drawn faint', async ($, on) => {
+  world(on, { list: argv => ok({ schema: 1, board: boardOf(argv), cards: CARDS.filter(c => c.status !== 'review') }) })
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane())
+  expect((await ui.find({ type: 'Box', key: 'lanes:0' }))?.text).toMatch(/Running[\s\S]*Review[\s\S]*—/)
+  expect((await ui.find({ type: 'Text', text: 'Review' }))?.props.color).toBe('inactive')
+  await ui.unmount()
+})
+
+test('the list keeps the needs-you strip: the reason, and the command whole on its own line', async ($, on) => {
+  world(on)
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane())
+  await ui.press({ key: 'view' })
   expect(await ui.find({ type: 'Text', text: /^Needs you$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^question/ })).toBeDefined()
   // Too long for one line at 48 columns: the command moves to its own line, whole.
@@ -325,7 +458,7 @@ test('an older CLI without digest still draws the board and hides the rest', asy
   await ui.unmount()
 })
 
-test('a row opens the card, and b goes back to the board', async ($, on) => {
+test('a card opens its detail, and b goes back to the board', async ($, on) => {
   const w = world(on)
   await $.command.run(command())
   const ui = await $.ui.mount(pane())
@@ -352,10 +485,11 @@ test('recently merged cards close the dock', async ($, on) => {
   await ui.unmount()
 })
 
-test('inline and wide, the lanes sit side by side; narrow, the meta column goes', async ($, on) => {
+test('in the list, inline and wide, the lanes sit side by side; narrow, the meta column goes', async ($, on) => {
   const w = world(on)
   await $.command.run(command())
   const wide = await $.ui.mount(pane({ placement: 'inline', bodyColumns: 120, bodyRows: 12 }))
+  await wide.press({ key: 'view' })
   const run = await wide.find({ type: 'Button', key: 'card:t_run' })
   expect(run?.text.length).toBe(Math.floor((120 - 2 * 3) / 4))
   expect(await wide.find({ type: 'Text', text: /Which IdP\?/ })).toBeDefined()

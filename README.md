@@ -69,13 +69,14 @@ To follow the board from a session, run `kanban watch --actionable --wait --boar
 
 ## Board pane
 
-`/kanban-board` opens the board of the session's folder beside the transcript; `/kanban-board SLUG` pins another board and `/kanban-board close` closes it. It reads `kanban --json list` and `kanban --json digest --since 24h` every 15 s while the pane is open, and only then; `r` refreshes now while the pane has the keyboard (click it, or Ctrl+X then Tab).
+`/kanban-board` opens the board of the session's folder beside the transcript; `/kanban-board SLUG` pins another board and `/kanban-board close` closes it. It reads `kanban --json list` and `kanban --json digest --since 24h` every 15 s while the pane is open, and only then; `r` refreshes now and `v` switches between cards and a list while the pane has the keyboard (click it, or Ctrl+X then Tab); until then the footer reads `ctrl+x tab: keys`, since those keys would type into the prompt.
 
-- **Needs you** comes first: questions, grants, merges, logins and quota walls, each with its reason and the command that answers it. A new need raises one toast.
+- **Needs you** comes first: questions, grants, merges, logins and quota walls, each a card with its reason and, on its own line, the command that answers it. A new need raises one toast.
 - A health line shows whether the daemon is live, whether dispatch is paused, and the last 24 hours' spend.
-- Running, Review, Blocked and Up next list each card's priority, owner, age, and PR number or block kind; then Recently merged and a bar of the board's spread.
+- Running, Review, Blocked and Up next are columns of cards: priority, the title on up to two lines, then owner and age, or PR number or block kind. A lane shows as many cards as the pane's height holds, then `+N more`; an empty lane keeps its place, drawn faint. Recently merged and a bar of the board's spread follow.
+- `v` switches to a compact list, one row a card, and back; the pane remembers the choice across sessions.
 - Select a card for its detail (branch, PR, last run, comments); `back` (or `b`) returns.
-- Inline from 72 columns the lanes sit side by side; in a dock or narrower they stack. Colors are Claude Code theme keys, so the pane follows your theme.
+- Card columns sit as many across as fit, at least 22 cells each: two in a dock, four inline at 120 columns. In the list, inline from 72 columns the lanes sit side by side; in a dock or narrower they stack. Colors are Claude Code theme keys, so the pane follows your theme.
 - A failed refresh keeps the last good read and says how stale it is and why.
 - The pane reopens next session only in the same folder, and only if that board still reads; one closed by hand stays closed. It needs `kanban` on PATH or at `~/.local/bin/kanban`. Card workers never load it.
 

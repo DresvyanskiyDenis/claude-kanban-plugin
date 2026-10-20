@@ -86,6 +86,7 @@ declare module 'claude-code' {
       open: string | null
       detail: KanbanDetail | null
       seen: number | null
+      view: 'cards' | 'list' | null
     }
   }
 }
