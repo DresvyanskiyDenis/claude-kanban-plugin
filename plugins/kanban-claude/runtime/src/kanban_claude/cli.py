@@ -105,7 +105,7 @@ VERB_HELP = {
     "merge-retry": "try a failed merge again",
     "grant": "approve exact commands for a card, or revoke them",
     "grants": "list a card's grants",
-    "watch": "print board events; --follow keeps going",
+    "watch": "print board events; --follow keeps going, --wait stops after the first lines",
     "digest": "summarize a time window and what needs the owner",
     "followups": "list FOLLOW-UP comments for the owner to turn into cards",
     "runs": "list a card's runs and their cost",
@@ -204,7 +204,7 @@ def build() -> argparse.ArgumentParser:
     add("grants", "id")
     add(
         "watch", "--kinds", ("--actionable", "flag"), ("--since", int), ("--since-start", "flag"),
-        ("--follow", "flag"),
+        ("--follow", "flag"), ("--wait", "flag"),
     )  # fmt: skip
     add("runs", "id")
     add("log", "id", ("--run", int), ("--tail", int))
@@ -502,6 +502,7 @@ def v_watch(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, 
     else:
         cursor = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
     stop_on_sigterm()
+    printed = False
     try:
         while True:
             batch = store.events_since(conn, cursor, kinds=kinds, board=board, limit=500)
@@ -509,13 +510,14 @@ def v_watch(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, 
                 cursor = ev["id"]
                 if a.actionable and not store.actionable(ev):
                     continue
+                printed = True
                 if a.json:
                     ev = {**ev, "payload": json.loads(ev["payload"]) if ev["payload"] else None}
                     print(json.dumps(views.clean_obj({"schema": 1, **ev})), flush=True)
                 else:
                     print(views.clean(views.watch_line(ev)), flush=True)
             if len(batch) < 500:
-                if not a.follow:
+                if not (a.follow or a.wait) or (a.wait and printed):
                     return {"cursor": cursor}, ""
                 time.sleep(1)
     except KeyboardInterrupt:

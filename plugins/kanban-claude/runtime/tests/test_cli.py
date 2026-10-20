@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -318,6 +319,32 @@ def test_l4_watch_follow_exits_0_on_sigterm(workdirs: tuple[Path, Path], kb: Kb)
     assert p.stdout and "created" in p.stdout.readline()
     p.send_signal(signal.SIGTERM)
     assert p.wait(timeout=20) == 0
+
+
+def test_watch_wait_blocks_until_it_prints_then_exits_0(
+    kb: Kb, workdirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_BOARD", "alpha")
+    a = json.loads(kb("create", "A", "--body", "b", "--assignee", "smith", "--json")[1])["id"]
+    conn = store.connect()
+    start = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+    p = subprocess.Popen(
+        [sys.executable, "-m", "kanban_claude", "watch", "--actionable", "--wait"]
+        + ["--since", str(start)],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+    t = store.get_task(conn, a)
+    with store.tx(conn):
+        store.event(conn, t, "commented", "worker:smith#1")
+    time.sleep(2.5)
+    assert p.poll() is None, "a line the filter hides must not end the wait"
+    with store.tx(conn):
+        store.event(conn, t, "blocked", "worker:smith#1", {"kind": "needs_input"})
+    conn.close()
+    assert p.wait(timeout=20) == 0
+    assert p.stdout and "blocked" in p.stdout.read()
 
 
 SEC3_NEGATIVES = [
