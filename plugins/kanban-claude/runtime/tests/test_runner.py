@@ -67,35 +67,166 @@ def test_r1_the_argv_is_exactly_the_contract(
     assert "--no-chrome" in argv and flag(argv, "--max-budget-usd") == "30"
     assert flag(argv, "--name") == f"kanban {tid} smith"
     assert flag(argv, "--session-id") == runner.session_id("main", tid, "smith")
-    for banned in ("--bare", "--plugin-dir", "--setting-sources", "--strict-mcp-config", "-w"):
+    for banned in ("--bare", "--plugin-dir", "--setting-sources", "-w"):
         assert banned not in argv
-    assert "--mcp-config" not in argv and "--max-turns" not in argv
+    assert "--strict-mcp-config" in argv and "--max-turns" not in argv
+    assert flag(argv, "--mcp-config").endswith("run-1.mcp.json")
     settings = json.loads(flag(argv, "--settings"))
-    assert settings["permissions"]["deny"] == [
+    deny = settings["permissions"]["deny"]
+    assert deny[:5] == [
         "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(gh pr merge:*)",
         "Bash(kanban grant:*)", f"Edit(/{dirs().home}/**)",
     ]  # fmt: skip
+    assert "Agent(kanban-claude:warden)" in deny and "Agent(kanban-claude:card-helper)" not in deny
     assert settings["permissions"]["allow"] == ["Bash(npm publish)"]
     assert settings["enabledPlugins"] == {"cc-plugin-you-should-know@builtin": False}
     assert seen["cwd"] == str(dirs().work / "scratch" / tid) or seen["cwd"].endswith(tid)
 
 
-def test_r1_mcp_config_only_for_a_role_with_a_file_and_turns_and_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_r1_the_mcp_config_is_strict_and_always_passed_and_the_rest_follows(
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(runner, "MCP_DIR", tmp_path)
-    (tmp_path / "scout.json").write_text("{}")
-
-    def argv(role: str, turns: int | None, resumed: bool) -> list[str]:
+    def argv(turns: int | None, resumed: bool) -> list[str]:
         return runner.build_argv(
-            "claude", "p", role, "t_1", "m", "e", "{}", 1.5, turns, "sid", resumed
+            "claude", "p", "scout", "t_1", "m", "e", "{}", 1.5, turns, "sid", resumed, "/m.json"
         )
 
-    scout, smith = argv("scout", 7, True), argv("smith", None, False)
-    assert flag(scout, "--mcp-config") == str(tmp_path / "scout.json")
-    assert flag(scout, "--max-turns") == "7" and flag(scout, "--resume") == "sid"
-    assert "--mcp-config" not in smith and flag(smith, "--session-id") == "sid"
-    assert flag(smith, "--max-budget-usd") == "1.5"
+    first, again = argv(7, True), argv(None, False)
+    assert "--strict-mcp-config" in first and flag(first, "--mcp-config") == "/m.json"
+    assert flag(first, "--max-turns") == "7" and flag(first, "--resume") == "sid"
+    assert "--max-turns" not in again and flag(again, "--session-id") == "sid"
+    assert flag(again, "--max-budget-usd") == "1.5"
+
+
+def user_config(config_dir: Path, plugins: dict[str, bool]) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "settings.json").write_text(json.dumps({"enabledPlugins": plugins}))
+
+
+def test_p21_every_enabled_user_plugin_is_off_but_ours_its_dependencies_and_the_allowlist(
+    conn: Any, tmp_path: Path
+) -> None:
+    alt = tmp_path / "alt"
+    user_config(alt, {
+        "ponytail@ponytail": True, "watch@claude-video": True, "off@m": False,
+        "kanban-claude@claude-kanban-plugin": True,
+        "frontend-design@claude-plugins-official": True,
+        "context-bar@claude-code-mods": True,
+    })  # fmt: skip
+    store.config_set(conn, "worker.plugin_allowlist", ["watch", "context-bar@claude-code-mods"])
+    assert runner.plugins_off(conn, str(alt)) == {
+        "ponytail@ponytail": False, "cc-plugin-you-should-know@builtin": False,
+    }  # fmt: skip
+    store.config_set(conn, "worker.plugin_allowlist", [])
+    assert set(runner.plugins_off(conn, str(alt))) == {
+        "ponytail@ponytail", "watch@claude-video", "context-bar@claude-code-mods",
+        "cc-plugin-you-should-know@builtin",
+    }  # fmt: skip
+    assert runner.plugins_off(conn, str(tmp_path / "no-such-dir")) == {
+        "cc-plugin-you-should-know@builtin": False
+    }
+
+
+def test_p21_the_dependencies_kept_on_are_the_ones_the_manifest_declares() -> None:
+    manifest = Path(runner.__file__).resolve().parents[3] / ".claude-plugin" / "plugin.json"
+    declared = json.loads(manifest.read_text()).get("dependencies", [])
+    assert {d.partition("@")[0] for d in declared} == set(runner.OWN_DEPENDENCIES)
+
+
+def test_p21_a_run_disables_the_plugins_of_the_accounts_own_settings(
+    conn: Any, card: Card, execute: Execute, env: Path, dump: Path
+) -> None:
+    user_config(Path.home() / ".claude", {"ponytail@ponytail": True})
+    run = execute(card())
+    settings = json.loads(flag(dumped(env, run["id"])["argv"], "--settings"))
+    assert settings["enabledPlugins"] == {
+        "ponytail@ponytail": False, "cc-plugin-you-should-know@builtin": False,
+    }  # fmt: skip
+
+
+def test_d1_the_deny_list_leaves_each_role_only_its_helper_and_what_its_job_needs() -> None:
+    def deny(role: str) -> list[str]:
+        out: list[str] = json.loads(runner.settings_json(Path("/h"), [], role))["permissions"][
+            "deny"
+        ]
+        return out
+
+    for role in ("smith", "designer", "scout"):
+        assert "Agent(kanban-claude:card-helper)" not in deny(role)
+        assert {"Agent(Explore)", "Agent(general-purpose)", "Agent(kanban-claude:warden)"} <= {
+            *deny(role)
+        }
+    assert "Agent(kanban-claude:review-helper)" in deny("smith")
+    assert "Agent(kanban-claude:review-helper)" not in deny("warden")
+    assert "Agent(kanban-claude:card-helper)" in deny("warden")
+    for role in ("warden", "atlassian"):
+        assert {"Edit", "Write"} <= {*deny(role)}
+    assert "Edit" in deny("scout") and "Write" not in deny("scout")
+    assert "Edit" not in deny("smith") and "Write" not in deny("smith")
+    assert not any(d.startswith("Agent(") for d in deny("atlassian"))
+    assert deny("") == deny("card-checker")[:5] == deny("smith")[:5]
+
+
+def write_mcp(path: Path, servers: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mcpServers": servers}))
+
+
+def test_p21_only_the_allowlisted_user_servers_and_the_roles_own_reach_the_worker(
+    conn: Any, tmp_path: Path
+) -> None:
+    write_mcp(Path.home() / ".claude.json", {
+        "context7": {"command": "npx"}, "memory-mcp": {"url": "https://vault.invalid"},
+        "lightpanda": {"command": "lp"}, "atlassian": {"command": "uvx"},
+    })  # fmt: skip
+    ws = tmp_path / "ws"
+    default = str(Path.home() / ".claude")
+    got = runner.mcp_config(conn, "smith", ws, default)
+    assert got == {"mcpServers": {"context7": {"command": "npx"}, "lightpanda": {"command": "lp"}}}
+    assert set(runner.mcp_config(conn, "atlassian", ws, default)["mcpServers"]) == {
+        "context7", "lightpanda", "atlassian",
+    }  # fmt: skip
+    store.config_set(conn, "worker.mcp_allowlist", [])
+    assert runner.mcp_config(conn, "smith", ws, default) == {"mcpServers": {}}
+    assert set(runner.mcp_config(conn, "designer", ws, default)["mcpServers"]) == {"playwright"}
+
+
+def test_p21_a_server_comes_from_the_config_dirs_own_claude_json_and_the_repo_fills_the_gaps(
+    conn: Any, tmp_path: Path
+) -> None:
+    alt = tmp_path / "alt"
+    write_mcp(alt / ".claude.json", {"context7": {"command": "alt-npx"}})
+    write_mcp(Path.home() / ".claude.json", {"lightpanda": {"command": "home-lp"}})
+    ws = tmp_path / "ws"
+    write_mcp(ws / ".mcp.json", {
+        "code-review-graph": {"command": "crg"}, "context7": {"command": "repo-planted"},
+        "rogue": {"command": "x"},
+    })  # fmt: skip
+    got = runner.mcp_config(conn, "smith", ws, str(alt))["mcpServers"]
+    assert got == {"context7": {"command": "alt-npx"}, "code-review-graph": {"command": "crg"}}
+    (ws / ".mcp.json").write_text("not json")
+    assert runner.mcp_config(conn, "smith", ws, str(alt))["mcpServers"] == {
+        "context7": {"command": "alt-npx"}
+    }
+
+
+def test_p21_the_mcp_file_is_private_while_claude_runs_and_gone_after(
+    conn: Any, card: Card, execute: Execute, env: Path, fake_claude: Path
+) -> None:
+    write_mcp(Path.home() / ".claude.json", {"context7": {"env": {"KEY": "s3cret"}}})
+    spy = env / "bin" / "claude-spy"
+    spy.write_text(
+        f"#!{sys.executable}\nimport os, sys\n"
+        "f = sys.argv[sys.argv.index('--mcp-config') + 1]\n"
+        f"open({str(env / 'seen')!r}, 'w').write(f'{{f}}\\n{{os.stat(f).st_mode & 0o777:o}}\\n' + open(f).read())\n"
+        f"os.execv({str(fake_claude)!r}, [{str(fake_claude)!r}, *sys.argv[1:]])\n"
+    )
+    spy.chmod(0o755)
+    store.config_set(conn, "claude.bin", str(spy))
+    execute(card())
+    path, mode, body = (env / "seen").read_text().split("\n", 2)
+    assert mode == "600" and json.loads(body)["mcpServers"]["context7"]["env"]["KEY"] == "s3cret"
+    assert not Path(path).exists()
 
 
 def test_r1_review_runs_always_use_the_review_model(conn: Any, card: Card, claim: Claim) -> None:
