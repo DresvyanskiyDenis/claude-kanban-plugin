@@ -13,7 +13,7 @@ Read the card (`kanban context`). It names the area: a directory or a set of mod
 
 ## 2. Green first
 
-Run the repo's whole gate (from CI, the Makefile or `pyproject.toml`) on the untouched branch. If it is red, stop and block with `needs_input`: you cannot show that a refactor preserved behaviour on top of a red gate.
+Run the repo's whole gate (from the card, CI, the Makefile or `pyproject.toml`) on the untouched branch with `kanban gate -- '<gate command>'`. If it is red, stop and block with `needs_input`: you cannot show that a refactor preserved behaviour on top of a red gate.
 
 ## 3. Find
 
@@ -32,7 +32,7 @@ python3 "${CLAUDE_SKILL_DIR}/scripts/slop_gate.py" snapshot "$TMPDIR/simplify-$K
 
 ## 5. Apply
 
-Remove, in this order of value: unused code and imports, dead branches, commented-out code, wrappers and abstractions with a single user, copy-pasted blocks folded into one function, hand-written code the standard library already provides. Do one kind of change at a time and run the gate after each. A change that breaks the gate is reverted, not repaired.
+Remove, in this order of value: unused code and imports, dead branches, commented-out code, wrappers and abstractions with a single user, copy-pasted blocks folded into one function, hand-written code the standard library already provides. Do one kind of change at a time and run the gate (`kanban gate`) after each. A change that breaks the gate is reverted, not repaired.
 
 Do not touch test files, public interfaces or behaviour. Do not rename for taste. Do not add code to remove code; a refactor that grows the total is not a simplification.
 
@@ -49,8 +49,8 @@ Exit 0 means no gated metric grew. Exit 1 prints each metric that did, as `metri
 If the diff removes nothing, complete the card with `kanban complete $KANBAN_TASK --summary "nothing worth simplifying in <area>"`. Otherwise:
 
 1. Commit as `refactor: simplify <area>`.
-2. Run the whole gate on the head, push the card branch, and open the PR with `gh pr create`. The body carries the before and after numbers from the compare step, the diffstat, and the line `` Gate: `<exact command>` -> exit 0 at <head sha> ``.
-3. Wait for CI: run `kanban wait-ci` and run it again while it exits 2, at most 3 runs in all (0 passed, 1 failed, 2 still pending, including no checks yet, 4 no open PR or several; it returns within 540 s). After the third exit 2 with "no checks reported yet" (a repo with no CI), treat CI as passed and write "no CI checks reported" in the review summary; with checks still running after the third, `kanban block $KANBAN_TASK --kind transient --retry-after 30m --reason "<CI still running; PR #n>"`. Never `run_in_background`, never Monitor, never a `sleep` loop.
+2. Run the whole gate on the head (`kanban gate`; skip it if the tree is unchanged since a passing run), push the card branch, and open the PR with `gh pr create`. The body carries the before and after numbers from the compare step, the diffstat, and the line `` Gate: `<exact command>` -> exit 0 at <head sha> ``.
+3. Wait for CI with `kanban wait-ci` as the rules in your run prompt say (it returns within 540 s). With checks still running after the third run, `kanban block $KANBAN_TASK --kind transient --retry-after 30m --reason "<CI still running; PR #n>"`.
 4. End with `kanban request-review $KANBAN_TASK --reviewer warden --summary "<area, numbers, PR #n>"`.
 
 The reviewer checks that the PR removes more lines than it adds and leaves the tests alone.

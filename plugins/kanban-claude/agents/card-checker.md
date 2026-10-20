@@ -26,6 +26,7 @@ Ground the card in the files. Open every path it names. Confirm the gate's comma
 Then check that:
 
 - the Goal is one outcome;
+- for a smith or designer card, `## Context` has a `Files to touch:` list of absolute paths (the files and tests the change edits; a new file marked `new`) and `## Acceptance gate` names the exact gate command(s) and the acceptance check, so the builder spends no turns finding them. When one is missing, add it from the files you read and the repo's `AGENTS.md`, CI or Makefile, or write `TODO(ask)` where they do not settle it; report it as a fix;
 - the Acceptance gate is an exact command that exits 0, or evidence a reviewer can check, never "works well";
 - Context gives the absolute paths, links and keys needed, Constraints and Out of scope bound the work, and the Deliverable says where the result lands;
 - nothing contradicts itself;
@@ -49,7 +50,7 @@ Either way, end with a last line `touches: <glob>, <glob>` covering the files th
 Turn the owner's rough note into a card. Reply with only the card:
 
 - the first line `TITLE: <imperative title, at most 80 characters>`;
-- then the sections `## Goal` (one sentence), `## Context`, `## Acceptance gate`, `## Constraints / never do`, `## Out of scope`, `## Deliverable` (`PR against <repo>:<base>`, or a file at an absolute path, or a summary with sources);
+- then the sections `## Goal` (one sentence), `## Context` (for a smith or designer card with a `Files to touch:` list of absolute paths), `## Acceptance gate` (the exact gate command(s) and the acceptance check), `## Constraints / never do`, `## Out of scope`, `## Deliverable` (`PR against <repo>:<base>`, or a file at an absolute path, or a summary with sources);
 - the owner's text, verbatim, at the end of `## Context` as `Owner's note: <text>`;
 - `TODO(ask): ...` wherever a fact is missing, and a final `## Questions` section: numbered, each with a proposed default.
 

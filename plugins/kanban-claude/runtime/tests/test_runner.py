@@ -836,6 +836,7 @@ def test_the_prompt_lists_the_terminal_calls_of_the_run_kind(
     for text in (work, review):
         assert tid in text and "$" not in text.replace("$KANBAN", "")
         assert "kanban wait-ci" in text and "--retry-after <duration>" in text
+        assert "kanban gate -- '<command>'" in text and "Batch independent reads" in text
         assert "--watch" not in text and "sleep 30" not in text and "sleep in" not in text
         assert "does not retry by itself" not in text
 
