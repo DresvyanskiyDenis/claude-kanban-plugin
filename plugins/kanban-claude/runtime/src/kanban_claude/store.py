@@ -1921,7 +1921,7 @@ def request_review(
     pr_url: str,
     reviewer: str | None = None,
 ) -> dict[str, Any]:
-    summary = _need(summary, "summary", "name the PR as 'PR #<n>' or its URL")
+    summary = _need(summary, "summary", "say what the PR changes and how it was checked")
     reviewer = reviewer or cfg(conn, "dispatch.reviewer")
     if reviewer not in active_roles(conn):
         raise Refused(f"reviewer {reviewer!r} is not a dispatchable role")
@@ -1995,7 +1995,7 @@ def request_review_owner(
     actor: str = OWNER,
 ) -> dict[str, Any]:
     """The owner's form of request-review: a blocked builder card whose PR is ready goes to review."""
-    summary = _need(summary, "summary", "name the PR as 'PR #<n>' or its URL")
+    summary = _need(summary, "summary", "say what the PR changes and how it was checked")
     reviewer = reviewer or cfg(conn, "dispatch.reviewer")
     if reviewer not in active_roles(conn):
         raise Refused(f"reviewer {reviewer!r} is not a dispatchable role")
