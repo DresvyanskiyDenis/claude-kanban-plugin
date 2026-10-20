@@ -237,7 +237,8 @@ def closed_unmerged(conn: sqlite3.Connection, t: Row) -> None:
 
 
 def sweep(conn: sqlite3.Connection) -> None:
-    """GIT-06: finished worktree cards, and the scratch directories of archived cards."""
+    """GIT-06: finished worktree cards, the scratch directories of archived cards, and the TMPDIR
+    of any card that is archived or deleted (a done card keeps it for a resumed run)."""
     for t in conn.execute(
         "SELECT * FROM tasks WHERE status IN ('done', 'archived') AND workspace_kind = 'worktree' "
         "AND worktree_state IN ('active', 'kept_dirty', 'kept_unpushed')"
@@ -249,7 +250,12 @@ def sweep(conn: sqlite3.Connection) -> None:
         "SELECT id FROM tasks WHERE status = 'archived' AND workspace_kind = 'scratch'"
     ).fetchall():
         shutil.rmtree(scratch / t["id"], ignore_errors=True)
-        shutil.rmtree(card_tmp(t["id"]), ignore_errors=True)
+    tmp = dirs().work / "tmp"
+    found = list(tmp.iterdir()) if tmp.is_dir() else []  # before the query: a new card is in it
+    alive = {r[0] for r in conn.execute("SELECT id FROM tasks WHERE status <> 'archived'")}
+    for d in found:
+        if d.name not in alive:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def retention(conn: sqlite3.Connection, ts: int) -> None:

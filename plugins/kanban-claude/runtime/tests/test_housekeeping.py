@@ -67,6 +67,19 @@ def test_the_sweep_removes_the_tmpdir_of_an_archived_scratch_card(
     assert not card_tmp(archived["id"]).exists() and card_tmp(done["id"]).exists()
 
 
+def test_the_sweep_removes_the_tmpdir_of_any_archived_or_deleted_card(
+    conn: Any, card: Callable[..., str]
+) -> None:
+    kept = card_with_tmp(conn, card("running"), "running", "worktree")
+    folder = card_with_tmp(conn, card("dir"), "archived", "dir")
+    worktree = card_with_tmp(conn, card("wt"), "archived", "worktree")
+    gone = ensure_dir(card_tmp("t_deleted"))
+    housekeeping.sweep(conn)
+    assert card_tmp(kept["id"]).exists()
+    assert not card_tmp(folder["id"]).exists() and not card_tmp(worktree["id"]).exists()
+    assert not gone.exists()
+
+
 def test_cleanup_card_removes_the_tmpdir_even_when_the_worktree_is_gone(
     conn: Any, card: Callable[..., str]
 ) -> None:
