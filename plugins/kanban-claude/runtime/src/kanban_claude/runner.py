@@ -174,6 +174,8 @@ def worker_env(
         CLAUDE_CODE_WEB_FETCH_AGENT="0", CLAUDE_SKIP_SOUL="1", KANBAN_TASK=t["id"],
         KANBAN_BOARD=t["board"], KANBAN_RUN_ID=str(run_id), KANBAN_WORKSPACE=str(workspace),
         KANBAN_HOME=str(d.home), KANBAN_WORK=str(d.work), TMPDIR=str(card_tmp(t["id"])),
+        # claude's Bash default of 120 s would cut `kanban wait-ci` (up to 540 s) off
+        BASH_DEFAULT_TIMEOUT_MS="600000",
     )  # fmt: skip
     if t["workspace_kind"] != "scratch" and (host := origin_host(workspace)):
         env.setdefault("GH_HOST", host)

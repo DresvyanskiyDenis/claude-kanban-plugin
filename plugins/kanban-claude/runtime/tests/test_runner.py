@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import runner, store
+from kanban_claude import runner, store, worker
 from kanban_claude.gitops import ProvisionError
 from kanban_claude.paths import dirs
 from kanban_claude.procs import start_time
@@ -703,6 +703,11 @@ def test_two_cards_never_share_a_tmpdir(conn: Any, card: Card, tmp_path: Path) -
     one, two = card("one"), card("two")
     a, b = env_for(conn, one, tmp_path), env_for(conn, two, tmp_path)
     assert a["TMPDIR"] != b["TMPDIR"] and a["TMPDIR"] == str(dirs().work / "tmp" / one)
+
+
+def test_a_worker_bash_call_outlasts_wait_ci(conn: Any, card: Card, tmp_path: Path) -> None:
+    timeout_ms = int(env_for(conn, card("t"), tmp_path)["BASH_DEFAULT_TIMEOUT_MS"])
+    assert timeout_ms / 1000 > worker.BUDGET_S
 
 
 @pytest.mark.parametrize(
