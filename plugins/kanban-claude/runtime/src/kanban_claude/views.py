@@ -95,7 +95,8 @@ _WAITING_SQL = """(CASE WHEN t.status = 'todo' THEN (
         AND NOT (p.status IN ('done', 'archived') AND (p.merge_state IS NULL OR p.merge_state = 'merged'))
         ORDER BY p.id)) END) AS waiting_for"""
 # A done card whose approved PR no one has merged: the last word on it was `awaiting_owner_merge`.
-_AWAITING_WHERE = """t.status = 'done' AND t.merge_state IS NULL AND t.merged_at IS NULL AND (
+_AWAITING_WHERE = """t.status = 'done' AND (
+  (t.merge_state IS NULL AND t.merged_at IS NULL) OR (t.owner_merge = 1 AND t.merge_state = 'pending')) AND (
   SELECT e.kind FROM task_events e WHERE e.task_id = t.id
   AND e.kind IN ('awaiting_owner_merge', 'completed', 'completed_by_owner', 'reopened')
   ORDER BY e.id DESC LIMIT 1) = 'awaiting_owner_merge'"""
@@ -201,7 +202,9 @@ def show_text(d: dict[str, Any]) -> str:
     if t["block_kind"]:
         lines.append(f"block: {t['block_kind']}")
     if t["merge_state"]:
-        lines.append(f"merge: {t['merge_state']}")
+        lines.append(f"merge: {t['merge_state']}{' (owner merges)' if t['owner_merge'] else ''}")
+    if t["merge_method"] not in (None, "squash"):
+        lines.append(f"merge method: {t['merge_method']}")
     lines += notes(t)
     lines.append(
         f"parents: {', '.join(d['parents']) or '-'}  children: {', '.join(d['children']) or '-'}"

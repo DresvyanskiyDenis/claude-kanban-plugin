@@ -7,9 +7,9 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import dispatcher, housekeeping, store
+from kanban_claude import dispatcher, gitops, housekeeping, store, views
 
-from .conftest import Calls, FakeProcs
+from .conftest import Calls, FakeProcs, git
 
 Prs = Callable[[dict[str, dict[str, Any]]], None]
 SHA = "abc1234def5678abc1234def5678abc1234def56"
@@ -24,13 +24,19 @@ PR = {
 CLEAN = f"WARDEN: APPROVED PR #7 @ {SHA[:7]}"
 
 
-def approved(conn: Any, repo: Path, summary: str = CLEAN, base: str | None = "feature/x") -> str:
+def approved(
+    conn: Any,
+    repo: Path,
+    summary: str = CLEAN,
+    base: str | None = "feature/x",
+    merge_method: str | None = None,
+) -> str:
     """A card whose review run completed with `summary`: done, with a merge pending for a stacked base."""
     store.board_create(conn, "main", default_workdir=str(repo))
     tid = str(
         store.create(
             conn, "main", "Work", body="b", assignee="smith", workspace=f"worktree:{repo}",
-            branch="feat/x", base=base,
+            branch="feat/x", base=base, merge_method=merge_method,
         )["id"]
     )  # fmt: skip
     build = store.claim(conn, tid)
@@ -78,10 +84,20 @@ def test_v1_a_clean_approval_squash_merges_and_posts_a_comment(
     assert comments(conn, tid) == ["[merge] squash-merged PR #7 into feature/x"]
 
 
+FIXES = {
+    "approval_not_clean": "merge the PR on GitHub if you accept it",
+    "pr_not_open": "kanban merge-retry",
+    "base_changed": "point it back at feature/x",
+    "head_branch_changed": "another branch than the card's",
+    "base_is_default": "which only the owner merges",
+    "head_moved": "so warden reviews the new head",
+    "closed": "not merged: closed",
+}
+
+
 @pytest.mark.parametrize(
     ("change", "summary", "reason"),
     [
-        ({}, f"{CLEAN} PARTIAL REVIEW: tests not run", "approval_not_clean"),
         ({"state": "DRAFT"}, CLEAN, "pr_not_open"),
         ({"baseRefName": "release/y"}, CLEAN, "base_changed"),
         ({"headRefName": "feat/other"}, CLEAN, "head_branch_changed"),
@@ -107,7 +123,7 @@ def test_v1_each_precondition_fails_closed_and_names_itself(
     assert merge_calls(env) == []
     said = comments(conn, tid)[0]
     assert said.startswith(f"[merge] PR #7 into feature/x not merged: {reason}")
-    assert ("kanban reopen-review" in said) == (reason != "closed")
+    assert FIXES[reason] in said
     event = conn.execute("SELECT payload FROM task_events WHERE kind = 'merge_failed'").fetchone()
     assert json.loads(event["payload"])["reason"] == reason
 
@@ -339,3 +355,188 @@ def test_a_retry_does_not_touch_a_card_that_was_reopened_during_the_attempt(
     t = store.get_task(conn, tid)
     assert (t["merge_attempts"], t["merge_next_at"]) == (0, None)
     assert comments(conn, tid) == []
+
+
+def run_gh_merge(
+    conn: Any, repo: Path, set_prs: Prs, env: Path, method: str | None
+) -> tuple[str, list[str]]:
+    set_prs({"7": PR})
+    tid = approved(conn, repo, merge_method=method)
+    housekeeping.run_due(conn, later())
+    assert store.get_task(conn, tid)["merge_state"] == "merged"
+    return tid, merge_calls(env)[0]
+
+
+@pytest.mark.parametrize(
+    ("method", "flag", "said"),
+    [("merge", "--merge", "merged (merge commit)"), ("rebase", "--rebase", "rebase-merged")],
+)
+def test_d2_the_cards_merge_method_picks_the_gh_flag(
+    conn: Any, repo: Path, set_prs: Prs, env: Path, method: str, flag: str, said: str
+) -> None:
+    tid, call = run_gh_merge(conn, repo, set_prs, env, method)
+    assert flag in call and "--squash" not in call
+    assert "--match-head-commit" in call and "--delete-branch" in call
+    assert comments(conn, tid) == [f"[merge] {said} PR #7 into feature/x"]
+
+
+def test_d2_a_card_without_a_method_still_squashes(
+    conn: Any, repo: Path, set_prs: Prs, env: Path
+) -> None:
+    assert "--squash" in run_gh_merge(conn, repo, set_prs, env, None)[1]
+
+
+def test_p03_a_merge_gh_reported_as_failed_but_that_landed_is_settled_on_that_attempt(
+    conn: Any, repo: Path, set_prs: Prs, env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_prs({"7": PR})
+    monkeypatch.setenv("GH_FAKE_MERGE_FAIL", "landed")
+    tid = approved(conn, repo)
+    housekeeping.run_due(conn, later())
+    t = store.get_task(conn, tid)
+    assert (t["merge_state"], t["merge_attempts"]) == ("merged", 0)
+    assert len(merge_calls(env)) == 1
+
+
+def land(repo: Path, env: Path) -> str:
+    """origin has `feature/x` and a PR branch `feat/x` that changes a.txt; returns the PR head."""
+    git("remote", "set-url", "origin", str(env / "origin.git"), cwd=repo)
+    git("push", "origin", "main:feature/x", cwd=repo)
+    git("checkout", "-b", "feat/x", cwd=repo)
+    (repo / "a.txt").write_text("changed")
+    git("commit", "-am", "work", cwd=repo)
+    git("push", "origin", "feat/x", cwd=repo)
+    return git("rev-parse", "HEAD", cwd=repo)
+
+
+def squash_onto_base(repo: Path) -> None:
+    git("checkout", "-B", "feature/x", "origin/feature/x", cwd=repo)
+    git("merge", "--squash", "feat/x", cwd=repo)
+    git("commit", "-m", "squash", cwd=repo)
+    git("push", "origin", "feature/x", cwd=repo)
+
+
+def test_p03_content_landed_is_scoped_to_the_files_the_pr_changed(repo: Path, env: Path) -> None:
+    head = land(repo, env)
+    assert not gitops.content_landed(repo, "feature/x", "feat/x", head)
+    squash_onto_base(repo)
+    assert gitops.content_landed(repo, "feature/x", "feat/x", head)
+    (repo / "b.txt").write_text("unrelated")
+    git("add", "b.txt", cwd=repo)
+    git("commit", "-m", "later", cwd=repo)
+    git("push", "origin", "feature/x", cwd=repo)
+    assert gitops.content_landed(repo, "feature/x", "feat/x", head)
+    (repo / "a.txt").write_text("changed again")
+    git("commit", "-am", "edit again", cwd=repo)
+    git("push", "origin", "feature/x", cwd=repo)
+    assert not gitops.content_landed(repo, "feature/x", "feat/x", head)
+
+
+def test_p03_a_failed_fetch_is_not_landed(repo: Path) -> None:
+    assert not gitops.content_landed(repo, "feature/x", "feat/x", SHA)
+
+
+def test_p03_an_open_pr_whose_content_is_on_the_base_is_settled_not_merged_again(
+    conn: Any, repo: Path, set_prs: Prs, env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_prs({"7": PR})
+    monkeypatch.setenv("GH_FAKE_MERGE_FAIL", "1")
+    monkeypatch.setattr(housekeeping.gitops, "content_landed", lambda *_a: True)
+    tid = approved(conn, repo)
+    housekeeping.run_due(conn, later())
+    t = store.get_task(conn, tid)
+    assert (t["merge_state"], t["merge_attempts"]) == ("merged", 0)
+    assert len(merge_calls(env)) == 1
+    assert "close PR #7 by hand" in comments(conn, tid)[0]
+    event = conn.execute("SELECT payload FROM task_events WHERE kind = 'merged'").fetchone()
+    assert json.loads(event["payload"])["landed"] is True
+
+
+def test_p03_content_on_the_base_does_not_settle_a_head_that_moved_after_the_approval(
+    conn: Any, repo: Path, set_prs: Prs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_prs({"7": {**PR, "headRefOid": "f" * 40}})
+    monkeypatch.setenv("GH_FAKE_MERGE_FAIL", "1")
+    monkeypatch.setattr(housekeeping.gitops, "content_landed", lambda *_a: True)
+    tid = approved(conn, repo)
+    housekeeping.run_due(conn, later())
+    assert store.get_task(conn, tid)["merge_state"] == "failed"
+
+
+def flagged(conn: Any, tid: str) -> bool:
+    return next(c for c in views.cards_list(conn, "main") if c["id"] == tid)["awaiting_merge"]
+
+
+PARTIAL = f"{CLEAN} PARTIAL REVIEW: the integration tests were not run"
+
+
+def test_p05_a_partial_approval_is_the_owners_to_merge_and_holds_its_children(
+    conn: Any, repo: Path, set_prs: Prs, env: Path
+) -> None:
+    set_prs({"7": PR})
+    parent = approved(conn, repo, PARTIAL)
+    child = str(
+        store.create(conn, "main", "Next", body="b", assignee="smith", parents=[parent])["id"]
+    )
+    t = store.get_task(conn, parent)
+    assert (t["status"], t["merge_state"], t["owner_merge"]) == ("done", "pending", 1)
+    assert t["merge_next_at"] is None
+    kinds = [
+        r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (parent,))
+    ]
+    assert kinds[-1] == "awaiting_owner_merge" and "merge_pending" not in kinds
+    assert [c["id"] for c in views.awaiting_owner_merge(conn)] == [parent]
+    assert flagged(conn, parent) is True
+    with store.tx(conn):  # even a due `merge_next_at` cannot pull it into the job
+        conn.execute("UPDATE tasks SET merge_next_at = 1 WHERE id = ?", (parent,))
+    housekeeping.run_due(conn, later())
+    assert merge_calls(env) == [] and store.get_task(conn, parent)["merge_state"] == "pending"
+    assert comments(conn, parent) == []
+    assert dispatcher.promote(conn) == []
+
+    set_prs({"7": {**PR, "state": "MERGED"}})
+    housekeeping.settle_owner_merges(conn)
+    t = store.get_task(conn, parent)
+    assert (t["merge_state"], t["owner_merge"]) == ("merged", 1) and t["merged_at"]
+    assert comments(conn, parent) == ["[merge] PR #7 was merged by the owner on GitHub"]
+    assert flagged(conn, parent) is False
+    assert dispatcher.promote(conn) == [child]
+
+
+def test_p05_an_open_partial_pr_stays_pending_through_the_sweep(
+    conn: Any, repo: Path, set_prs: Prs
+) -> None:
+    set_prs({"7": PR})
+    tid = approved(conn, repo, PARTIAL)
+    housekeeping.settle_owner_merges(conn)
+    assert store.get_task(conn, tid)["merge_state"] == "pending"
+
+
+@pytest.mark.parametrize("verb", ["reopen", "reopen_review", "merge_retry"])
+def test_p05_every_reset_of_the_merge_state_clears_owner_merge(
+    conn: Any, repo: Path, set_prs: Prs, verb: str
+) -> None:
+    set_prs({"7": PR})
+    tid = approved(conn, repo, PARTIAL)
+    if verb == "reopen":
+        store.reopen(conn, tid, "again")
+    else:
+        with store.tx(conn):
+            conn.execute("UPDATE tasks SET merge_state = 'failed' WHERE id = ?", (tid,))
+        if verb == "reopen_review":
+            store.reopen_review(conn, tid, "again")
+        else:
+            store.merge_retry(conn, tid)
+    assert store.get_task(conn, tid)["owner_merge"] == 0
+
+
+def test_p05_the_guard_still_refuses_a_partial_summary_and_names_its_own_fix(
+    conn: Any, repo: Path, set_prs: Prs, env: Path
+) -> None:
+    set_prs({"7": PR})
+    tid = approved(conn, repo)
+    with store.tx(conn):
+        conn.execute("UPDATE task_runs SET summary = ? WHERE task_id = ?", (PARTIAL, tid))
+    housekeeping.run_due(conn, later())
+    assert store.get_task(conn, tid)["merge_state"] == "failed" and merge_calls(env) == []
+    assert FIXES["approval_not_clean"] in comments(conn, tid)[0]

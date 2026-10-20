@@ -102,6 +102,7 @@ def build() -> argparse.ArgumentParser:
     card = (
         "--assignee", "--workspace", "--branch", "--base", ("--priority", int), "--max-runtime",
         ("--max-retries", int), ("--skill", "append"), "--model", "--effort", ("--budget", float),
+        "--merge-method",
     )  # fmt: skip
     add("show", ("id", "?"))
     add("context", ("id", "?"))

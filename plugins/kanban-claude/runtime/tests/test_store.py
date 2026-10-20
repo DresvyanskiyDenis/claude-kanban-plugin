@@ -724,3 +724,37 @@ def test_no_sandbox_settings_remain(conn: Any) -> None:
     for key in ("worker.disabled_plugins", "worker.allowed_domains", "worker.allow_write"):
         with pytest.raises(Refused):
             store.config_set(conn, key, [])
+
+
+def test_a_partial_approval_into_a_feature_base_goes_to_the_owner(conn: Any, card: Card) -> None:
+    tid = card(branch="feature/x", base="feature/base")
+    review_request(conn, claim_run(conn, tid))
+    store.complete(
+        conn, claim_run(conn, tid), f"{APPROVED} PARTIAL REVIEW: no tests", default_branch="main"
+    )
+    t = row(conn, tid)
+    assert (t["merge_state"], t["owner_merge"], t["merge_next_at"]) == ("pending", 1, None)
+    assert kinds(conn, tid)[-1] == "awaiting_owner_merge" and "merge_pending" not in kinds(
+        conn, tid
+    )
+    store.reopen(conn, tid, "redo")
+    assert row(conn, tid)["owner_merge"] == 0
+
+
+def test_a_clean_approval_into_a_feature_base_is_not_an_owner_merge(conn: Any, card: Card) -> None:
+    tid = card(branch="feature/x", base="feature/base")
+    review_request(conn, claim_run(conn, tid))
+    store.complete(conn, claim_run(conn, tid), APPROVED, default_branch="main")
+    assert row(conn, tid)["owner_merge"] == 0
+
+
+def test_merge_method_is_stored_on_create_and_edit_and_validated(conn: Any, card: Card) -> None:
+    tid = card(merge_method="merge")
+    assert row(conn, tid)["merge_method"] == "merge"
+    store.edit(conn, tid, {"merge_method": "rebase"})
+    assert row(conn, tid)["merge_method"] == "rebase"
+    with pytest.raises(Refused, match="merge-method"):
+        store.edit(conn, tid, {"merge_method": "fast-forward"})
+    with pytest.raises(Refused, match="merge-method"):
+        card(merge_method="octopus")
+    assert row(conn, card())["merge_method"] is None

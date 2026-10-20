@@ -153,6 +153,8 @@ STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "
 NOT_RUNNING = tuple(s for s in STATUSES if s != "running")
 WORKER_BLOCK_KINDS = ("needs_input", "capability", "transient")
 BUILDERS = ("smith", "designer")
+PARTIAL_REVIEW = "PARTIAL REVIEW"  # a warden approval the owner merges (D10), never the daemon
+MERGE_METHODS = ("squash", "merge", "rebase")
 APPROVED_RE = re.compile(r"WARDEN: APPROVED PR #(\d+) @\s*([0-9a-f]{7,40})\b")
 BLOCK_RECURRENCE_LIMIT = 2
 PROTOCOL_VIOLATION_LIMIT = 3
@@ -673,6 +675,7 @@ FIELD_COLUMNS = {
     "model": "model_override",
     "effort": "reasoning_effort",
     "budget": "budget_usd",
+    "merge_method": "merge_method",
 }
 
 
@@ -736,6 +739,8 @@ def _columns(conn: sqlite3.Connection, fields: dict[str, Any], board: Row) -> di
             v = validate.budget(v, cfg(conn, "budget.ceiling"))
         elif key in ("branch", "base") and v is not None:
             validate.branch(v)
+        elif key == "merge_method" and v not in MERGE_METHODS:
+            raise Refused(f"merge-method {v!r} must be one of {', '.join(MERGE_METHODS)}")
         out[col] = v
     return out
 
@@ -793,6 +798,7 @@ def create(
     model: str | None = None,
     effort: str | None = None,
     budget: float | None = None,
+    merge_method: str | None = None,
     triage: bool = False,
     grants: Sequence[str] = (),
     approved: str | None = None,
@@ -810,6 +816,7 @@ def create(
         "title": title, "body": body, "assignee": assignee, "priority": priority,
         "branch": branch, "base": base, "max_retries": max_retries, "skills": list(skills),
         "model": model, "effort": effort, "budget": budget,
+        "merge_method": merge_method,
     }  # fmt: skip
     if max_runtime is not None:
         given["max_runtime"] = max_runtime
@@ -1093,6 +1100,7 @@ def reopen_review(
                 "merge_state": None,
                 "merge_attempts": 0,
                 "merge_next_at": None,
+                "owner_merge": 0,
                 "completed_at": None,
             }
         target = "ready" if parents_satisfied(conn, task_id) else "todo"
@@ -1121,7 +1129,7 @@ def reopen(
         _cas(
             conn, task_id, expected, version=expect_version, status=status, completed_at=None,
             merge_state=None, merge_attempts=0, merge_next_at=None, merged_at=None,
-            retry_after=None, assignee=t["implementer"] or t["assignee"],
+            owner_merge=0, retry_after=None, assignee=t["implementer"] or t["assignee"],
         )  # fmt: skip
         if actor != "jira":  # jira.py pushes owner comments to the issue it just reopened from
             _comment(conn, t, "owner", f"REOPEN: {reason}", actor)
@@ -1310,7 +1318,15 @@ def merge_retry(conn: sqlite3.Connection, task_id: str, *, actor: str = OWNER) -
             raise Refused(
                 f"card {task_id} has no failed merge to retry (status {t['status']}, merge {t['merge_state']})"
             )
-        _cas(conn, task_id, ["done"], merge_state="pending", merge_attempts=0, merge_next_at=now())
+        _cas(
+            conn,
+            task_id,
+            ["done"],
+            merge_state="pending",
+            merge_attempts=0,
+            merge_next_at=now(),
+            owner_merge=0,
+        )
         event(conn, t, "merge_retry", actor)
     return {"id": task_id, "merge_state": "pending"}
 
@@ -1734,12 +1750,19 @@ def complete(
                     "a review run completes only with 'WARDEN: APPROVED PR #<n> @ <sha>'; "
                     "otherwise use request-changes or block"
                 )
+            partial = PARTIAL_REVIEW in summary
             if t["base_branch"] and t["base_branch"] != default_branch:
-                merge = {"merge_state": "pending", "merge_attempts": 0, "merge_next_at": now()}
-                extra.append(("merge_pending", {"run_id": run_id, "pr": int(m[1]), "sha": m[2]}))
+                # A partial review stays 'pending' so children wait, but no merge job is due (D10).
+                merge = {
+                    "merge_state": "pending", "merge_attempts": 0, "owner_merge": int(partial),
+                    "merge_next_at": None if partial else now(),
+                }  # fmt: skip
+            pr_sha = {"run_id": run_id, "pr": int(m[1]), "sha": m[2]}
+            if merge and not partial:
+                extra.append(("merge_pending", pr_sha))
             else:
                 extra.append(
-                    ("awaiting_owner_merge", {"run_id": run_id, "pr": int(m[1]), "sha": m[2]})
+                    ("awaiting_owner_merge", {**pr_sha, **({"partial": True} if partial else {})})
                 )
         elif run["role"] in BUILDERS and commits_ahead > 0:
             raise Refused(

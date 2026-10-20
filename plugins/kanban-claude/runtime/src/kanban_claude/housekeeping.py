@@ -19,6 +19,21 @@ MERGE_RETRY_S = 120
 MERGE_MAX_ATTEMPTS = 3
 log = logging.getLogger("kanban.housekeeping")
 Row = sqlite3.Row
+METHOD_DONE = {
+    "squash": "squash-merged",
+    "merge": "merged (merge commit)",
+    "rebase": "rebase-merged",
+}
+# One fix per precondition failure (REV-05), not one reopen-review string for all of them.
+FIX = {
+    "approval_not_clean": "the approval is not clean; merge the PR on GitHub if you accept it, or run: kanban reopen-review {id} --reason TEXT",
+    "pr_not_open": "the PR is not open; reopen it or mark it ready on GitHub, then run: kanban merge-retry {id}",
+    "default_branch_unknown": "gh could not name the repository's default branch; check gh auth and the network, then run: kanban merge-retry {id}",
+    "head_branch_changed": "the PR now comes from another branch than the card's; run: kanban reopen-review {id} --reason TEXT",
+    "base_is_default": "the PR targets the default branch, which only the owner merges; merge it on GitHub, or retarget it and run: kanban merge-retry {id}",
+    "base_changed": "the PR was retargeted; point it back at {base} and run: kanban merge-retry {id}",
+    "head_moved": "commits were pushed after the approval; run: kanban reopen-review {id} --reason TEXT so warden reviews the new head",
+}
 
 
 def say(conn: sqlite3.Connection, t: Row, text: str) -> None:
@@ -29,7 +44,7 @@ def precondition_failure(
     t: Row, approved: dict[str, Any], summary: str, pr: dict[str, Any], default: str
 ) -> str | None:
     """REV-05 preconditions in order (the PR was fetched by its approved number); None means all hold."""
-    if not store.APPROVED_RE.search(summary) or "PARTIAL REVIEW" in summary:
+    if not store.APPROVED_RE.search(summary) or store.PARTIAL_REVIEW in summary:
         return "approval_not_clean"
     if pr.get("state") != "OPEN":
         return "pr_not_open"
@@ -93,12 +108,18 @@ def merge_one(conn: sqlite3.Connection, t: Row) -> None:
             + (f" ({extra['fix']})" if "fix" in extra else ""),
         )  # fmt: skip
 
-    def merged(pr: dict[str, Any]) -> None:
+    method = t["merge_method"] or "squash"
+
+    def merged(pr: dict[str, Any], landed: bool = False) -> None:
         sha, into = pr.get("headRefOid"), pr.get("baseRefName")
-        settle(
-            conn, t, "merged", "merged", {"pr": n, "base": into, "sha": sha},
-            f"[merge] squash-merged PR #{n} into {into or base}",
-        )  # fmt: skip
+        text = (
+            f"[merge] gh did not merge PR #{n}, but its content is already on {into or base}; "
+            f"close PR #{n} by hand"
+            if landed
+            else f"[merge] {METHOD_DONE[method]} PR #{n} into {into or base}"
+        )
+        payload = {"pr": n, "base": into, "sha": sha, **({"landed": True} if landed else {})}
+        settle(conn, t, "merged", "merged", payload, text)
 
     def repo() -> str:
         return gitops.repo_slug(gitops.origin_url(t["workspace_path"]) or "")
@@ -115,21 +136,28 @@ def merge_one(conn: sqlite3.Connection, t: Row) -> None:
             summary = (run["summary"] if run else "") or ""
             reason = precondition_failure(t, approved, summary, pr, ghops.repo_default_branch(slug))
             if reason:
-                return fail(
-                    reason,
-                    fix=f"the approval no longer covers the PR; run: kanban reopen-review {t['id']} --reason TEXT",
-                )
+                return fail(reason, fix=FIX[reason].format(id=t["id"], base=base))
             if not claim_merge(conn, t):
                 return
-            ghops.merge(slug, n, pr["headRefOid"])
+            ghops.merge(slug, n, pr["headRefOid"], method)
         merged(pr)
     except Exception as e:
         log.exception("merge of PR #%s for %s failed", n, t["id"])
         attempts = t["merge_attempts"] + 1
+        with contextlib.suppress(Exception):  # gh may report failure after GitHub merged (REV-06)
+            pr = ghops.pr_view(repo(), n, fields)
+            if pr.get("state") == "MERGED":
+                return merged(pr)
+            head = str(pr.get("headRefOid", ""))
+            if (
+                pr.get("state") == "OPEN"
+                and head.startswith(approved.get("sha") or "-")
+                and gitops.content_landed(
+                    t["workspace_path"], pr["baseRefName"], pr["headRefName"], head
+                )
+            ):
+                return merged(pr, landed=True)
         if attempts >= MERGE_MAX_ATTEMPTS:
-            with contextlib.suppress(Exception):
-                if (pr := ghops.pr_view(repo(), n, fields)).get("state") == "MERGED":
-                    return merged(pr)
             return fail(f"failed after {attempts} attempts: {e}", error=str(e))
         with store.tx(conn):
             cur = conn.execute(
@@ -162,12 +190,19 @@ def cleanup_card(conn: sqlite3.Connection, t: Row) -> None:
 
 
 def settle_owner_merges(conn: sqlite3.Connection) -> None:
-    """A PR into the default branch is merged by the owner on GitHub, which nothing else sees: note the
-    time, so the card stops being `awaiting merge`. Its worktree is usually gone by then (GIT-06)."""
+    """A PR the owner merges on GitHub (into the default branch, or a partial review) is seen by nothing
+    else: note it, so the card stops being `awaiting merge`; a partial review's pending merge settles
+    and its children start. Its worktree is usually gone by then (GIT-06)."""
     for t in views.awaiting_owner_merge(conn):
         with contextlib.suppress(Error):
             repo = gitops.repo_slug(gitops.origin_url(t["workspace_path"]) or "")
-            if ghops.pr_view(repo, t["pr_number"])["state"] == "MERGED":
+            if ghops.pr_view(repo, t["pr_number"])["state"] != "MERGED":
+                continue
+            if t["owner_merge"]:  # held back by merge_state 'pending' until now
+                n = t["pr_number"]
+                settle(conn, t, "merged", "merged", {"pr": n, "owner": True},
+                       f"[merge] PR #{n} was merged by the owner on GitHub")  # fmt: skip
+            else:
                 ts = store.now()
                 with store.tx(conn):
                     conn.execute(
@@ -209,7 +244,8 @@ def run_due(conn: sqlite3.Connection, ts: int | None = None) -> None:
     """One housekeeping wake-up: every job that is due, one at a time; a job's failure stays its own."""
     ts = ts or int(time.time())
     for t in conn.execute(
-        "SELECT * FROM tasks WHERE status = 'done' AND merge_state = 'pending' AND merge_next_at <= ? "
+        "SELECT * FROM tasks WHERE status = 'done' AND merge_state = 'pending' AND owner_merge = 0 "
+        "AND merge_next_at <= ? "
         "ORDER BY merge_next_at",
         (ts,),
     ).fetchall():
