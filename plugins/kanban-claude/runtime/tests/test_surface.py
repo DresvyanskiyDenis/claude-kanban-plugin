@@ -29,15 +29,16 @@ BUILTIN = {
 MCP_SERVERS = {"atlassian", "code-review-graph", "context7", "lightpanda", "playwright"}
 MCP_NAME = re.compile(r"mcp__([a-z0-9-]+)(?:__[a-z0-9_]+)?")
 IGNORED_FOR_PLUGIN_AGENTS = {"permissionMode", "hooks", "mcpServers"}
+# Dispatched roles carry no effort: the runner's --effort from `effort.<role>` config decides.
 MODEL_EFFORT = {
-    "smith": ("sonnet", "xhigh"),
-    "designer": ("sonnet", "xhigh"),
-    "scout": ("sonnet", "high"),
-    "warden": ("opus", "high"),
+    "smith": ("sonnet", None),
+    "designer": ("sonnet", None),
+    "scout": ("sonnet", None),
+    "warden": ("opus", None),
     "card-helper": ("sonnet", "high"),
     "review-helper": ("sonnet", "high"),
     "card-checker": ("sonnet", "medium"),
-    "atlassian": ("sonnet", "medium"),
+    "atlassian": ("sonnet", None),
 }
 SPAWNS = {
     "smith": {"card-helper"},
@@ -81,7 +82,7 @@ def test_agent_frontmatter(role: str):
     fm = frontmatter(AGENTS[role])
     assert fm["name"] == role
     assert re.fullmatch(r'"(?:[^"\\]|\\.)+"', fm["description"]), "description must be quoted"
-    assert (fm["model"], fm["effort"]) == MODEL_EFFORT[role]
+    assert (fm["model"], fm.get("effort")) == MODEL_EFFORT[role]
     assert not IGNORED_FOR_PLUGIN_AGENTS & fm.keys()
     assert "tools" in fm and fm["tools"], "tools must be an explicit allowlist"
 

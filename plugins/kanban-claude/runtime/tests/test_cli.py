@@ -362,9 +362,7 @@ def test_help_lists_every_verb_with_a_line_and_comment_names_stdin(kb: Kb) -> No
         a.choices for a in cli.build()._actions if isinstance(a, argparse._SubParsersAction)
     )
     listed = {ln.split()[0]: ln for ln in kb("--help")[1].splitlines() if ln.startswith("    ")}
-    assert {v for v in verbs if v != "board"} <= {
-        v for v, ln in listed.items() if len(ln.split()) > 1
-    }
+    assert set(verbs) <= {v for v, ln in listed.items() if len(ln.split()) > 1}
     assert "stdin" in listed["comment"] and "stdin" in kb("comment", "--help")[1]
 
 

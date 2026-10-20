@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Install or upgrade the kanban-claude daemon on this Mac. Use when the user runs /kanban-claude:setup, or a SessionStart line asks to run it. Installs the runtime with uv, probes claude, loads the LaunchAgent and checks that the board answers.
+description: Install or upgrade the kanban-claude daemon on this Mac. Use when the user runs /kanban-claude:setup, or a SessionStart line asks to run it. Installs the runtime with uv, probes claude, loads the LaunchAgent and checks that the daemon holds its lock.
 disable-model-invocation: true
 ---
 
