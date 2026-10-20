@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.0.dev8
+
+### Removed
+
+- The web board: the `board` verb, the daemon's web thread, `web.py` and its assets, `setup --port`, and the `web.port` and `web.jira_base_url` config keys. A leftover `web.port` row is ignored. The views are now the CLI (`list`, `show`, `digest`, `watch --actionable`) and the `/kanban-board` pane. A `web.secret` file left in `$KANBAN_HOME` is no longer read and can be deleted.
+
+### Added
+
+- `kanban watch --wait` polls like `--follow` but exits 0 once it has printed at least one line (lines `--actionable` hides do not count). The orchestrator skill now runs `kanban watch --actionable --wait --board <slug>` as a background command instead of under Monitor, which stopped it every 30 minutes and woke the session for nothing.
+- `kanban watch --actionable` keeps only the events that need the owner (`blocked`, `block_loop_detected`, `gave_up`, `merge_failed`, `awaiting_owner_merge`, `account_paused`, `quota_wall`, `dispatch_paused`) and drops the owner's own. Watch lines end with the actor, for example `(worker:smith#3)`.
+- `notify.command` runs once per new actionable event with the event line on stdin. It takes an argv list or a command line, runs with no shell and a 10 s timeout, and keeps a cursor, so a restart replays nothing.
+- Worker verb `kanban wait-ci [--pr N]` waits up to 540 s on the run's PR checks: exit 0 passed, 1 failed, 2 pending or no checks yet, 4 no single open PR. Worker Bash calls get a 600 s default timeout so the wait is not cut off at 120 s.
+- `block --kind transient --retry-after DUR` (`30m`, `2h`, `90s` or seconds) puts the card back in line after DUR. It counts as a failed run, so the failure limit still ends the retries.
+- `kanban digest --since` opens with what needs you, then merged, in review, running and cost. `kanban followups --since` lists the `FOLLOW-UP:` comments. `list` and `show` print why the dispatcher passed over a waiting card, `stats` lists walled and logged-out accounts, and `kanban --help` gives every verb a one-line help.
+- `--touches GLOB` on `create`, `specify` and `edit`: a card whose touches overlap a running card's in the same repo waits, with the skip reason `overlaps:<id>`.
+- `--merge-method squash|merge|rebase` per card.
+- Budget caps checked at claim: `budget.max_usd_per_card` (default 15, 0 turns it off) and `budget.max_usd_per_board_day` (off by default). A card over a cap is blocked with kind `capability` and a comment naming the key to raise.
+- `effort.<role>` config keys. Effort resolves from the card, then the role, then the run kind's default, then `effort.default`; review runs ignore the card's effort. `config set` refuses an effort or model `claude` would reject.
+- A partial-review approval into a feature base is left to the owner to merge (`awaiting_owner_merge`), and its children wait until the sweep sees it merged. A failed merge whose approved content already landed on the base settles as merged.
+- Schema migration 5: `tasks.ignore_merge`, `owner_merge`, `touches` and `merge_method`.
+
+### Changed
+
+- Workers are isolated from the owner's setup. Every plugin the account enables is off in a run except kanban-claude, its declared dependency and `worker.plugin_allowlist`. Workers start with `--strict-mcp-config` and a private 0600 MCP file per run, holding the role's servers plus `worker.mcp_allowlist`. Per-role permission denies are passed with `--settings`.
+- Each card's workers get their own `TMPDIR` under `$KANBAN_WORK/tmp/<card>`. A worker in a repo whose origin is not github.com gets `GH_HOST`.
+- A paused login is re-probed after 5, 15, then 60 minutes, and `account_paused` carries the card, the error and the login command.
+- `request-review` finds the PR from the card's branch and base, so the summary no longer has to name it; zero or several open PRs are refused, with the fix.
+- `promote --ignore-merge` stays on the card until `reopen`, `hold` or `link`. A scratch card with `--branch` is refused. A worktree card with no `--base` and one same-repo worktree parent takes that parent's base.
+- The run prompts live in `prompts/*.md`, with one rules file and a terminal list per run kind. `kanban context` is leaner. `preflight.py` ignores base merges and reports a merge-only re-review.
+- The daemon writes its pid and version into `daemon.lock`; `doctor` and `setup` read them from there. An upgrade now waits up to 30 s for the restarted daemon to report the new version.
+- Jira sync is frozen: bug fixes only.
+
+### Fixed
+
+- A card the budget cap blocked at a review claim unblocks back to review, not to its builder.
+- A PR the owner closed without merging ends the owner-merge wait as `merge_failed`. Before, the card waited forever and held its children.
+- The sweep removes the `TMPDIR` of every archived or deleted card.
+
 ## 0.2.0.dev7
 
 ### Added

@@ -2,7 +2,7 @@
 
 A local kanban board for Claude Code. Cards are dispatched to headless Claude workers (`claude -p`) under a macOS LaunchAgent; the board is a SQLite file you read with the `kanban` CLI and the `/kanban-board` pane. No external service.
 
-Status: pre-release (`0.2.0.dev7`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
+Status: pre-release (`0.2.0.dev8`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
 
 ## Install
 
@@ -56,6 +56,12 @@ Upgrading is the same skill on a newer plugin: when the recorded version is olde
 Each worker session is named `kanban <card-id> <role>`. Ask your session to steer a running card and it sends your words there and records them on the card; a worker asks back only by blocking its card with `needs_input`.
 
 Agents cannot enforce a deny list for Bash commands; the runner's `--settings` carries the rules for `gh pr merge`, force pushes and `kanban grant`, and branch protection on the remote is the backstop.
+
+Workers do not inherit your own setup. In a run, every plugin your account enables is off except kanban-claude, its declared dependency and the names in `worker.plugin_allowlist`. MCP servers come only from a private per-run file (`--strict-mcp-config`, mode 0600) that holds the role's servers plus `worker.mcp_allowlist`, copied from the config directory's `.claude.json`. Each role also gets its own permission denies: no subagent but its helper, and no edits for warden, atlassian and (except its report) scout. Each card's workers share one `TMPDIR` under `$KANBAN_WORK/tmp/<card>`.
+
+Spend is capped at claim: `budget.max_usd_per_card` (default 15 USD, 0 turns it off) and `budget.max_usd_per_board_day` (off by default). A card over a cap is blocked with a comment naming the key to raise.
+
+To follow the board from a session, run `kanban watch --actionable --wait --board <slug>` as a background command. It blocks until something needs you, prints it and exits; run it again with `--since <last event id>`. `notify.command` (an argv list, for example `kanban config set notify.command '["/abs/path/script"]'`) gets each such event line on stdin from the daemon, with no session open.
 
 ## Session start
 
