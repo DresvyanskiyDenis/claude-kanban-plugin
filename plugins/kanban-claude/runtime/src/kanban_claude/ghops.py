@@ -57,9 +57,13 @@ def repo_default_branch(repo: str) -> str:
         raise Error("gh returned unreadable JSON for the repository") from e
 
 
-def merge(repo: str, number: int, head_oid: str) -> None:
-    """REV-05: squash, only if the head is still the approved commit; remote branch deleted."""
-    gh("pr", "merge", str(number), "-R", repo, "--squash", "--match-head-commit", head_oid,
+METHOD_FLAGS = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}
+
+
+def merge(repo: str, number: int, head_oid: str, method: str = "squash") -> None:
+    """REV-05: merge by `method` (squash unless the card says otherwise), only if the head is still
+    the approved commit; remote branch deleted."""
+    gh("pr", "merge", str(number), "-R", repo, METHOD_FLAGS[method], "--match-head-commit", head_oid,
        "--delete-branch", timeout=120)  # fmt: skip
 
 

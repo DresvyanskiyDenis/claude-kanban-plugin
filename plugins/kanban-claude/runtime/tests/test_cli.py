@@ -329,3 +329,19 @@ def test_a_corrupt_database_is_a_clean_error(kb: Kb, env: Path) -> None:
     db.write_bytes(b"this is not a database\n" * 64)
     code, _, err = kb("list")
     assert code == 1 and "database" in err and "Traceback" not in err
+
+
+def test_merge_method_flag_on_create_and_edit(
+    kb: Kb, workdirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_BOARD", "alpha")
+    out = kb(
+        "create", "T", "--body", "b", "--assignee", "smith", "--merge-method", "rebase", "--json"
+    )
+    tid = json.loads(out[1])["id"]
+    assert json.loads(kb("show", tid, "--json")[1])["task"]["merge_method"] == "rebase"
+    assert "merge method: rebase" in kb("show", tid)[1]
+    assert kb("edit", tid, "--merge-method", "merge")[0] == 0
+    assert "merge method: merge" in kb("show", tid)[1]
+    code, _, err = kb("edit", tid, "--merge-method", "octopus")
+    assert code != 0 and "merge-method" in err

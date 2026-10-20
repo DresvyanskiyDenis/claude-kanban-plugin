@@ -71,6 +71,25 @@ def commits_ahead(root: str | Path, base: str, branch: str) -> int:
     return int(out)
 
 
+def content_landed(root: str | Path, base: str, branch: str, head_oid: str) -> bool:
+    """True when every file `head_oid` changed against its fork point is already identical on
+    `origin/<base>`, so merging the PR would change nothing. Any git failure answers False: the
+    caller then falls back to merging."""
+    if run("fetch", "origin", base, branch, root=root, timeout=120)[0] != 0:
+        return False
+    rc, fork = run("merge-base", f"refs/remotes/origin/{base}", head_oid, root=root)
+    if rc != 0:
+        return False
+    rc, out = run("diff", "--name-only", "--no-renames", "-z", fork, head_oid, root=root)
+    files = [f for f in out.split("\0") if f] if rc == 0 else []
+    if not files:
+        return False
+    return (
+        run("diff", "--quiet", f"refs/remotes/origin/{base}", head_oid, "--", *files, root=root)[0]
+        == 0
+    )
+
+
 class ProvisionError(Error):
     """A workspace that cannot be provided. `infra` marks a fault of the machine, not the card."""
 

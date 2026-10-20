@@ -79,3 +79,19 @@ def test_watch_line_shape(conn: Any, card: Card) -> None:
     ev = store.events_since(conn, 0)[-1]
     line = views.watch_line(ev)
     assert f" {tid} {ev['kind']}" in line and line.startswith("[")
+
+
+def test_show_text_names_a_non_default_merge_method_and_an_owner_merge(
+    conn: Any, card: Card
+) -> None:
+    tid = card()
+    assert "merge method" not in views.show_text(views.show_data(conn, tid))
+    store.edit(conn, tid, {"merge_method": "squash"})
+    assert "merge method" not in views.show_text(views.show_data(conn, tid))
+    store.edit(conn, tid, {"merge_method": "merge"})
+    with store.tx(conn):
+        conn.execute(
+            "UPDATE tasks SET merge_state = 'pending', owner_merge = 1 WHERE id = ?", (tid,)
+        )
+    text = views.show_text(views.show_data(conn, tid))
+    assert "merge method: merge" in text and "merge: pending (owner merges)" in text
