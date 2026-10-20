@@ -512,6 +512,29 @@ def test_p05_an_open_partial_pr_stays_pending_through_the_sweep(
     assert store.get_task(conn, tid)["merge_state"] == "pending"
 
 
+@pytest.mark.parametrize(
+    ("summary", "base"), [(PARTIAL, "feature/x"), (CLEAN, None)], ids=["partial", "default"]
+)
+def test_a_pr_closed_without_a_merge_ends_the_wait_as_a_failed_merge(
+    conn: Any, repo: Path, set_prs: Prs, summary: str, base: str | None
+) -> None:
+    set_prs({"7": PR})
+    tid = approved(conn, repo, summary, base)
+    assert [c["id"] for c in views.awaiting_owner_merge(conn)] == [tid]
+    set_prs({"7": {**PR, "state": "CLOSED"}})
+    housekeeping.settle_owner_merges(conn)
+    housekeeping.settle_owner_merges(conn)
+    assert store.get_task(conn, tid)["merge_state"] == "failed"
+    assert views.awaiting_owner_merge(conn) == []
+    events = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'merge_failed'", (tid,)
+    ).fetchall()
+    assert [json.loads(e["payload"])["reason"] for e in events] == ["pr_closed"]
+    assert comments(conn, tid) == [
+        f"[merge] PR #7 was closed on GitHub without a merge ({housekeeping.FIX['pr_closed'].format(id=tid)})"
+    ]
+
+
 @pytest.mark.parametrize("verb", ["reopen", "reopen_review", "merge_retry"])
 def test_p05_every_reset_of_the_merge_state_clears_owner_merge(
     conn: Any, repo: Path, set_prs: Prs, verb: str

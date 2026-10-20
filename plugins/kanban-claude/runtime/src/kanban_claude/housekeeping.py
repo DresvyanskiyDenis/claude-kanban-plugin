@@ -33,6 +33,7 @@ FIX = {
     "base_is_default": "the PR targets the default branch, which only the owner merges; merge it on GitHub, or retarget it and run: kanban merge-retry {id}",
     "base_changed": "the PR was retargeted; point it back at {base} and run: kanban merge-retry {id}",
     "head_moved": "commits were pushed after the approval; run: kanban reopen-review {id} --reason TEXT so warden reviews the new head",
+    "pr_closed": "reopen the card with: kanban reopen {id} --reason TEXT, or let its children start with: kanban promote CHILD --reason TEXT --ignore-merge",
 }
 
 
@@ -197,7 +198,10 @@ def settle_owner_merges(conn: sqlite3.Connection) -> None:
     for t in views.awaiting_owner_merge(conn):
         with contextlib.suppress(Error):
             repo = gitops.repo_slug(gitops.origin_url(t["workspace_path"]) or "")
-            if ghops.pr_view(repo, t["pr_number"])["state"] != "MERGED":
+            state = ghops.pr_view(repo, t["pr_number"])["state"]
+            if state == "CLOSED":
+                closed_unmerged(conn, t)
+            if state != "MERGED":
                 continue
             if t["owner_merge"]:  # held back by merge_state 'pending' until now
                 n = t["pr_number"]
@@ -211,6 +215,25 @@ def settle_owner_merges(conn: sqlite3.Connection) -> None:
                         "WHERE id = ? AND merge_state IS NULL AND merged_at IS NULL",
                         (ts, ts, t["id"]),
                     )
+
+
+def closed_unmerged(conn: sqlite3.Connection, t: Row) -> None:
+    """A PR closed without a merge ends the wait as a failed merge: the owner decides, and the
+    sweep stops asking GitHub about it."""
+    n, fix = t["pr_number"], FIX["pr_closed"].format(id=t["id"])
+    ts = store.now()
+    with store.tx(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET merge_state = 'failed', merge_next_at = NULL, updated_at = ?, "
+            "version = version + 1 WHERE id = ? AND merged_at IS NULL "
+            "AND (merge_state IS NULL OR (owner_merge = 1 AND merge_state = 'pending'))",
+            (ts, t["id"]),
+        )
+        if cur.rowcount == 1:
+            payload = {"reason": "pr_closed", "pr": n, "fix": fix}
+            store.event(conn, t, "merge_failed", "housekeeping", payload)
+    if cur.rowcount == 1:
+        say(conn, t, f"[merge] PR #{n} was closed on GitHub without a merge ({fix})")
 
 
 def sweep(conn: sqlite3.Connection) -> None:
