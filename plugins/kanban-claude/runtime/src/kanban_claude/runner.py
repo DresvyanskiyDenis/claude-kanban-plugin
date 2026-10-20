@@ -71,12 +71,18 @@ ATLASSIAN_TOOLS = (
 )  # fmt: skip
 # D1: an allowlist of one, so an agent type the deny list does not name (a user agent) stays out;
 # agent_id is set only inside a subagent, and a helper inherits the role's Agent tool
-SPAWN_GUARD = (
-    "import json, sys; a = sys.argv[1]; e = json.load(sys.stdin); "
-    't = e.get("tool_input", {}).get("subagent_type"); '
-    '(a and t == a and "agent_id" not in e) or (print("kanban: only the role spawns, and only " '
-    '+ (a or "no subagent"), file=sys.stderr), sys.exit(2))'
-)
+# A PreToolUse hook that exits 1 lets the tool run, so any failure to read the event blocks (exit 2).
+SPAWN_GUARD = """import json, sys
+a = sys.argv[1]
+try:
+    e = json.load(sys.stdin)
+    ok = bool(a) and e["tool_input"]["subagent_type"] == a and "agent_id" not in e
+except Exception:
+    ok = False
+if not ok:
+    print("kanban: only the role spawns, and only " + (a or "no subagent"), file=sys.stderr)
+    sys.exit(2)
+"""
 EOF = object()
 Row = sqlite3.Row
 

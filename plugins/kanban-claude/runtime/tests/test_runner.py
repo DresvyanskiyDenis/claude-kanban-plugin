@@ -210,6 +210,15 @@ def test_d1_a_role_may_spawn_only_its_own_helper_and_nothing_else() -> None:
     assert spawn("smith", "kanban-claude:card-helper", helper) == 2
 
 
+def test_d1_the_spawn_guard_blocks_when_it_cannot_read_the_event() -> None:
+    # a PreToolUse hook that crashes (exit 1) lets the tool run, so every crash must exit 2
+    (entry,) = json.loads(runner.settings_json(Path("/h"), [], "smith"))["hooks"]["PreToolUse"]
+    cmd = ["/bin/sh", "-c", entry["hooks"][0]["command"]]
+    for payload in (b"not json", b"null", b'{"tool_input": null}', b'"x"', b"\xff"):
+        run = subprocess.run(cmd, input=payload, capture_output=True)  # noqa: S603
+        assert run.returncode == 2, (payload, run.stderr)
+
+
 def write_mcp(path: Path, servers: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"mcpServers": servers}))
