@@ -37,6 +37,12 @@ def test_show_json_has_the_fields_the_preflight_reads(conn: Any, card: Card) -> 
     assert d["parents"] == [parent]
     assert [c["body"] for c in d["comments"]] == ["needs care"]
     assert views.show_data(conn, parent)["latest_summary"] == "parent result"
+    run_row = views.show_data(conn, parent)["runs"][-1]
+    assert (run_row["kind"], run_row["outcome"], run_row["summary"]) == (
+        "work",
+        "completed",
+        "parent result",
+    )
     assert views.show_data(conn, parent)["children"] == [child]
 
 

@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 
 OVERSIZED = 2000
 DEEP_LINES, LIGHT_LINES = 500, 30
@@ -39,6 +40,7 @@ HIDDEN = re.compile("[​-‏‪-‮⁠-⁤﻿]")
 HOST = re.compile(r"https?://([A-Za-z0-9.-]+)")
 BORING_HOSTS = {"localhost", "127.0.0.1", "example.com", "example.org", "example.net"}
 LEDGER = "REVIEW LEDGER @ "
+APPROVED = re.compile(r"WARDEN: APPROVED PR #\d+ @\s*([0-9a-f]{7,40})\b")
 PR_URL = re.compile(r"^https?://([^/]+/[^/]+/[^/]+)/pull/(\d+)")
 
 
@@ -46,13 +48,21 @@ def is_test(path: str) -> bool:
     return bool(TEST_PATH.search(path))
 
 
-def gate_fact(body: str, sha: str) -> list[str]:
+def gate_fact(
+    body: str, sha: str, merge_only_since: Callable[[str], bool] = lambda _: False
+) -> list[str]:
     gates = [ln for ln in body.splitlines() if ln.lstrip().startswith("Gate:")]
     if not gates:
         return ["CHECK the PR body has no `Gate:` line"]
-    for line in gates:
-        if any(sha.startswith(t) for t in re.findall(r"\b[0-9a-f]{7,40}\b", line)):
-            return ["ok the Gate line names the head commit"]
+    named = [t for line in gates for t in re.findall(r"\b[0-9a-f]{7,40}\b", line)]
+    if any(sha.startswith(t) for t in named):
+        return ["ok the Gate line names the head commit"]
+    for tok in named:
+        if merge_only_since(tok):
+            return [
+                f"ok the Gate line names {tok[:7]}, an ancestor of the head {sha[:7]} with only merge commits since; "
+                "a base merge needs no new local gate run (CI and the review gate still run on the head)"
+            ]
     return [
         f"CHECK the Gate line does not name the head commit {sha[:7]}: {gates[0].strip()[:120]}"
     ]
@@ -69,6 +79,61 @@ def checks_fact(checks: list[dict[str, str]]) -> list[str]:
     if pending:
         out.append(f"CHECK CI still running on the head: {', '.join(pending)}")
     return out or [f"ok CI green on the head ({len(checks)} checks)"]
+
+
+def git_out(*args: str) -> str | None:
+    r = call(["git", *args])
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def own_headlines(commits: list[dict[str, str]]) -> list[str]:
+    """Headlines of the PR's own commits: the base merges smith makes are left out."""
+    own = git_out("rev-list", "--no-merges", "--no-walk=unsorted", *[c["oid"] for c in commits])
+    if own is None:  # a commit is not in this clone: judge them all rather than none
+        return [c["messageHeadline"] for c in commits]
+    return [c["messageHeadline"] for c in commits if c["oid"] in own.split()]
+
+
+def merge_only_since(old: str, head: str) -> bool:
+    """`old` is an ancestor of `head` on its first-parent line and only merges came after it.
+
+    First-parent matters: a base merge brings the base's own commits into `old..head`, but they
+    sit on the second parent, so only the branch's own commits are counted.
+    """
+    full = git_out("rev-parse", "--verify", "--quiet", f"{old}^{{commit}}")
+    if (
+        not full
+        or full == head
+        or call(["git", "merge-base", "--is-ancestor", full, head]).returncode
+    ):
+        return False
+    return git_out("rev-list", "--no-merges", "--first-parent", f"{full}..{head}") == ""
+
+
+def pr_delta(rev: str, base_ref: str) -> str | None:
+    """The PR's own change at `rev`: changed lines against its merge-base, without hunk positions."""
+    mb = git_out("merge-base", rev, base_ref)
+    out = git_out("diff", "--no-ext-diff", "--no-color", "-U0", mb, rev) if mb else None
+    if out is None:
+        return None
+    return "\n".join(ln for ln in out.splitlines() if ln.startswith(("+", "-", "diff --git")))
+
+
+def merge_only_fact(runs: list[dict[str, str]], head: str, base: str) -> list[str]:
+    """INFO when the last approval is followed by merges only and the PR's own diff is unchanged."""
+    shas = [
+        m[1] for r in runs if r["kind"] == "review" and (m := APPROVED.search(r["summary"] or ""))
+    ]
+    if not shas or not merge_only_since(shas[-1], head):
+        return []
+    ref = f"origin/{base}"
+    before = pr_delta(shas[-1], ref)
+    if before is None or before != pr_delta(head, ref):
+        return []
+    return [
+        f"INFO merge-only since APPROVED @ {shas[-1][:7]}: every commit since then is a merge "
+        f"and the PR's own diff against {ref} is unchanged"
+    ]
 
 
 def nonconventional(headlines: list[str]) -> list[str]:
@@ -257,9 +322,10 @@ def main(argv: list[str]) -> int:
     ]
     if status:
         facts.append("CHECK the working tree is not clean")
-    facts += gate_fact(pr["body"] or "", sha)
+    facts += gate_fact(pr["body"] or "", sha, lambda tok: merge_only_since(tok, sha))
     facts += checks_fact(checks)
-    facts += nonconventional([c["messageHeadline"] for c in pr["commits"]])
+    facts += merge_only_fact(card["runs"], sha, pr["baseRefName"])
+    facts += nonconventional(own_headlines(pr["commits"]))
     facts += tier(files)
     facts += fix_needs_test(title, files)
     facts += simplify_rules(title, files)
