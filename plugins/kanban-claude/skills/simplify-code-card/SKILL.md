@@ -50,7 +50,7 @@ If the diff removes nothing, complete the card with `kanban complete $KANBAN_TAS
 
 1. Commit as `refactor: simplify <area>`.
 2. Run the whole gate on the head, push the card branch, and open the PR with `gh pr create`. The body carries the before and after numbers from the compare step, the diffstat, and the line `` Gate: `<exact command>` -> exit 0 at <head sha> ``.
-3. Wait for CI: run `kanban wait-ci` and run it again while it exits 2 (0 passed, 1 failed, 2 still pending, including no checks yet; it returns within 540 s). Never `run_in_background`, never Monitor, never a `sleep` loop.
+3. Wait for CI: run `kanban wait-ci` and run it again while it exits 2, at most 3 runs in all (0 passed, 1 failed, 2 still pending, including no checks yet, 4 no open PR or several; it returns within 540 s). After the third exit 2 with "no checks reported yet" (a repo with no CI), treat CI as passed and write "no CI checks reported" in the review summary; with checks still running after the third, `kanban block $KANBAN_TASK --kind transient --retry-after 30m --reason "<CI still running; PR #n>"`. Never `run_in_background`, never Monitor, never a `sleep` loop.
 4. End with `kanban request-review $KANBAN_TASK --reviewer warden --summary "<area, numbers, PR #n>"`.
 
 The reviewer checks that the PR removes more lines than it adds and leaves the tests alone.
