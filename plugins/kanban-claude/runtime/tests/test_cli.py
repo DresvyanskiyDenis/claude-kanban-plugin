@@ -385,3 +385,43 @@ def test_stats_reports_account_walls_and_pauses(kb: Kb, workdirs: tuple[Path, Pa
     conn.close()
     accounts = json.loads(kb("stats", "--json")[1])["accounts"]
     assert accounts[0]["config_dir"] == "/acct" and accounts[0]["wall_until"]
+
+
+def test_touches_flag_repeats_and_edit_clears_it(
+    kb: Kb, workdirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_BOARD", "alpha")
+    code, out, err = kb(
+        "create", "T", "--body", "b", "--assignee", "smith", "--touches", "docs/**",
+        "--touches", "README.md", "--json",
+    )  # fmt: skip
+    assert code == 0, err
+    tid = json.loads(out)["id"]
+    shown = kb("show", tid)[1]
+    assert "touches: docs/**, README.md" in shown
+    assert kb("edit", tid, "--touches", "")[0] == 0
+    assert "touches:" not in kb("show", tid)[1]
+    assert json.loads(kb("show", tid, "--json")[1])["task"]["touches"] is None
+
+
+def test_create_scratch_with_a_branch_names_the_fix(
+    kb: Kb, workdirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_BOARD", "alpha")
+    code, _, err = kb("create", "T", "--body", "b", "--assignee", "smith", "--branch", "feat/x")
+    assert code == 4 and "--workspace worktree:<repo>" in err
+
+
+def test_config_set_turns_the_budget_caps_on_and_off(kb: Kb, workdirs: tuple[Path, Path]) -> None:
+    def get(key: str) -> Any:
+        return json.loads(kb("config", "get", key, "--json")[1])["value"]
+
+    assert get("budget.max_usd_per_card") == 15.0
+    assert kb("config", "set", "budget.max_usd_per_card", "0")[0] == 0
+    assert get("budget.max_usd_per_card") == 0
+    assert kb("config", "set", "budget.max_usd_per_board_day", "75")[0] == 0
+    assert get("budget.max_usd_per_board_day") == 75
+    assert kb("config", "set", "budget.max_usd_per_board_day", "null")[0] == 0
+    assert get("budget.max_usd_per_board_day") is None
+    assert kb("config", "set", "budget.max_usd_per_board_day", '"lots"')[0] == 4
+    assert kb("config", "set", "budget.max_usd_per_card", "-3")[0] == 4

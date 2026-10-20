@@ -419,10 +419,12 @@ def test_s5_a_done_card_awaiting_the_owners_merge_says_so(
 
 @pytest.mark.parametrize("end", ["merged", "stacked", "owner_done", "reopened"])
 def test_s5_the_flag_ends_when_the_merge_is_settled_another_way(
-    conn: Any, board: str, card: Card, kb: Kb, end: str
+    conn: Any, board: str, card: Card, kb: Kb, end: str, repo: Path
 ) -> None:
     if end == "stacked":
-        tid = approved_card(conn, card, branch="feature/x", base="feature/base")
+        tid = approved_card(
+            conn, card, workspace=f"worktree:{repo}", branch="feature/x", base="feature/base"
+        )
     elif end == "owner_done":
         tid = card()
         store.request_review(conn, claim_run(conn, tid), "PR #12", pr_number=12, pr_url=PR_URL)

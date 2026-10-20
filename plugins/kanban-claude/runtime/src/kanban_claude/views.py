@@ -208,6 +208,8 @@ def show_text(d: dict[str, Any]) -> str:
         t["title"],
         f"workspace: {t['workspace_kind']}:{t['workspace_path'] or '-'}  branch: {t['branch_name'] or '-'}  base: {t['base_branch'] or '-'}",
     ]
+    if t["touches"]:
+        lines.append(f"touches: {', '.join(json.loads(t['touches']))}")
     if t["pr_url"]:
         lines.append(f"pr: #{t['pr_number']} {t['pr_url']}")
     if t["block_kind"]:

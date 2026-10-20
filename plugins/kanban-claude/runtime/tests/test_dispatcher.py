@@ -16,7 +16,7 @@ from kanban_claude import dispatcher, gitops, runner, store
 from kanban_claude.dispatcher import dispatch_once
 from kanban_claude.errors import Refused
 
-from .conftest import FakeProcs, Kb
+from .conftest import FakeProcs, Kb, git
 
 Card = Callable[..., str]
 NOW = 2_000_000_000
@@ -590,3 +590,84 @@ def test_each_account_gets_its_own_wall_event_and_an_idle_wall_is_silent(
         {"until": NOW + 300, "kind": "hard", "cards": 1},
         {"until": NOW + 100, "kind": "hard", "cards": 1},
     ]
+
+
+def test_ignore_merge_card_is_dispatched(conn: Any, card: Card, procs: FakeProcs) -> None:
+    parent, child = card("p"), card("c")
+    store.link(conn, parent, child)
+    store.complete(conn, store.claim(conn, parent) or 0, "ok")
+    set_card(conn, parent, merge_state="pending")
+    store.promote(conn, child, "stuck merge", ignore_merge=True)
+    assert [c["id"] for c in tick(conn, procs)["claimed"]] == [child]
+
+
+@pytest.fixture
+def worktree_cards(conn: Any, repo: Path) -> Callable[..., str]:
+    store.board_create(conn, "wt", default_workdir=str(repo))
+
+    def make(branch: str, touches: list[str] | None, workdir: Path = repo) -> str:
+        got = store.create(
+            conn, "wt", branch, body="b", assignee="smith", workspace=f"worktree:{workdir}",
+            branch=branch, touches=touches,
+        )  # fmt: skip
+        return str(got["id"])
+
+    return make
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "overlap"),
+    [
+        (["docs/**"], ["docs/guide.md"], True),
+        (["docs"], ["docs/guide.md"], True),
+        (["README.md"], ["README.md"], True),
+        (["*.md"], ["docs/guide.md"], True),
+        (["docs/**"], ["src/**"], False),
+        (["src/a.py"], ["src/b.py"], False),
+        (["docs/a.md", "src/**"], ["tests/x.py", "src/util.py"], True),
+    ],
+)
+def test_globs_overlap(a: list[str], b: list[str], overlap: bool) -> None:
+    assert dispatcher.touches_overlap(a, b) is overlap
+
+
+def test_overlapping_touches_wait_for_the_running_card(
+    conn: Any, worktree_cards: Callable[..., str], procs: FakeProcs
+) -> None:
+    store.config_set(conn, "dispatch.max_in_progress", 4)
+    first = worktree_cards("feat/a", ["docs/**"])
+    assert store.claim(conn, first)
+    second = worktree_cards("feat/b", ["docs/guide.md"])
+    free = worktree_cards("feat/c", ["src/**"])
+    unknown = worktree_cards("feat/d", None)
+    report = tick(conn, procs, memory={})
+    assert report["skipped"] == {second: f"overlaps:{first}"}
+    assert sorted(c["id"] for c in report["claimed"]) == sorted([free, unknown])
+    ev = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'skipped'", (second,)
+    ).fetchone()
+    assert json.loads(ev["payload"]) == {"reason": f"overlaps:{first}"}
+
+
+def test_overlapping_cards_ready_together_start_one_at_a_time(
+    conn: Any, worktree_cards: Callable[..., str], procs: FakeProcs
+) -> None:
+    store.config_set(conn, "dispatch.max_in_progress", 4)
+    a = worktree_cards("feat/a", ["docs/**"])
+    b = worktree_cards("feat/b", ["docs/x.md"])
+    report = tick(conn, procs)
+    assert [c["id"] for c in report["claimed"]] == [a]
+    assert report["skipped"] == {b: f"overlaps:{a}"}
+
+
+def test_touches_in_another_repo_do_not_overlap(
+    conn: Any, worktree_cards: Callable[..., str], procs: FakeProcs, repo: Path, env: Path
+) -> None:
+    other = env / "repos" / "other"
+    other.mkdir()
+    git("init", "-b", "main", cwd=other)
+    git("remote", "add", "origin", "https://example.invalid/acme/other.git", cwd=other)
+    a = worktree_cards("feat/a", ["docs/**"])
+    assert store.claim(conn, a)
+    b = worktree_cards("feat/b", ["docs/**"], other)
+    assert [c["id"] for c in tick(conn, procs)["claimed"]] == [b]

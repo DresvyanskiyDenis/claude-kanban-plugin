@@ -163,6 +163,7 @@ def build() -> argparse.ArgumentParser:
         "--assignee", "--workspace", "--branch", "--base", ("--priority", int), "--max-runtime",
         ("--max-retries", int), ("--skill", "append"), "--model", "--effort", ("--budget", float),
         "--merge-method",
+        ("--touches", "append"),
     )  # fmt: skip
     add("show", ("id", "?"))
     add("context", ("id", "?"))

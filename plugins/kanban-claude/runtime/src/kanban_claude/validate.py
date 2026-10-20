@@ -57,6 +57,15 @@ def skills(values: object) -> list[str]:
     return list(values)
 
 
+def touches(values: object) -> list[str]:
+    if not isinstance(values, list | tuple) or not values:
+        raise Refused("touches must be a non-empty list of globs; clear it with --touches ''")
+    for v in values:
+        if not isinstance(v, str) or not v.strip():
+            raise Refused(f"touches glob {v!r} must be a non-empty string")
+    return [v.strip() for v in values]
+
+
 def duration(value: str | int) -> int:
     """`30m`, `2h`, `90s` or plain seconds."""
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:

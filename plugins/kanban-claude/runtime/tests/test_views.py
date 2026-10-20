@@ -214,3 +214,9 @@ def test_account_states_list_only_current_walls_and_pauses(conn: Any, clock: Any
     got = {a["config_dir"]: a for a in views.account_states(conn)}
     assert set(got) == {"/a", "/b"}
     assert got["/a"]["wall_until"] == now + 600 and got["/b"]["auth_paused"]["error"]
+
+
+def test_show_text_prints_the_touches_only_when_set(conn: Any, card: Card) -> None:
+    plain, scoped = card("plain"), card("scoped", touches=["docs/**", "*.md"])
+    assert "touches" not in views.show_text(views.show_data(conn, plain))
+    assert "touches: docs/**, *.md" in views.show_text(views.show_data(conn, scoped))
