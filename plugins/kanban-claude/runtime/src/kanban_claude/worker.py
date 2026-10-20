@@ -4,14 +4,19 @@ Anything that needs git or the network runs before the transaction a terminal ve
 """
 
 import json
+import os
+import re
 import sqlite3
 import subprocess
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
 
 from . import ghops, gitops, store, validate, views
 from .errors import Error, NotAllowed, Refused, Usage
+from .paths import ensure_dir, run_files
 
 MAX_TEXT = 1024 * 1024
 VERBS = (
@@ -24,10 +29,13 @@ VERBS = (
     "request-review",
     "request-changes",
     "wait-ci",
+    "gate",
 )
 BUDGET_S = 540  # under the 600 s a worker's shell command may run
 POLL_S = 20
 CI_EXIT = {"passed": 0, "failed": 1, "pending": 2}
+GATE_LINES = 40
+GATE_RE = re.compile(r"FAIL|Error|error:|failed|Traceback|AssertionError|✗")
 _FAILED_RUNS = ("failure", "timed_out", "cancelled", "startup_failure", "action_required")
 
 
@@ -151,6 +159,63 @@ def wait_ci(repo: str, number: int, deadline: float | None = None) -> tuple[str,
         time.sleep(POLL_S)
 
 
+def gate_log(t: sqlite3.Row, run: sqlite3.Row) -> Path:
+    """A fresh `run-N.gate-K.log` next to the run's log, under KANBAN_HOME: never in the worktree,
+    where it would land in the PR diff. Created exclusively, so parallel gates get different K."""
+    d = ensure_dir(run_files(t["board"], t["id"], run["n"])[0].parent)
+    k = 1
+    while True:
+        path = d / f"run-{run['n']}.gate-{k}.log"
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            return path
+        except FileExistsError:
+            k += 1
+
+
+def gate_digest(lines: Iterable[str], limit: int) -> tuple[int, list[str]]:
+    """The line count of a gate's output and at most `limit` lines of it: the failure-looking ones
+    first (once each, in order, half the budget at most), then the tail, which is where test runners
+    print their summary. Streams the lines, so a huge log never sits in memory."""
+    cap, bad, last, n = limit - limit // 2, dict[str, None](), deque[str](maxlen=limit), 0
+    for x in lines:
+        n += 1
+        if len(bad) < cap and GATE_RE.search(x):
+            bad.setdefault(x)
+        last.append(x)
+    room = limit - len(bad) - (1 if bad else 0)
+    tail = [x for x in list(last)[-room:] if x not in bad] if room > 0 else []
+    return n, [*bad, *(["--- last lines ---"] if bad and tail else []), *tail][:limit]
+
+
+def gate(t: sqlite3.Row, run: sqlite3.Row, command: list[str], limit: int | None) -> dict[str, Any]:
+    """L3: run the gate command with its whole output in a log file and return a short digest.
+    One argument is a shell string (`bash -o pipefail -c`), several are an argv."""
+    if not command:
+        raise Usage("gate needs a command: kanban gate -- CMD [ARG...]")
+    limit = GATE_LINES if limit is None else limit
+    if limit < 1:
+        raise Usage("--lines must be at least 1")
+    argv = ["bash", "-o", "pipefail", "-c", command[0]] if len(command) == 1 else command
+    log = gate_log(t, run)
+    started = time.monotonic()
+    with log.open("wb") as f:
+        try:
+            code = subprocess.run(
+                argv, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT
+            ).returncode
+        except OSError as e:
+            f.write(f"kanban gate: cannot run {argv[0]}: {e.strerror}\n".encode())
+            code = 127
+    code = code if code >= 0 else 128 - code
+    with log.open(errors="replace") as f:
+        n, digest = gate_digest((x.rstrip("\n") for x in f), limit)
+    head = (
+        f"gate: exit {code} after {round(time.monotonic() - started)}s, {n} lines; full log: {log}"
+    )
+    return {"exit": code, "text": "\n".join([head, *digest]), "log": str(log)}
+
+
 def act(conn: sqlite3.Connection, run_id: int, verb: str, args: dict[str, Any]) -> Any:
     """Apply one worker verb to the card of run `run_id`; errors are the usual `Error`s."""
     run = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
@@ -198,6 +263,8 @@ def act(conn: sqlite3.Connection, run_id: int, verb: str, args: dict[str, Any]) 
             }
         state, line = wait_ci(_repo(t), number, deadline)
         return {"state": state, "summary": line, "pr": number}
+    if verb == "gate":
+        return gate(t, run, args.get("command") or [], args.get("lines"))
     if verb == "request-changes":
         return store.request_changes(conn, run_id, _text(args, "reason"))
     summary = _text(args, "summary")

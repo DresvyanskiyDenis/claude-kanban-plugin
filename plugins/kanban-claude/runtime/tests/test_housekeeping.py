@@ -29,6 +29,22 @@ def test_retention_removes_files_past_the_window_and_their_empty_directories(con
     assert not old[0].parent.exists()
 
 
+def test_retention_also_removes_the_prompt_and_gate_logs_of_an_old_run(conn: Any) -> None:
+    run_dir = make("main", "t_old", 1, 40)[0].parent
+    extra = [
+        run_dir / "run-1.prompt.md",
+        run_dir / "run-1.gate-1.log",
+        run_dir / "run-1.gate-2.log",
+    ]
+    kept = [run_dir / "run-2.prompt.md", run_dir / "run-2.gate-1.log"]
+    for f in [*extra, *kept]:
+        f.write_text("x")
+    for f in extra:
+        os.utime(f, (1, 1))
+    housekeeping.retention(conn, store.now())
+    assert not any(f.exists() for f in extra) and all(f.exists() for f in kept)
+
+
 def test_a_file_that_vanishes_during_the_sweep_does_not_end_it(
     conn: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

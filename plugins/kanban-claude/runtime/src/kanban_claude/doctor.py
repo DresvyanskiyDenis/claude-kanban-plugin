@@ -17,6 +17,7 @@ from . import (
     daemon,
     dispatcher,
     ghops,
+    github,
     install,
     jira,
     launchd,
@@ -407,7 +408,7 @@ def runners(c: Ctx) -> Result:
     return ok("every running run has its runner")
 
 
-# --- 19-20: GitHub and Jira -----------------------------------------------------------------
+# --- 19-21: GitHub and Jira -----------------------------------------------------------------
 
 
 @check(19, "branch protection (GIT-08)")
@@ -476,6 +477,47 @@ def jira_pairing(c: Ctx) -> Result:
             )
     probed = ", the server lists the seven tools" if c.probe else ""
     return ok(f"{', '.join(boards) or 'no board'}: assignee set, sync running{probed}")
+
+
+@check(21, "GitHub pairing")
+def github_pairing(c: Ctx) -> Result:
+    have = c.conn.execute("PRAGMA user_version").fetchone()[0]
+    if have < len(store.MIGRATIONS):
+        return warn(f"not checked: the database is at schema {have}; see check 5")
+    boards = github.paired(c.conn)
+    if not boards:
+        return ok("no board is paired with a GitHub repository")
+    hosts = sorted({github.split(b["github_repo"])[0] for b in boards})
+    needs_project = {github.split(b["github_repo"])[0] for b in boards if b["github_project"]}
+    for host in hosts:
+        try:
+            status = ghops.auth_status(host)
+        except Error as e:
+            return fail(f"{host}: {e}", f"gh auth login --hostname {host}")
+        scopes = re.search(r"Token scopes: (.*)", status)
+        if host in needs_project and scopes and "'project'" not in scopes[1]:
+            return fail(
+                f"{host}: the token has no project scope, which a board with --github-project needs",
+                f"gh auth refresh -h {host} -s project",
+            )
+    if c.probe:
+        for b in boards:
+            repo = github.Repo(b)
+            try:
+                github.call(repo.host, repo.path)
+                repo.use_project()
+            except Error as e:
+                return fail(f"{b['slug']}: {e}", f"gh auth status --hostname {repo.host}")
+    paused = {
+        b["slug"]: p
+        for b in boards
+        if (p := (store.state_get(c.conn, f"github:{b['slug']}") or {}).get("paused"))
+    }
+    if paused:
+        why = "; ".join(f"{slug}: {p['detail']}" for slug, p in paused.items())
+        return warn(f"sync paused on {why}", "kanban github sync")
+    probed = ", the repository and project read" if c.probe else ""
+    return ok(f"{', '.join(b['slug'] for b in boards)}: gh logged in to {', '.join(hosts)}{probed}")
 
 
 # --- running them, and --fix ----------------------------------------------------------------

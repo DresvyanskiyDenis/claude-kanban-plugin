@@ -16,13 +16,16 @@ from . import (
     daemon,
     dispatcher,
     doctor,
+    github,
     gitops,
     install,
     jira,
+    measure,
     runner,
     store,
     validate,
     views,
+    web,
     worker,
 )
 from .errors import Error, NotAllowed, NotFound, Refused, Usage
@@ -40,6 +43,7 @@ NUDGE = NEEDS_DAEMON | {
 LONG_RUNNING: dict[str, Callable[[argparse.Namespace], int]] = {
     "daemon": lambda a: daemon.serve(),
     "run": lambda a: runner.run(a.run_id),
+    "web": web.serve,  # its own read-only connection: `owner()` would open and migrate the live one
 }
 OWNER: dict[str, Handler] = {}
 
@@ -80,8 +84,10 @@ VERB_HELP = {
     "request-review": "end the run: the PR is ready, hand it to the reviewer",
     "request-changes": "send a reviewed card back to its builder with the reasons",
     "wait-ci": "wait up to 9 minutes for the PR checks; exit 0 pass, 1 fail, 2 pending",
+    "gate": "run a gate command; the full output goes to a log, a short digest is printed",
     "boards": "list, create, edit or archive boards",
     "jira": "import, link, unlink or sync Jira issues",
+    "github": "import, link, unlink or sync GitHub issues",
     "create": "create a card",
     "specify": "fill in a triage card and start it",
     "list": "list the board's cards and why each waits",
@@ -112,6 +118,7 @@ VERB_HELP = {
     "log": "print a run's log",
     "tail": "follow the live run's log",
     "stats": "cost, outcomes, review rounds, and accounts that are walled or logged out",
+    "web": "serve a read-only board, cards, logs and stats on http://127.0.0.1 until Ctrl-C",
     "pause": "stop dispatching",
     "resume": "resume dispatching and re-probe sign-in",
     "config": "list, get or set settings",
@@ -135,7 +142,7 @@ def build() -> argparse.ArgumentParser:
     root.add_argument("--version", action="version", version=f"kanban {__version__}")
     sub = root.add_subparsers(dest="verb", required=True, metavar="VERB")
 
-    def add(name: str, *spec: str | tuple[str, Any]) -> None:
+    def add(name: str, *spec: str | tuple[str, Any]) -> argparse.ArgumentParser:
         """A bare name is a positional, `--x` takes a value; a tuple adds its type or kind."""
         p = sub.add_parser(
             name,
@@ -157,6 +164,7 @@ def build() -> argparse.ArgumentParser:
                 p.add_argument(arg, required=True)
             else:
                 p.add_argument(arg, **({"type": kind} if kind else {}))
+        return p
 
     text = ("--body", "--body-file")
     card = (
@@ -171,14 +179,17 @@ def build() -> argparse.ArgumentParser:
     add("attach", "id", "path")
     add("block", "id", ("--kind", "required"), ("--reason", "required"), "--retry-after")
     add("wait-ci", ("--pr", int))
+    add("gate", ("--lines", int)).add_argument("command", nargs="*", metavar="-- CMD")
     add("complete", "id", "--summary", "--summary-file")
     add("request-review", "id", "--reviewer", "--summary", "--summary-file")
     add("request-changes", "id", ("--reason", "required"))
     add(
         "boards", "action", ("slug", "?"), "--default-workdir", "--name", "--claude-config-dir",
-        "--jira-project", "--jira-jql", ("--jira-off", "flag"),
+        "--jira-project", "--jira-jql", ("--jira-off", "flag"), "--github-repo", "--github-query",
+        "--github-project", ("--github-off", "flag"),
     )  # fmt: skip
     add("jira", "action", ("ref", "?"), ("issue", "?"))
+    add("github", "action", ("ref", "?"), ("issue", "?"))
     add(
         "create", "title", *card, *text, "--idempotency-key", ("--parent", "append"),
         ("--triage", "flag"), ("--grant", "append"), "--approved",
@@ -211,7 +222,8 @@ def build() -> argparse.ArgumentParser:
     add("tail", "id")
     add("digest", "--since")
     add("followups", "--since")
-    add("stats", ("--days", int))
+    add("stats", ("--days", int), ("--backfill", "flag"))
+    add("web", ("--port", int), ("--open", "flag"))
     add("pause", "--reason")
     add("resume")
     add("config", "action", ("key", "?"), ("value", "?"))
@@ -339,11 +351,19 @@ def v_boards(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str,
         "claude_config_dir": a.claude_config_dir,
         "jira_project": a.jira_project,
         "jira_jql": a.jira_jql,
+        "github_repo": a.github_repo,
+        "github_query": a.github_query,
+        "github_project": a.github_project,
     }
     if a.action == "edit":
-        return store.board_edit(conn, a.slug, **opts, jira_off=a.jira_off), None
-    if not a.default_workdir or a.jira_off:
-        raise Usage("boards create needs --default-workdir PATH and cannot take --jira-off")
+        edited = store.board_edit(
+            conn, a.slug, **opts, jira_off=a.jira_off, github_off=a.github_off
+        )
+        return edited, None
+    if not a.default_workdir or a.jira_off or a.github_off:
+        raise Usage(
+            "boards create needs --default-workdir PATH and cannot take --jira-off or --github-off"
+        )
     return store.board_create(conn, a.slug, **opts), None
 
 
@@ -365,6 +385,60 @@ def v_jira(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, A
         case "status", None, None:
             return jira_status(conn)
     raise Usage("usage: kanban jira import ISSUE | link ID ISSUE | unlink ID | sync | status")
+
+
+@owner_verb("github")
+def v_github(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    """`sync` runs a pass now, in this process, under the daemon's lock."""
+    match a.action, a.ref, a.issue:
+        case "import", ref, None if ref:
+            got = github.import_issue(conn, need_board(conn, a), ref)
+            return got, f"card {got['id']} created for {got['issue']}"
+        case "link", ref, issue if ref and issue:
+            got = github.link_card(conn, ref, issue)
+            return got, f"card {got['id']} linked to {got['issue']}"
+        case "unlink", ref, None if ref:
+            got = github.unlink_card(conn, ref)
+            return got, f"card {got['id']} unlinked from {got['issue']}"
+        case "sync", None, None:
+            return github_sync(conn, find_board(conn, a))
+        case "status", None, None:
+            return github_status(conn)
+    raise Usage("usage: kanban github import ISSUE | link ID ISSUE | unlink ID | sync | status")
+
+
+def github_sync(conn: sqlite3.Connection, board: str | None) -> tuple[dict[str, Any], str | None]:
+    done = github.sync_all(conn, board)
+    stuck = [
+        b
+        for b in github.status(conn)["boards"]
+        if b["board"] not in done and board in (None, b["board"])
+    ]
+    lines = [f"{slug}: synced" for slug in done]
+    lines += [f"{b['board']}: paused: {b['paused']['detail']}" for b in stuck]
+    if stuck:
+        raise Error("\n".join(lines))
+    return {"boards": done}, "\n".join(lines) or "no board is paired with a GitHub repository"
+
+
+def github_status(conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    data = github.status(conn)
+    lines = []
+    for b in data["boards"]:
+        pull = views.local(b["last_pull_at"]) if b.get("last_pull_at") else "never"
+        paused = b.get("paused")
+        note = (
+            f"  PAUSED since {views.local(paused['since'])}: {paused['detail']}" if paused else ""
+        )
+        if b.get("export_skipped"):
+            note += f"  EXPORT OFF: {b['export_skipped']}"
+        project = f"  project {b['project']}" if b["project"] else ""
+        lines.append(f"{b['board']}  {b['repo']}{project}  last pull {pull}{note}")
+    lines += [
+        f"{ln['repo'].partition('/')[2]}#{ln['number']}  card {ln['task_id']}  {ln['conflict'] or ln['error']}"
+        for ln in data["links"]
+    ]
+    return data, "\n".join(lines) or "no board is paired with a GitHub repository"
 
 
 def jira_sync(conn: sqlite3.Connection, board: str | None) -> tuple[dict[str, Any], str | None]:
@@ -585,6 +659,12 @@ def v_tail(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, A
 
 @owner_verb("stats")
 def v_stats(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    if a.backfill:
+        done = measure.backfill(conn)
+        return (
+            done,
+            f"backfill: filled {done['filled']} runs, skipped {done['skipped']} (no stream sidecar)",
+        )
     data = store.stats(conn, board=find_board(conn, a), days=a.days or 7)
     data["accounts"] = views.account_states(conn)
     return data, json.dumps(data, indent=2, sort_keys=True)
@@ -738,6 +818,8 @@ def worker_args(a: argparse.Namespace) -> dict[str, Any]:
             args.update(kind=a.kind, reason=a.reason, retry_after=a.retry_after)
         case "wait-ci":
             args["pr"] = a.pr
+        case "gate":
+            args.update(command=a.command, lines=a.lines)
         case "complete" | "request-review":
             args["summary"] = text_arg(a.summary, a.summary_file)
             args["reviewer"] = getattr(a, "reviewer", None)
@@ -769,14 +851,17 @@ def run_as_worker(a: argparse.Namespace) -> int:
     elif a.verb == "wait-ci":
         present(a, data, data["summary"])
         return worker.CI_EXIT[data["state"]]
+    elif a.verb == "gate":
+        present(a, data, data["text"])
+        return int(data["exit"])
     else:
         present(a, data, "already done" if data.get("noop") else None)
     return 0
 
 
 def owner(a: argparse.Namespace) -> int:
-    if a.verb == "wait-ci":
-        raise NotAllowed("wait-ci is a worker verb; it waits on the CI of the run's own card")
+    if a.verb in ("wait-ci", "gate"):
+        raise NotAllowed(f"{a.verb} is a worker verb; it acts on the run's own card")
     if a.verb in RUN_ONLY:
         raise NotAllowed(
             f"{a.verb} ends a worker's run, so only a worker can use it; "

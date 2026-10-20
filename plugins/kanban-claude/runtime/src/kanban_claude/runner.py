@@ -2,6 +2,7 @@
 
 import collections
 import contextlib
+import hashlib
 import json
 import os
 import queue
@@ -20,10 +21,10 @@ from pathlib import Path
 from string import Template
 from typing import IO, Any
 
-from . import classify, ghops, gitops, housekeeping, store, validate
+from . import classify, ghops, gitops, housekeeping, measure, store, validate
 from .errors import Error
 from .gitops import ProvisionError
-from .paths import card_tmp, dirs, ensure_dir, nudge, run_files
+from .paths import card_tmp, dirs, ensure_dir, nudge, run_files, write_private
 from .procs import signal_group, start_time
 
 KILL_GRACE_S = 30
@@ -114,6 +115,18 @@ def model_effort(conn: sqlite3.Connection, t: Row, run: Row) -> tuple[str, str]:
     return t["model_override"] or store.cfg(conn, "models.default"), effort
 
 
+def advisor_arm(conn: sqlite3.Connection, run: Row) -> str:
+    """D1: the advisor arm of this run, `inherit`, `on` or `off`, from `advisor.<role>`. An `ab`
+    role is split by a stable hash of role and card (salted, so smith's and warden's arms on one
+    card are independent, and a card keeps its arm across reruns)."""
+    key = f"advisor.{run['role']}"
+    policy = store.cfg(conn, key) if key in store.DEFAULTS else "inherit"
+    if policy != "ab":
+        return str(policy)
+    digest = hashlib.sha256(f"{run['role']}:{run['task_id']}".encode()).digest()
+    return "off" if digest[0] & 1 else "on"
+
+
 def json_section(path: Path, key: str) -> dict[str, Any]:
     try:
         section = json.loads(path.read_text()).get(key)
@@ -201,7 +214,12 @@ def with_config_dir(env: dict[str, str], config_dir: str) -> dict[str, str]:
 
 
 def worker_env(
-    conn: sqlite3.Connection, t: Row, run_id: int, workspace: Path, config_dir: str
+    conn: sqlite3.Connection,
+    t: Row,
+    run_id: int,
+    workspace: Path,
+    config_dir: str,
+    advisor: str = "inherit",
 ) -> dict[str, str]:
     env = with_config_dir(base_env(conn), config_dir)
     exe = shutil.which("kanban")
@@ -218,6 +236,10 @@ def worker_env(
     )  # fmt: skip
     if t["workspace_kind"] != "scratch" and (host := origin_host(workspace)):
         env.setdefault("GH_HOST", host)
+    if advisor == "off":
+        env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
+    elif advisor == "on":  # an explicit arm, also against a daemon started with the switch set
+        env.pop("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", None)
     return env
 
 
@@ -309,6 +331,18 @@ def build_argv(
     return [*argv, "--resume" if resumed else "--session-id", sid]
 
 
+def launch_params(argv: list[str], env: dict[str, str], prompt_path: Path) -> dict[str, Any]:
+    """How a run was launched, for `task_runs.params`: the argv without the prompt text (it is in
+    the file), and only the env keys the runner sets itself."""
+    shown = [*argv]
+    shown[shown.index("-p") + 1] = "<prompt>"
+    return {
+        "argv": shown,
+        "env": {k: env[k] for k in measure.PARAM_ENV if k in env},
+        "prompt_path": str(prompt_path),
+    }
+
+
 def run_line(run: Row) -> str:
     """RUN-14."""
     secs = (run["ended_at"] or int(time.time())) - run["started_at"]
@@ -326,6 +360,7 @@ class Runner:
         self.conn = conn
         self.run_id = run_id
         self.stream = classify.Stream()
+        self.measure = measure.Measure()
         self.q: queue.SimpleQueue[object] = queue.SimpleQueue()
         self.tail: collections.deque[str] = collections.deque(maxlen=40)
         self.proc: subprocess.Popen[str] | None = None
@@ -452,21 +487,36 @@ class Runner:
         fd = os.open(mcp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         with os.fdopen(fd, "w") as f:
             json.dump(mcp_config(self.conn, run["role"], workspace, self.config_dir), f)
+        prompt = build_prompt(
+            self.conn, t, workspace, self.config_dir, resumed, is_review(self.conn, run)
+        )
+        arm = advisor_arm(self.conn, run)
         argv = build_argv(
-            store.cfg(self.conn, "claude.bin") or shutil.which("claude") or "claude",
-            build_prompt(
-                self.conn, t, workspace, self.config_dir, resumed, is_review(self.conn, run)
-            ), run["role"], t["id"],
+            store.cfg(self.conn, "claude.bin") or shutil.which("claude") or "claude", prompt,
+            run["role"], t["id"],
             model, effort,
             settings_json(dirs().home, rules, run["role"], plugins_off(self.conn, self.config_dir)),
             budget, store.cfg(self.conn, "worker.max_turns"), sid, resumed, str(mcp),
             store.cfg(self.conn, f"tools.{run['role']}"),
         )  # fmt: skip
+        env = worker_env(self.conn, t, self.run_id, workspace, self.config_dir, arm)
+        prompt_path = Path(run["log_path"]).with_suffix(".prompt.md")
+        write_private(prompt_path, prompt.encode())
         with store.tx(self.conn):
             self.conn.execute(
                 "UPDATE task_runs SET session_id = ?, resumed = ?, model = ?, effort = ?, "
-                "budget_usd = ?, config_dir = ? WHERE id = ?",
-                (sid, int(resumed), model, effort, budget, self.config_dir, self.run_id),
+                "budget_usd = ?, config_dir = ?, advisor = ?, params = ? WHERE id = ?",
+                (
+                    sid,
+                    int(resumed),
+                    model,
+                    effort,
+                    budget,
+                    self.config_dir,
+                    arm,
+                    store.dumps(launch_params(argv, env, prompt_path)),
+                    self.run_id,
+                ),
             )
         print(
             f"[kanban] {run['role']} {t['id']} model={model} effort={effort} session={sid} "
@@ -481,7 +531,7 @@ class Runner:
         fd = os.open(run["stream_path"], os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         try:
             self.proc = subprocess.Popen(
-                argv, cwd=workspace, env=worker_env(self.conn, t, self.run_id, workspace, self.config_dir),
+                argv, cwd=workspace, env=env,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 process_group=0, text=True, errors="replace", bufsize=1,
             )  # fmt: skip
@@ -574,6 +624,11 @@ class Runner:
         except ValueError:
             ev = None
         kind = self.stream.feed(ev) if isinstance(ev, dict) else None
+        if isinstance(ev, dict):
+            try:
+                self.measure.feed(ev)
+            except Exception:  # noqa: BLE001 - counting must never end a paid run
+                traceback.print_exc()
         if not isinstance(ev, dict):
             self.tail.append(line.rstrip())
         if self.silence_at is not None or (kind == "limit" and self.stream.rejected):
@@ -641,6 +696,10 @@ class Runner:
             verdict = classify.Verdict("interrupted", "the runner was signalled")
         with store.tx(self.conn):
             store.record_result(self.conn, run, code, res)
+            try:
+                store.record_measure(self.conn, run, self.measure)
+            except Exception:  # noqa: BLE001 - counting must never cost a paid run its result
+                traceback.print_exc()
             ended = store.end_run(
                 self.conn, self.run_id, verdict.outcome, "retry", actor="runner",
                 event_kind=verdict.outcome, retry_after=verdict.retry_after, error=verdict.error,

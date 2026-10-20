@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0.dev1
+
+Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup/scripts/bootstrap.sh`) so the daemon and the CLI move together. The first command of this version migrates the database to schema 7, after a backup, and a 0.3.0 daemon then refuses it (`database schema 7 is newer than this kanban`). Then run `kanban stats --backfill` once to measure the runs that finished before the upgrade.
+
+### Added
+
+- `kanban web [--port N] [--board SLUG] [--open]`: a read-only local dashboard on `http://127.0.0.1:8742/`. Unlike the web board 0.2.0.dev8 removed, it has no daemon thread, no secret and no write path: it opens the database read-only on every request and never migrates it. The board has one lane per status and a dock following every running card. A card opens in a drawer with Overview, Parameters (every card setting, then per run the command line, environment, what the session loaded and used), Runs, Logs (the transcript with filters, search and follow, or the raw log, plus downloads) and Comments. A Stats page shows spend per day, role and model, runtime by role and the harness numbers. It binds to `127.0.0.1` only, answers `GET` and `HEAD` only, rejects other `Host` headers and serves log and prompt files only from under the kanban home.
+- Run measurement (schema 6): each run records advisor policy and calls, cache writes by TTL (1 h and 5 min), API time, a `harness` summary (turns, tools, skills, MCP servers, agents, hooks, compactions, permission denials, tool errors, subagents) and its `params` (command line, environment, what the session loaded). `kanban stats` reports them with runtime by role, cost per role and model, the warden first-pass rate and the cost per approved card. `kanban show --json` carries `harness` and `params`.
+- `kanban stats --backfill` reads those numbers from the saved stream of each run that finished before schema 6; a run whose stream was not kept stays unmeasured.
+- `advisor.<role>` config: `inherit` (the default) leaves the session's advisor as it is, `off` turns it off for that role, `ab` turns it off for a stable half of that role's cards (hashed from the role and the card id, so a card keeps its arm across runs) so the two halves can be compared in `kanban stats`.
+- Worker verb `kanban gate [--lines N] -- CMD` runs a gate command, keeps its full output in `runs/<board>/<task>/run-N.gate-K.log`, prints only the last lines and the log path, and exits with the command's exit code (127 when it cannot start). Each run's prompt is kept beside its log as `run-N.prompt.md`.
+- GitHub sync (schema 7): pair a board with one repository (`kanban boards edit SLUG --github-repo [HOST/]OWNER/REPO`, optional `--github-query` and `--github-project OWNER/NUMBER`, `--github-off` to unpair) and its cards and issues stay in step both ways, with no model in the loop. GitHub owns the text, the board owns execution: title and body merge per field as in the Jira sync, comments flow both ways, done comes from the issue being closed, and a Projects v2 board follows the card status. New verbs `kanban github import|link|unlink|sync|status`, config keys `github.poll_s`, `github.label` and `github.status_map`, doctor check 21, and `Closes OWNER/REPO#N` in a linked card's worker context. Cards are never exported to a public repository (or one whose visibility GitHub does not report); its issues are still imported and synced.
+
+### Changed
+
+- Worker prompts carry a short paragraph of turn rules. smith, designer, warden, `kanban-code-review` and `simplify-code-card` run long gate commands through `kanban gate`, so a passing suite costs a few lines of context instead of its whole output. designer takes one cropped screenshot per check.
+- Cards name `Files to touch:` with absolute paths and the exact gate and acceptance commands; the card template, the kanban skill and card-checker ask for them.
+
+### Fixed
+
+- The input, output and cache token columns of a run held only the last turn's `usage`, so `kanban stats` undercounted tokens by orders of magnitude (cost was right). They now sum the run's `modelUsage`, and the schema 6 migration rewrites the old rows from the `model_usage` they kept.
+
 ## 0.3.0
 
 The first stable release. Its code is 0.2.0.dev11's, plus the README line that describes the pane's triage rows; the 0.2.0.dev0 to 0.2.0.dev11 sections below are what it holds. Development continues as `0.4.0.devN` pre-releases, starting at `0.4.0.dev1`.

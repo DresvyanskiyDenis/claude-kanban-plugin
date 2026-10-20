@@ -15,11 +15,14 @@ import sqlite3
 import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import ghops, validate
 from .errors import Error, NotFound, Refused, Stale
 from .paths import dirs, ensure_dir
+
+if TYPE_CHECKING:
+    from . import measure
 
 log = logging.getLogger("kanban.store")
 
@@ -145,8 +148,57 @@ ALTER TABLE tasks ADD COLUMN merge_method TEXT
   CHECK (merge_method IS NULL OR merge_method IN ('squash','merge','rebase'));
 """
 
+# 0.4.0 per-run measurement. `advisor` is the arm a run used (`inherit`, `on` or `off`); the cache
+# split, the advisor calls, the API time and the `harness` counts (tools, skills, hooks ...) come
+# from the run's own stream; `params` is how it was launched (argv, allowlisted env, the prompt file
+# and the init event). NULL `harness` marks a run nobody measured yet.
+METRICS_SCHEMA = """
+ALTER TABLE task_runs ADD COLUMN advisor TEXT;
+ALTER TABLE task_runs ADD COLUMN advisor_calls INTEGER;
+ALTER TABLE task_runs ADD COLUMN cache_write_1h_tokens INTEGER;
+ALTER TABLE task_runs ADD COLUMN cache_write_5m_tokens INTEGER;
+ALTER TABLE task_runs ADD COLUMN api_ms INTEGER;
+ALTER TABLE task_runs ADD COLUMN harness TEXT;
+ALTER TABLE task_runs ADD COLUMN params TEXT;
+-- the token columns were the last result's per-turn usage; the run's `model_usage` delta covers the
+-- whole run, subagent and advisor models included
+UPDATE task_runs SET
+  input_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.inputTokens')), 0) FROM json_each(model_usage) j),
+  output_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.outputTokens')), 0) FROM json_each(model_usage) j),
+  cache_write_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.cacheCreationInputTokens')), 0) FROM json_each(model_usage) j),
+  cache_read_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.cacheReadInputTokens')), 0) FROM json_each(model_usage) j)
+WHERE model_usage IS NOT NULL;
+"""
+
+# GitHub sync: the pairing (repo as `host/owner/repo`, an optional search query, an optional Projects v2
+# board as `owner/number`), the id of every comment that crossed, and one link per card. A link keeps
+# what each side held at the last sync, as `jira_links` does, plus the issue's and the project item's
+# node ids. `base_state` is `done` or `open`: the issue's state, the only thing read back from GitHub
+# besides the text.
+GITHUB_SCHEMA = """
+ALTER TABLE boards ADD COLUMN github_repo TEXT;
+ALTER TABLE boards ADD COLUMN github_query TEXT;
+ALTER TABLE boards ADD COLUMN github_project TEXT;
+ALTER TABLE task_comments ADD COLUMN gh_comment_id TEXT;
+CREATE UNIQUE INDEX idx_comments_github ON task_comments(gh_comment_id);
+CREATE TABLE github_links (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id), repo TEXT NOT NULL, number INTEGER NOT NULL,
+  node_id TEXT NOT NULL, project_item_id TEXT, base_title TEXT NOT NULL, base_body TEXT NOT NULL,
+  card_title TEXT NOT NULL, card_body TEXT NOT NULL, base_state TEXT, gh_updated TEXT,
+  synced_status TEXT NOT NULL, synced_version INTEGER NOT NULL, conflict TEXT, error TEXT,
+  created_at INTEGER NOT NULL, UNIQUE (repo, number));
+"""
+
 # Forward-only: MIGRATIONS[i] takes user_version i to i + 1 (STO-03).
-MIGRATIONS: list[str] = [SCHEMA, JIRA_SCHEMA, USAGE_SCHEMA, CLAIM_SCHEMA, MODERNIZE_SCHEMA]
+MIGRATIONS: list[str] = [
+    SCHEMA,
+    JIRA_SCHEMA,
+    USAGE_SCHEMA,
+    CLAIM_SCHEMA,
+    MODERNIZE_SCHEMA,
+    METRICS_SCHEMA,
+    GITHUB_SCHEMA,
+]
 BACKUPS_KEPT = 5
 
 STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "archived")
@@ -155,6 +207,7 @@ WORKER_BLOCK_KINDS = ("needs_input", "capability", "transient")
 BUILDERS = ("smith", "designer")
 PARTIAL_REVIEW = "PARTIAL REVIEW"  # a warden approval the owner merges (D10), never the daemon
 MERGE_METHODS = ("squash", "merge", "rebase")
+ADVISOR_POLICIES = ("inherit", "off", "ab")
 APPROVED_RE = re.compile(r"WARDEN: APPROVED PR #(\d+) @\s*([0-9a-f]{7,40})\b")
 BLOCK_RECURRENCE_LIMIT = 2
 PROTOCOL_VIOLATION_LIMIT = 3
@@ -185,6 +238,13 @@ DEFAULTS: dict[str, Any] = {
     "effort.designer": None,
     "effort.warden": None,
     "effort.atlassian": None,
+    # D1: `inherit` leaves the advisor as the owner's settings have it, `off` disables it for the
+    # role's runs, `ab` flips it per card (stable hash) to measure what it buys
+    "advisor.smith": "inherit",
+    "advisor.designer": "inherit",
+    "advisor.scout": "inherit",
+    "advisor.warden": "inherit",
+    "advisor.atlassian": "inherit",
     "runtime.scout": 1800,
     "runtime.smith": 7200,
     "runtime.designer": 7200,
@@ -228,10 +288,18 @@ DEFAULTS: dict[str, Any] = {
         "triage": "To Do", "todo": "To Do", "ready": "To Do",
         "running": "In Progress", "review": "In Progress", "done": "Done",
     },
+    "github.label": "kanban-claude",
+    "github.poll_s": 120,
+    # the Status options of a new Projects v2 board; only used when a board has --github-project
+    "github.status_map": {
+        "triage": "Todo", "todo": "Todo", "ready": "Todo",
+        "running": "In Progress", "review": "In Progress", "done": "Done",
+    },
 }  # fmt: skip
 
 BOUNDS: dict[str, tuple[int, int | None]] = {
     "jira.poll_s": (1, None),
+    "github.poll_s": (1, None),
     "dispatch.max_in_progress": (1, None),
     "dispatch.tick_seconds": (1, None),
     "dispatch.failure_limit": (1, None),
@@ -377,6 +445,8 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         raise Refused(f"{key} must be a list of tool names, got {value!r}")
     if value is not None and key.startswith("effort."):
         validate.effort(value)
+    if key.startswith("advisor.") and value not in ADVISOR_POLICIES:
+        raise Refused(f"{key} must be one of {', '.join(ADVISOR_POLICIES)}, got {value!r}")
     if value is not None and key.startswith("models."):
         validate.model(value)
     roles = active_roles(conn, value if key == "dispatch.roles" else None)
@@ -418,11 +488,13 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         )
     ):
         raise Refused("notify.command must be a command line or a non-empty list of strings (argv)")
-    if key == "jira.status_map" and not (
+    if key in ("jira.status_map", "github.status_map") and not (
         isinstance(value, dict)
         and all(k in STATUSES and isinstance(v, str) and v for k, v in value.items())
     ):
-        raise Refused(f"jira.status_map maps card statuses ({', '.join(STATUSES)}) to status names")
+        raise Refused(f"{key} maps card statuses ({', '.join(STATUSES)}) to status names")
+    if key == "github.label" and not value.strip():
+        raise Refused("github.label must not be empty")
     with tx(conn):
         config_put(conn, key, value)
         event(conn, None, "config_changed", actor, {"key": key, "value": value})
@@ -633,6 +705,42 @@ def _jira_fields(
     return fields
 
 
+REPO_RE = re.compile(r"(?:([A-Za-z0-9.-]+)/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)")
+
+
+def _github_fields(
+    current: str | None, repo: str | None, query: str | None, project: str | None, off: bool
+) -> dict[str, Any]:
+    """The GitHub pairing, with the repo stored as `host/owner/repo`. `--github-off` unpairs and
+    keeps the links."""
+    if off:
+        if repo or query is not None or project is not None:
+            raise Refused("--github-off cannot be combined with the other --github-* flags")
+        return {"github_repo": None, "github_query": None, "github_project": None}
+    fields: dict[str, Any] = {}
+    if repo is not None:
+        m = REPO_RE.fullmatch(repo)
+        if not m:
+            raise Refused(f"--github-repo {repo!r} must look like [HOST/]OWNER/REPO")
+        fields["github_repo"] = f"{m[1] or 'github.com'}/{m[2]}/{m[3]}"
+        if fields["github_repo"] != current:
+            fields |= {"github_query": None, "github_project": None}
+    if (query is not None or project is not None) and not (repo or current):
+        raise Refused("--github-query and --github-project need a paired board; pass --github-repo")
+    if query is not None:
+        fields["github_query"] = query or None
+    if project is not None:
+        if project and not re.fullmatch(r"[A-Za-z0-9_.-]+/[1-9][0-9]*", project):
+            raise Refused(f"--github-project {project!r} must look like OWNER/NUMBER")
+        fields["github_project"] = project or None
+    return fields
+
+
+def _one_tracker(jira_project: str | None, github_repo: str | None) -> None:
+    if jira_project and github_repo:
+        raise Refused("a board pairs with Jira or with GitHub, not both; unpair one first")
+
+
 def board_create(
     conn: sqlite3.Connection,
     slug: str,
@@ -642,6 +750,9 @@ def board_create(
     claude_config_dir: str | None = None,
     jira_project: str | None = None,
     jira_jql: str | None = None,
+    github_repo: str | None = None,
+    github_query: str | None = None,
+    github_project: str | None = None,
     actor: str = OWNER,
 ) -> dict[str, Any]:
     validate.slug(slug)
@@ -650,12 +761,22 @@ def board_create(
         if conn.execute("SELECT 1 FROM boards WHERE slug = ?", (slug,)).fetchone():
             raise Refused(f"board {slug!r} already exists; edit it with: kanban boards edit {slug}")
         jira = _jira_fields(conn, None, jira_project, jira_jql, False)
+        gh = _github_fields(None, github_repo, github_query, github_project, False)
+        _one_tracker(jira.get("jira_project"), gh.get("github_repo"))
+        cols = {
+            "slug": slug,
+            "name": name or slug,
+            "default_workdir": workdir,
+            "claude_config_dir": claude_config_dir,
+            "jira_project": jira.get("jira_project"),
+            "jira_jql": jira.get("jira_jql"),
+            **gh,  # only the GitHub columns that are set, so a board can still be made before the migration
+            "created_at": now(),
+        }
         conn.execute(
-            "INSERT INTO boards(slug, name, default_workdir, claude_config_dir, jira_project, "
-            "jira_jql, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (slug, name or slug, workdir, claude_config_dir, jira.get("jira_project"),
-             jira.get("jira_jql"), now()),
-        )  # fmt: skip
+            f"INSERT INTO boards({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+            tuple(cols.values()),
+        )
         event(conn, {"board": slug, "id": None}, "board_created", actor, {"slug": slug})
     return {"slug": slug}
 
@@ -670,6 +791,10 @@ def board_edit(
     jira_project: str | None = None,
     jira_jql: str | None = None,
     jira_off: bool = False,
+    github_repo: str | None = None,
+    github_query: str | None = None,
+    github_project: str | None = None,
+    github_off: bool = False,
     actor: str = OWNER,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {}
@@ -679,14 +804,25 @@ def board_edit(
         fields["name"] = name
     if claude_config_dir is not None:
         fields["claude_config_dir"] = claude_config_dir
-    if not (fields or jira_project or jira_jql is not None or jira_off):
+    if not (
+        fields or jira_project or jira_jql is not None or jira_off
+        or github_repo or github_query is not None or github_project is not None or github_off
+    ):  # fmt: skip
         raise Refused(
             "nothing to change; pass --default-workdir, --name, --claude-config-dir, "
-            "--jira-project, --jira-jql or --jira-off"
+            "--jira-project, --jira-jql, --jira-off, --github-repo, --github-query, "
+            "--github-project or --github-off"
         )
     with tx(conn):
         b = get_board(conn, slug)
         fields |= _jira_fields(conn, b["jira_project"], jira_project, jira_jql, jira_off)
+        fields |= _github_fields(
+            b["github_repo"], github_repo, github_query, github_project, github_off
+        )
+        _one_tracker(
+            fields.get("jira_project", b["jira_project"]),
+            fields.get("github_repo", b["github_repo"]),
+        )
         sets = ", ".join(f"{k} = ?" for k in fields)
         conn.execute(f"UPDATE boards SET {sets} WHERE slug = ?", [*fields.values(), slug])
         event(conn, {"board": slug, "id": None}, "board_edited", actor, {"fields": sorted(fields)})
@@ -1213,7 +1349,10 @@ def reopen(
             owner_merge=0, retry_after=None, assignee=t["implementer"] or t["assignee"],
             ignore_merge=0,
         )  # fmt: skip
-        if actor != "jira":  # jira.py pushes owner comments to the issue it just reopened from
+        if actor not in (
+            "jira",
+            "github",
+        ):  # the sync pushes owner comments to the issue it reopened from
             _comment(conn, t, "owner", f"REOPEN: {reason}", actor)
         event(conn, t, "reopened", actor, {"reason": reason})
         children = conn.execute(
@@ -1360,15 +1499,27 @@ def archive(
                     actor,
                     {"key": key, "reason": "deleted"},
                 )
+            gh_linked = conn.execute(
+                "SELECT repo, number FROM github_links WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if gh_linked:
+                event(
+                    conn,
+                    {"board": t["board"], "id": None},
+                    "github_unlinked",
+                    actor,
+                    {"issue": f"{gh_linked['repo']}#{gh_linked['number']}", "reason": "deleted"},
+                )
             conn.execute(
-                "UPDATE task_events SET task_id = NULL WHERE task_id = ? AND kind = 'jira_unlinked'",
+                "UPDATE task_events SET task_id = NULL WHERE task_id = ? "
+                "AND kind IN ('jira_unlinked', 'github_unlinked')",
                 (task_id,),
             )
             conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
             for table, col in (
                 ("task_attachments", "task_id"), ("task_comments", "task_id"), ("grants", "task_id"),
                 ("task_runs", "task_id"), ("task_links", "parent_id"), ("task_links", "child_id"),
-                ("jira_links", "task_id"),
+                ("jira_links", "task_id"), ("github_links", "task_id"),
             ):  # fmt: skip
                 conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (task_id,))
             conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
@@ -1699,7 +1850,14 @@ def record_result(
             }
             for m, used in seen.items()
         }
-    usage: dict[str, Any] = res["usage"] if isinstance(res.get("usage"), dict) else {}
+    usage: dict[str, Any] = dict(res["usage"]) if isinstance(res.get("usage"), dict) else {}
+    if share is not None:  # the whole run, every model; the result's `usage` is one turn
+        for col, key in (
+            ("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"),
+            ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+            ("cache_read_input_tokens", "cacheReadInputTokens"),
+        ):  # fmt: skip
+            usage[col] = int(sum(u.get(key, 0) for u in share.values()))
     conn.execute(
         "UPDATE task_runs SET claude_exit_code = ?, exit_code = ?, subtype = ?, is_error = ?, "
         "api_error_status = ?, num_turns = ?, session_cost_usd = ?, cost_usd = ?, "
@@ -1714,6 +1872,34 @@ def record_result(
             usage.get("cache_creation_input_tokens"), usage.get("cache_read_input_tokens"),
             None if share is None else json.dumps(share),
             None if seen is None else json.dumps(seen), run["id"],
+        ),
+    )  # fmt: skip
+
+
+def record_measure(
+    conn: sqlite3.Connection, run: Row, m: "measure.Measure", *, advisor: str | None = None
+) -> None:
+    """The run's own counts from its stream. `duration_api_ms` is cumulative over the session
+    (verified on resumed runs), so `api_ms` is the rise over the session's earlier runs, as the
+    cost is; `advisor` fills the arm only where none was recorded (the backfill's `inherit`).
+    Runs inside the caller's BEGIN IMMEDIATE."""
+    total = m.api_ms
+    prev = conn.execute(
+        "SELECT COALESCE(SUM(api_ms), 0) FROM task_runs WHERE session_id = ? AND id < ?",
+        (run["session_id"], run["id"]),
+    ).fetchone()[0]
+    old = conn.execute("SELECT params FROM task_runs WHERE id = ?", (run["id"],)).fetchone()[0]
+    params = json.loads(old) if old else {}
+    if m.init:
+        params["init"] = m.init_params()
+    conn.execute(
+        "UPDATE task_runs SET advisor = COALESCE(advisor, ?), advisor_calls = ?, "
+        "cache_write_1h_tokens = ?, cache_write_5m_tokens = ?, api_ms = ?, harness = ?, "
+        "params = ? WHERE id = ?",
+        (
+            advisor, m.advisor_calls, m.cache_1h, m.cache_5m,
+            None if total is None else (total - prev if total >= prev else total),
+            dumps(m.harness()), dumps(params) if params else None, run["id"],
         ),
     )  # fmt: skip
 
@@ -2165,4 +2351,111 @@ def stats(conn: sqlite3.Connection, *, board: str | None = None, days: int = 7) 
         ),
         "outcomes": table(f"SELECT r.outcome, COUNT(*) runs {base} GROUP BY r.outcome ORDER BY r.outcome"),
         "review_rounds": table(f"SELECT t.id, COUNT(*) rounds {base} AND r.kind = 'review' GROUP BY t.id ORDER BY rounds DESC"),
+        **_measure_stats(conn, base, where, args),
     }  # fmt: skip
+
+
+def _measure_stats(
+    conn: sqlite3.Connection, base: str, where: str, args: list[Any]
+) -> dict[str, Any]:
+    """The 0.4.0 keys of `stats`: runtime, cost per role and model, the advisor arms, guards and
+    what the harness did (tools, skills, MCP, agents, hooks); all but the first two read what the
+    runner and the backfill recorded, so a run without `harness` only counts in `unmeasured_runs`."""
+
+    def table(sql: str, extra: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        return [dict(r) for r in conn.execute(sql, [*args, *extra])]
+
+    def counts(section: str) -> list[dict[str, Any]]:
+        return table(
+            "SELECT j.key name, SUM(j.value) calls, COUNT(*) runs "
+            f"FROM task_runs r JOIN tasks t ON t.id = r.task_id, json_each(r.harness, '$.{section}') j "
+            f"WHERE {where} GROUP BY j.key ORDER BY calls DESC, name"
+        )
+
+    verdict = "r.kind = 'review' AND r.terminal_verb IN ('complete', 'request-changes')"
+    reviews, sent = conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(r.terminal_verb = 'request-changes'), 0) {base} AND {verdict}",
+        args,
+    ).fetchone()
+    # a card's first verdict is its earliest review run that approved or sent back
+    cards_judged, first_ok = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(r.terminal_verb = 'complete'), 0) "
+        f"{base} AND {verdict} AND r.n = (SELECT MIN(x.n) FROM task_runs x WHERE x.task_id = r.task_id "
+        "AND x.kind = 'review' AND x.terminal_verb IN ('complete', 'request-changes'))",
+        args,
+    ).fetchone()
+    approved = [
+        row[0]
+        for row in conn.execute(
+            f"SELECT DISTINCT r.task_id {base} AND r.kind = 'review' AND r.terminal_verb = 'complete'",
+            args,
+        )
+    ]
+    spent = conn.execute(
+        f"SELECT COALESCE(SUM(cost_usd), 0) FROM task_runs WHERE task_id IN ({','.join('?' * len(approved))})",
+        approved,
+    ).fetchone()[0]
+    totals: dict[str, Any] = {
+        "hooks_ok": 0, "hooks_failed": 0, "compactions": 0, "permission_denials": 0,
+        "tool_errors": 0, "subagents_spawned": 0, "subagents_failed": 0, "by_terminal_reason": {},
+    }  # fmt: skip
+    for (raw,) in conn.execute(f"SELECT r.harness {base} AND r.harness IS NOT NULL", args):
+        h = json.loads(raw)
+        for v in h.get("hooks", {}).values():
+            totals["hooks_ok"] += v.get("ok", 0)
+            totals["hooks_failed"] += v.get("failed", 0)
+        for k in ("compactions", "permission_denials", "tool_errors"):
+            totals[k] += h.get(k, 0)
+        totals["subagents_spawned"] += h.get("subagents", {}).get("spawned", 0)
+        totals["subagents_failed"] += h.get("subagents", {}).get("failed", 0)
+        reason = str(h.get("terminal_reason") or "none")
+        totals["by_terminal_reason"][reason] = totals["by_terminal_reason"].get(reason, 0) + 1
+    cards = len(approved)
+    return {
+        "runtime_by_role": table(
+            "SELECT r.role, COUNT(*) runs, SUM(r.ended_at - r.started_at) total_s, "
+            "ROUND(AVG(r.ended_at - r.started_at), 1) avg_s, MAX(r.ended_at - r.started_at) max_s, "
+            f"ROUND(COALESCE(SUM(r.api_ms), 0) / 1000.0, 1) api_s {base} AND r.ended_at IS NOT NULL "
+            "GROUP BY r.role ORDER BY r.role"
+        ),
+        # per model the run used (`modelUsage`, so the advisor's model is a row of its own); the
+        # cache-write split is the run's, put on the model it ran as (a subagent's share stays there)
+        "cost_by_role_model": table(
+            "SELECT r.role, j.key model, COUNT(*) runs, "
+            "ROUND(COALESCE(SUM(json_extract(j.value, '$.costUSD')), 0), 4) cost, "
+            "ROUND(COALESCE(SUM(json_extract(j.value, '$.costUSD')), 0) / COUNT(*), 4) avg_cost, "
+            "COALESCE(SUM(json_extract(j.value, '$.inputTokens')), 0) input, "
+            "COALESCE(SUM(json_extract(j.value, '$.outputTokens')), 0) output, "
+            "COALESCE(SUM(json_extract(j.value, '$.cacheCreationInputTokens')), 0) cache_write, "
+            "COALESCE(SUM(CASE WHEN j.key = r.model THEN r.cache_write_1h_tokens END), 0) cache_write_1h, "
+            "COALESCE(SUM(CASE WHEN j.key = r.model THEN r.cache_write_5m_tokens END), 0) cache_write_5m, "
+            "COALESCE(SUM(json_extract(j.value, '$.cacheReadInputTokens')), 0) cache_read "
+            f"FROM task_runs r JOIN tasks t ON t.id = r.task_id, json_each(r.model_usage) j "
+            f"WHERE {where} GROUP BY r.role, j.key ORDER BY r.role, j.key"
+        ),
+        "advisor_arms": table(
+            "SELECT r.role, r.advisor, COUNT(*) runs, ROUND(COALESCE(SUM(r.cost_usd), 0), 4) cost, "
+            "ROUND(COALESCE(SUM(r.cost_usd), 0) / COUNT(*), 4) avg_cost, "
+            f"COALESCE(SUM(r.advisor_calls), 0) advisor_calls {base} AND r.advisor IS NOT NULL "
+            "GROUP BY r.role, r.advisor ORDER BY r.role, r.advisor"
+        ),
+        "per_approved_card": {
+            "cards": cards,
+            "cost": round(spent, 4),
+            "avg_cost": round(spent / cards, 4) if cards else None,
+        },  # fmt: skip
+        "guards": {
+            "reviews": reviews,
+            "first_pass_approvals": first_ok,
+            "send_backs": sent,
+            "first_pass_rate": round(first_ok / cards_judged, 3) if cards_judged else None,
+        },  # fmt: skip
+        "skills": counts("skills"),
+        "mcp": counts("mcp"),
+        "tools": counts("tools"),
+        "agents": counts("agents"),
+        "harness_totals": totals,
+        "unmeasured_runs": conn.execute(
+            f"SELECT COUNT(*) {base} AND r.harness IS NULL", args
+        ).fetchone()[0],
+    }

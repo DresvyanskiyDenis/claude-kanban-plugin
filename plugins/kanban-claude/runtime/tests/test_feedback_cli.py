@@ -764,12 +764,50 @@ def resumed_twice(conn: Any, card: Card, execute: Any, tmp_path: Path) -> tuple[
     return first, second
 
 
-def test_u3_a_run_records_the_four_counts_of_its_own_invocation(
+def test_u3_a_run_records_the_four_counts_summed_over_every_model_of_its_own_invocation(
     conn: Any, card: Card, execute: Any, tmp_path: Path
 ) -> None:
     first, second = resumed_twice(conn, card, execute, tmp_path)
     assert tuple(first[k] for k in ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens")) == (2, 4, 100, 0)  # fmt: skip
-    assert tuple(second[k] for k in ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens")) == (3, 6, 50, 150)  # fmt: skip
+    assert tuple(second[k] for k in ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens")) == (4, 7, 50, 150)  # fmt: skip
+
+
+def test_u3_without_model_usage_the_counts_fall_back_to_the_results_usage(
+    conn: Any, card: Card, execute: Any, tmp_path: Path
+) -> None:
+    result_fixture(tmp_path, "bare", cost=0.5, usage=usage_of(2, 4, 100, 7), models={})
+    run = execute(card(), str(tmp_path / "bare"))
+    assert run["model_usage"] is None
+    assert tuple(run[k] for k in ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens")) == (2, 4, 100, 7)  # fmt: skip
+
+
+def test_u3_the_migration_recomputes_old_counts_from_the_model_usage_delta(env: Path) -> None:
+    home = env / "kb-home"
+    home.mkdir(exist_ok=True)
+    old = sqlite3.connect(home / "kanban.db")
+    before = store.MIGRATIONS.index(store.METRICS_SCHEMA)
+    for step in store.MIGRATIONS[:before]:
+        old.executescript(step)
+    old.execute("INSERT INTO boards(slug, name, created_at) VALUES ('main', 'main', 1)")
+    old.execute(
+        "INSERT INTO tasks(id, board, title, status, created_at, updated_at) VALUES ('t_1', 'main', 't', 'done', 1, 1)"
+    )
+    for n, mu in (
+        (1, {HAIKU: per_model(2, 4, 100, 7, 0.5), OTHER: per_model(1, 1, 0, 3, 0.1)}),
+        (2, None),
+    ):
+        old.execute(
+            "INSERT INTO task_runs(task_id, n, kind, status, started_at, input_tokens, output_tokens, "
+            "cache_write_tokens, cache_read_tokens, model_usage) VALUES ('t_1', ?, 'work', 'ended', 1, 9, 9, 9, 9, ?)",
+            (n, None if mu is None else json.dumps(mu)),
+        )  # fmt: skip
+    old.execute(f"PRAGMA user_version = {before}")
+    old.commit()
+    old.close()
+    c = store.connect()
+    cols = ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens")
+    rows = [tuple(r[k] for k in cols) for r in c.execute("SELECT * FROM task_runs ORDER BY n")]
+    assert rows == [(3, 5, 100, 10), (9, 9, 9, 9)]  # a run with no model_usage keeps what it had
 
 
 def test_u3_a_resumed_run_records_only_the_rise_of_the_per_model_usage(
