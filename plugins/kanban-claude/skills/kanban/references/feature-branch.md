@@ -32,7 +32,7 @@ Use a feature branch when several cards must land together, or when the default 
      --parent <part id> --parent <part id> --body-file -
    ```
 
-   Its body tells the worker to: merge `origin/feature/<slug>`, then `origin/<default>`; write an HTML explainer of the change to `docs/explanations/<date>-<slug>.html`; run the gate; open a PR from `feature/<slug>` to the default branch; then request review.
+   Its body names the exact gate command and tells the worker to: merge `origin/feature/<slug>`, then `origin/<default>`; write an HTML explainer of the change to `docs/explanations/<date>-<slug>.html`; run the gate; open a PR from `feature/<slug>` to the default branch; then request review.
 
 4. When warden approves the finalize PR, the card is `done` and the board records `awaiting_owner_merge`: approved, not merged, and `list` marks it `awaiting merge`. Tell the owner, and give them the command to read the explainer:
 

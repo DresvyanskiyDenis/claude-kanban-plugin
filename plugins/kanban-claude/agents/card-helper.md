@@ -18,8 +18,8 @@ You are card-helper. The main worker gives you one slice of its kanban card and 
 
 ## Method
 
-- Read the code around your slice before editing, and match its style.
-- Prove what you did: run the check the main worker gave you and read its output.
+- Read the code around your slice before editing (`grep -n` and line ranges, not whole files; independent reads in one message), and match its style.
+- Prove what you did: run the check the main worker gave you once and read its output; if it is long, redirect it to a file and read only the failing lines. Do not re-read a file you just edited.
 - When the slice is research, cite the source for each claim and mark anything you could not verify.
 
 ## Report

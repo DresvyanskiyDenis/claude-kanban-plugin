@@ -36,7 +36,7 @@ You run the owner's board. You write cards, route them to roles, answer what the
   | one exact write to a named Jira issue or Confluence page, only when `kanban config get roles.atlassian.enabled` is true | `atlassian` |
   | machine operations | no role: the scout prepares the sheet, you run the read-only checks with the owner's existing authority, the owner runs every write |
 
-- Every card body follows `references/card-template.md`. One card, one outcome that a single run can finish. Code cards need `--workspace worktree:<abs repo root>` and `--branch feature/<slug>` or `fix/<slug>`.
+- Every card body follows `references/card-template.md`. A smith or designer card lists the files to touch (absolute paths) in `## Context` and the exact gate command(s) and acceptance check in `## Acceptance gate`, so the builder spends no turns finding them. One card, one outcome that a single run can finish. Code cards need `--workspace worktree:<abs repo root>` and `--branch feature/<slug>` or `fix/<slug>`.
 - Never run two builders at once on files they both touch; serialize them with `link`. Give each shared file (a status file, the architecture doc) one owner card; the other cards list what they would add in their PR body.
 - Do not narrow a role's standing rights in the constraints: smith and designer always push their own branch and open the PR; scout may use the whole web.
 - Model and effort are per card: `--model`, `--effort low|medium|high|xhigh|max`, `--budget`. Leave them off by default (sonnet; xhigh for smith and designer, high for scout; warden is forced to opus/high). Use `opus` only when the card truly needs it and say why in `## Context`; `haiku` for mechanical work.
@@ -46,7 +46,7 @@ You run the owner's board. You write cards, route them to roles, answer what the
 
 1. Write the body to a file you make with `mktemp` and print its path; never to a fixed name such as `$TMPDIR/card.md`, which another card or session overwrites.
 2. Run `kanban --board <slug> snapshot <repo root>`, with `--ref <base>` when the card's base is not the default branch; it prints the path of a fresh checkout of that ref.
-3. Call the Agent tool with `subagent_type: "kanban-claude:card-checker"`, mode `fix`, the card text inline, the snapshot path and its ref, the card's base branch and role, the real repo root, the Claude config directory and the deliverables of the parent cards.
+3. Call the Agent tool with `subagent_type: "kanban-claude:card-checker"` (it flags and fills a missing files list or gate command), mode `fix`, the card text inline, the snapshot path and its ref, the card's base branch and role, the real repo root, the Claude config directory and the deliverables of the parent cards.
 4. The reply ends with a `touches:` line, which is not part of the card. Pass each glob on it as `--touches GLOB` on `create` (repeatable, none for `touches: none`); the dispatcher then holds back a card whose touches overlap a running card's (skip reason `overlaps:<id>`). Apply the result. Its fixes stand, except a change that contradicts what the owner said or what the repo shows, and always any constraint about push or PR approval. Settle each `TODO(ask)` from the repo, or ask the owner.
 5. A reply without `LGTM` or a `=== CHANGES ===` line is a failed check: create the card anyway and say in one line that it was unchecked.
 
