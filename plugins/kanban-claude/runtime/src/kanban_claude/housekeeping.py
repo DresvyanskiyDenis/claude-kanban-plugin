@@ -11,7 +11,7 @@ from typing import Any
 
 from . import ghops, gitops, jira, protection, store, views
 from .errors import Error
-from .paths import dirs
+from .paths import card_tmp, dirs
 
 SWEEP_S = 600
 RETENTION_S = 86400
@@ -171,6 +171,7 @@ def merge_one(conn: sqlite3.Connection, t: Row) -> None:
 
 def cleanup_card(conn: sqlite3.Connection, t: Row) -> None:
     """GIT-06 for one finished worktree card; the state is recorded, an event only on change."""
+    shutil.rmtree(card_tmp(t["id"]), ignore_errors=True)
     root = t["workspace_path"]
     merged = t["merge_state"] == "merged"
     if not merged and t["pr_number"]:
@@ -225,6 +226,7 @@ def sweep(conn: sqlite3.Connection) -> None:
         "SELECT id FROM tasks WHERE status = 'archived' AND workspace_kind = 'scratch'"
     ).fetchall():
         shutil.rmtree(scratch / t["id"], ignore_errors=True)
+        shutil.rmtree(card_tmp(t["id"]), ignore_errors=True)
 
 
 def retention(conn: sqlite3.Connection, ts: int) -> None:

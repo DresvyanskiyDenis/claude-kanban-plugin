@@ -20,14 +20,14 @@ from string import Template
 from typing import IO, Any
 
 from . import classify, ghops, gitops, housekeeping, store, validate
+from .errors import Error
 from .gitops import ProvisionError
-from .paths import dirs, ensure_dir, nudge, run_files
+from .paths import card_tmp, dirs, ensure_dir, nudge, run_files
 from .procs import signal_group, start_time
 
 KILL_GRACE_S = 30
 WALL_WAIT_S = 120
 QUIET_POLL_S = 5
-TOUCH_S = 30
 READER_JOIN_S = 3
 INFRA_COOLDOWN_S = 300
 INFRA_RETRIES = 3
@@ -68,13 +68,21 @@ def was_resumed(config_dir: str, sid: str) -> bool:
     return any(Path(config_dir).glob(f"projects/*/{sid}.jsonl"))
 
 
+def is_review(conn: sqlite3.Connection, run: Row) -> bool:
+    return bool(run["kind"] == "review" or run["role"] == store.cfg(conn, "dispatch.reviewer"))
+
+
 def model_effort(conn: sqlite3.Connection, t: Row, run: Row) -> tuple[str, str]:
-    """RUN-06: review runs always use the review model and effort; both flags are always passed."""
-    if run["kind"] == "review" or run["role"] == store.cfg(conn, "dispatch.reviewer"):
-        return store.cfg(conn, "models.review"), store.cfg(conn, "effort.review")
+    """RUN-06: review runs always use the review model; both flags are always passed. The effort
+    is the card's own, else `effort.<role>`, else the kind default (`effort.review` for a review,
+    which ignores the card's own), else `effort.default`."""
+    key = f"effort.{run['role']}"
+    role_effort = store.cfg(conn, key) if key in store.DEFAULTS else None
+    if is_review(conn, run):
+        return store.cfg(conn, "models.review"), role_effort or store.cfg(conn, "effort.review")
     effort = t["reasoning_effort"]
     if effort not in validate.EFFORTS:
-        effort = store.cfg(conn, "effort.scout" if run["role"] == "scout" else "effort.default")
+        effort = role_effort or store.cfg(conn, "effort.default")
     return t["model_override"] or store.cfg(conn, "models.default"), effort
 
 
@@ -165,9 +173,22 @@ def worker_env(
     env.update(
         CLAUDE_CODE_WEB_FETCH_AGENT="0", CLAUDE_SKIP_SOUL="1", KANBAN_TASK=t["id"],
         KANBAN_BOARD=t["board"], KANBAN_RUN_ID=str(run_id), KANBAN_WORKSPACE=str(workspace),
-        KANBAN_HOME=str(d.home), KANBAN_WORK=str(d.work),
+        KANBAN_HOME=str(d.home), KANBAN_WORK=str(d.work), TMPDIR=str(card_tmp(t["id"])),
     )  # fmt: skip
+    if t["workspace_kind"] != "scratch" and (host := origin_host(workspace)):
+        env.setdefault("GH_HOST", host)
     return env
+
+
+def origin_host(workspace: Path) -> str | None:
+    """The host of the workspace's origin when it is not github.com: `gh` in a worker would
+    otherwise go to github.com (the daemon always passes `-R HOST/OWNER/REPO`)."""
+    url = gitops.origin_url(workspace)
+    try:
+        host = gitops.repo_slug(url).split("/")[0] if url else None
+    except Error:
+        return None
+    return None if host == "github.com" else host
 
 
 def login_command(env: dict[str, str]) -> str:
@@ -206,13 +227,20 @@ def skill_exists(config_dir: str, name: str) -> bool:
 
 
 def build_prompt(
-    conn: sqlite3.Connection, t: Row, workspace: Path, config_dir: str, resumed: bool
+    conn: sqlite3.Connection, t: Row, workspace: Path, config_dir: str, resumed: bool, review: bool
 ) -> str:
-    """RUN-05: the protocol, the card's skills that exist here, and the grant sentence."""
+    """RUN-05: the protocol with the terminal calls of the run kind, and the card's skills that
+    exist here. Grants are not repeated: `kanban context` lists them, also those added later."""
+
+    def prompt(name: str) -> str:
+        return resources.files("kanban_claude").joinpath("prompts", name).read_text()
+
     text = (
-        resources.files("kanban_claude")
-        .joinpath("prompts", "resume.md" if resumed else "protocol.md")
-        .read_text()
+        prompt("resume.md" if resumed else "protocol.md")
+        .replace(
+            "$TERMINALS", prompt("terminals-review.md" if review else "terminals-work.md").rstrip()
+        )
+        .replace("$RULES", prompt("rules.md"))
     )
     out = Template(text).safe_substitute(
         KANBAN_TASK=t["id"], KANBAN_BOARD=t["board"], KANBAN_WORKSPACE=str(workspace)
@@ -220,14 +248,6 @@ def build_prompt(
     skills = [s for s in json.loads(t["skills"]) if skill_exists(config_dir, s)]
     if skills:
         out += f"Load and follow these skills for this card: {', '.join(skills)}.\n"
-    grants = [g for g in store.grants_list(conn, t["id"]) if not g["revoked_at"]]
-    if grants:
-        approved = "; ".join(g["approved"] for g in grants)
-        rules = "; ".join(r for g in grants for r in g["rules"])
-        out += (
-            f"The board owner approved exactly these actions for this card ({approved}): "
-            f"{rules}. Anything beyond them is still a stop signal.\n"
-        )
     return out
 
 
@@ -276,7 +296,6 @@ class Runner:
         self.term_at: float | None = None
         self.silence_at: float | None = None
         self.reap_at: float | None = None
-        self.touched = 0.0
 
     def row(self) -> Row:
         row: Row = self.conn.execute(
@@ -393,7 +412,9 @@ class Runner:
             json.dump(mcp_config(self.conn, run["role"], workspace, self.config_dir), f)
         argv = build_argv(
             store.cfg(self.conn, "claude.bin") or shutil.which("claude") or "claude",
-            build_prompt(self.conn, t, workspace, self.config_dir, resumed), run["role"], t["id"],
+            build_prompt(
+                self.conn, t, workspace, self.config_dir, resumed, is_review(self.conn, run)
+            ), run["role"], t["id"],
             model, effort,
             settings_json(dirs().home, rules, run["role"], plugins_off(self.conn, self.config_dir)),
             budget, store.cfg(self.conn, "worker.max_turns"), sid, resumed, str(mcp),
@@ -413,6 +434,7 @@ class Runner:
             with contextlib.suppress(OSError):
                 subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])  # noqa: S603
         ensure_dir(Path(run["stream_path"]).parent)
+        ensure_dir(card_tmp(t["id"]))
         fd = os.open(run["stream_path"], os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         try:
             self.proc = subprocess.Popen(
@@ -504,13 +526,6 @@ class Runner:
         self.sidecar.write(line if line.endswith("\n") else line + "\n")
         self.sidecar.flush()
         t = time.monotonic()
-        if t - self.touched >= TOUCH_S:
-            self.touched = t
-            with store.tx(self.conn):
-                self.conn.execute(
-                    "UPDATE task_runs SET last_output_at = ? WHERE id = ?",
-                    (int(time.time()), self.run_id),
-                )
         try:
             ev = json.loads(line)
         except ValueError:
@@ -598,8 +613,12 @@ class Runner:
                     auth_paused={"since": int(time.time()), "error": verdict.error},
                 )
                 store.event(
-                    self.conn, None, "account_paused", "runner", {"config_dir": self.config_dir}
-                )
+                    self.conn, None, "account_paused", "runner",
+                    {
+                        "config_dir": self.config_dir, "task": run["task_id"], "error": verdict.error,
+                        "login": login_command(with_config_dir({}, self.config_dir)),
+                    },
+                )  # fmt: skip
         self.afterwards()
 
     def afterwards(self) -> None:
