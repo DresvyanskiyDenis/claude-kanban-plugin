@@ -117,7 +117,8 @@ test('cards are the default: each lane a column of bordered cards, two lanes acr
   const long = card('t_long', 'running', 'Make the retry backoff configurable per client and document it', { assignee: 'builder', updated_at: S - 300 })
   world(on, { list: argv => ok({ schema: 1, board: boardOf(argv), cards: [...CARDS, long] }) })
   await $.command.run(command())
-  const ui = await $.ui.mount(pane())
+  // Tall enough for two cards a lane under the needs, with Triage and Merged below.
+  const ui = await $.ui.mount(pane({ bodyRows: 42 }))
   const box = await ui.find({ type: 'Box', key: 'box:t_run' })
   expect(box?.props.borderStyle).toBe('round')
   expect(box?.props.borderColor).toBe('claude')
@@ -182,7 +183,10 @@ test('the list view draws the lanes with their meta, the bar and the legend', as
   expect(await ui.find({ type: 'Text', text: /overlaps t_run$/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^P2 $/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^done 1$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^triage 1$/ })).toBeDefined()
+  // Raw ideas are a lane of their own at the end, so the legend no longer counts them.
+  expect(await ui.find({ type: 'Text', text: 'Triage' })).toBeDefined()
+  expect((await ui.find({ type: 'Button', key: 'card:t_tri' }))?.text).toMatch(/^ +Raw idea +1m$/)
+  expect(await ui.find({ type: 'Text', text: /^triage 1$/ })).toBeUndefined()
   const bar = await ui.findAll({ type: 'Text', text: /^━+$/ })
   expect(bar.reduce((n, seg) => n + String(seg.props.children ?? seg.text).length, 0)).toBe(48)
   // Every row line is exactly the pane's width, so the columns line up.
@@ -232,11 +236,15 @@ test('the dock shows as many cards per lane as its height holds, so the footer s
   await $.command.run(command())
   const tall = await $.ui.mount(pane({ bodyRows: 80 }))
   expect((await tall.find({ type: 'Box', key: 'lane:next' }))?.text).toMatch(/\+5 more/)
+  expect(await tall.find({ type: 'Button', key: 'card:t_tri' })).toBeDefined()
   await tall.unmount()
-  // Header, bar, footer and its margin, the two needs, Merged and the lane heads take 22 rows; a card a lane takes 9 more, two take 13.
-  const short = await $.ui.mount(pane({ bodyRows: 34 }))
+  // Header, bar, footer and its margin, the two needs, Triage's head, Merged and the lane heads take 24 rows; a card a lane takes 9 more, two take 13.
+  const short = await $.ui.mount(pane({ bodyRows: 33 }))
   expect((await short.find({ type: 'Box', key: 'lane:next' }))?.text).toMatch(/Ready a[\s\S]*\+7 more/)
   expect(await short.find({ type: 'Box', key: 'box:t_todo' })).toBeUndefined()
+  // The lanes leave no row for an idea: Triage keeps its head and count.
+  expect(await short.find({ type: 'Text', text: 'Triage' })).toBeDefined()
+  expect(await short.find({ type: 'Button', key: 'card:t_tri' })).toBeUndefined()
   await short.unmount()
 })
 
@@ -255,6 +263,29 @@ test('an empty board says so once instead of drawing empty lanes', async ($, on)
   const ui = await $.ui.mount(pane())
   expect(await ui.find({ type: 'Text', text: /Nothing running or planned/ })).toBeDefined()
   expect(await ui.find({ type: 'Box', key: 'lanes:0' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('triage cards are listed under the lanes, and Enter opens one', async ($, on) => {
+  const w = world(on)
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane())
+  expect(await ui.find({ type: 'Text', text: 'Triage' })).toBeDefined()
+  expect((await ui.find({ type: 'Button', key: 'card:t_tri' }))?.text).toMatch(/^  Raw idea/)
+  await ui.press({ key: 'card:t_tri' })
+  expect(w.runs.some(r => r.join(' ') === 'kanban --json show t_tri')).toBe(true)
+  await ui.unmount()
+})
+
+test('a board holding only triage cards says nothing runs, and still lists them', async ($, on) => {
+  world(on, { list: argv => ok({ schema: 1, board: boardOf(argv), cards: CARDS.filter(c => ['triage', 'done'].includes(c.status)) }), digest: () => ok({ ...DIGEST, needs_you: [] }) })
+  await $.command.run(command())
+  const ui = await $.ui.mount(pane())
+  expect(await ui.find({ type: 'Text', text: /Nothing running or planned/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'card:t_tri' })).toBeDefined()
+  await ui.press({ key: 'view' })
+  expect(await ui.find({ type: 'Text', text: /Nothing running or planned/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'card:t_tri' })).toBeDefined()
   await ui.unmount()
 })
 
@@ -491,7 +522,8 @@ test('in the list, inline and wide, the lanes sit side by side; narrow, the meta
   const wide = await $.ui.mount(pane({ placement: 'inline', bodyColumns: 120, bodyRows: 12 }))
   await wide.press({ key: 'view' })
   const run = await wide.find({ type: 'Button', key: 'card:t_run' })
-  expect(run?.text.length).toBe(Math.floor((120 - 2 * 3) / 4))
+  // Four lanes and Triage.
+  expect(run?.text.length).toBe(Math.floor((120 - 2 * 4) / 5))
   expect(await wide.find({ type: 'Text', text: /Which IdP\?/ })).toBeDefined()
   await wide.unmount()
   // Inline the need is one line: the words before the command give way, the command stays whole.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0.dev11
+
+### Fixed
+
+- The `/kanban-board` pane lists triage cards. Before, it only counted them in the footer, so a board holding only raw ideas read "Nothing running or planned." with no way to see or open them. The card view lists them as rows under the lane grid, in the rows the lanes leave, with `+N more` when the list is cut; the list view adds Triage as a fifth lane. Enter on a row opens the card. The footer legend now counts only done cards.
+- The runtime's test fixtures fake macOS (`sys.platform`) along with the macOS tools, so the suite runs on a Linux CI runner. Before, setup's macOS guard failed every setup, doctor and uninstall test there.
+
 ## 0.2.0.dev10
 
 ### Added
