@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>kanban board</title>
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css">
+<script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+<a class="skip" href="#view">Skip to the board</a>
+<div class="app" id="app">
+  <nav class="side" id="side" aria-label="Boards"></nav>
+  <div class="main">
+    <header class="top" id="top"></header>
+    <main class="view" id="view" tabindex="-1"></main>
+    <section class="dock" id="dock" aria-label="Live runs"></section>
+  </div>
+  <footer class="status" id="status" aria-label="Status"></footer>
+</div>
+<dialog class="drawer" id="drawer" aria-label="Card details"></dialog>
+<noscript><p class="nojs">This dashboard needs JavaScript. Nothing leaves this machine.</p></noscript>
+</body>
+</html>

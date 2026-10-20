@@ -25,6 +25,7 @@ from . import (
     store,
     validate,
     views,
+    web,
     worker,
 )
 from .errors import Error, NotAllowed, NotFound, Refused, Usage
@@ -42,6 +43,7 @@ NUDGE = NEEDS_DAEMON | {
 LONG_RUNNING: dict[str, Callable[[argparse.Namespace], int]] = {
     "daemon": lambda a: daemon.serve(),
     "run": lambda a: runner.run(a.run_id),
+    "web": web.serve,  # its own read-only connection: `owner()` would open and migrate the live one
 }
 OWNER: dict[str, Handler] = {}
 
@@ -116,6 +118,7 @@ VERB_HELP = {
     "log": "print a run's log",
     "tail": "follow the live run's log",
     "stats": "cost, outcomes, review rounds, and accounts that are walled or logged out",
+    "web": "serve a read-only board, cards, logs and stats on http://127.0.0.1 until Ctrl-C",
     "pause": "stop dispatching",
     "resume": "resume dispatching and re-probe sign-in",
     "config": "list, get or set settings",
@@ -220,6 +223,7 @@ def build() -> argparse.ArgumentParser:
     add("digest", "--since")
     add("followups", "--since")
     add("stats", ("--days", int), ("--backfill", "flag"))
+    add("web", ("--port", int), ("--open", "flag"))
     add("pause", "--reason")
     add("resume")
     add("config", "action", ("key", "?"), ("value", "?"))
