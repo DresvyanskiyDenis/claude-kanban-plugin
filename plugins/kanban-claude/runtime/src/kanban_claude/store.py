@@ -160,6 +160,14 @@ ALTER TABLE task_runs ADD COLUMN cache_write_5m_tokens INTEGER;
 ALTER TABLE task_runs ADD COLUMN api_ms INTEGER;
 ALTER TABLE task_runs ADD COLUMN harness TEXT;
 ALTER TABLE task_runs ADD COLUMN params TEXT;
+-- the token columns were the last result's per-turn usage; the run's `model_usage` delta covers the
+-- whole run, subagent and advisor models included
+UPDATE task_runs SET
+  input_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.inputTokens')), 0) FROM json_each(model_usage) j),
+  output_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.outputTokens')), 0) FROM json_each(model_usage) j),
+  cache_write_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.cacheCreationInputTokens')), 0) FROM json_each(model_usage) j),
+  cache_read_tokens = (SELECT COALESCE(SUM(json_extract(j.value, '$.cacheReadInputTokens')), 0) FROM json_each(model_usage) j)
+WHERE model_usage IS NOT NULL;
 """
 
 # Forward-only: MIGRATIONS[i] takes user_version i to i + 1 (STO-03).
@@ -1733,7 +1741,14 @@ def record_result(
             }
             for m, used in seen.items()
         }
-    usage: dict[str, Any] = res["usage"] if isinstance(res.get("usage"), dict) else {}
+    usage: dict[str, Any] = dict(res["usage"]) if isinstance(res.get("usage"), dict) else {}
+    if share is not None:  # the whole run, every model; the result's `usage` is one turn
+        for col, key in (
+            ("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"),
+            ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+            ("cache_read_input_tokens", "cacheReadInputTokens"),
+        ):  # fmt: skip
+            usage[col] = int(sum(u.get(key, 0) for u in share.values()))
     conn.execute(
         "UPDATE task_runs SET claude_exit_code = ?, exit_code = ?, subtype = ?, is_error = ?, "
         "api_error_status = ?, num_turns = ?, session_cost_usd = ?, cost_usd = ?, "
