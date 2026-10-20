@@ -131,6 +131,20 @@ def fingerprint(home: Path) -> tuple[str, int, list[tuple[str, int]]]:
     return hashlib.sha256(db.read_bytes()).hexdigest(), version, counts
 
 
+def to_v5(conn: sqlite3.Connection) -> None:
+    """Strip what schemas 6 and 7 added: the web never migrates, so it must read an older daemon's database."""
+    conn.execute("DROP INDEX idx_comments_github")
+    conn.execute("DROP TABLE github_links")
+    for table, cols in (
+        ("task_runs", [c.split()[0] for c in V6_COLUMNS]),
+        ("boards", ["github_repo", "github_query", "github_project"]),
+        ("task_comments", ["gh_comment_id"]),
+    ):
+        for col in cols:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+    conn.execute("PRAGMA user_version = 5")
+
+
 def to_v6(conn: sqlite3.Connection) -> None:
     for col in V6_COLUMNS:
         conn.execute(f"ALTER TABLE task_runs ADD COLUMN {col}")
@@ -199,12 +213,12 @@ def test_the_verb_is_registered_without_the_migrating_connection() -> None:
 # --- read-only ------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("v6", [False, True], ids=["v5", "v6"])
+@pytest.mark.parametrize("v6", [False, True], ids=["v5", "current"])
 def test_every_route_leaves_the_database_untouched(
     conn: sqlite3.Connection, get: Get, run_row: Callable[..., int], home: Path, v6: bool
 ) -> None:
-    if v6:
-        to_v6(conn)
+    if not v6:
+        to_v5(conn)
     rid = run_row(
         **(
             {
@@ -229,7 +243,7 @@ def test_every_route_leaves_the_database_untouched(
     for p in paths_:
         assert get(p)[0] == 200, p
     assert fingerprint(home) == before
-    assert before[0] and before[1] == (6 if v6 else 5)
+    assert before[0] and before[1] == (len(store.MIGRATIONS) if v6 else 5)
 
 
 def test_a_missing_database_is_refused_not_created(
@@ -343,7 +357,6 @@ def test_v6_run_fields_arrive_parsed_and_v5_runs_simply_lack_them(
     conn: sqlite3.Connection, get: Get, run_row: Callable[..., int]
 ) -> None:
     old = run_row()
-    to_v6(conn)
     new = run_row(
         advisor="on", advisor_calls=2, harness=json.dumps(HARNESS),
         params=json.dumps({"argv": ["claude", "-p", "<prompt>"], "env": {"A": "1"}, "init": INIT}),
@@ -360,23 +373,19 @@ def test_v6_run_fields_arrive_parsed_and_v5_runs_simply_lack_them(
     assert run.get("harness") is None and run.get("params") is None
 
 
-def test_stats_work_on_v5_and_v6_and_survive_a_stats_that_wants_missing_columns(
-    conn: sqlite3.Connection, get: Get, run_row: Callable[..., int], monkeypatch: pytest.MonkeyPatch
+def test_stats_need_the_v6_columns_and_say_so_on_a_v5_database(
+    conn: sqlite3.Connection, get: Get, run_row: Callable[..., int]
 ) -> None:
+    to_v5(conn)
     run_row()
+    data = js(get("/api/stats?days=30&b=main"))
+    assert "no such column" in data["unavailable"] and data["accounts"] == []
+    to_v6(conn)
     data = js(get("/api/stats?days=30&b=main"))
     assert (
         data["days"] == 30 and data["cost_by_role"][0]["role"] == "smith" and data["accounts"] == []
     )
-    to_v6(conn)
     assert js(get("/api/stats"))["days"] == 7
-
-    def boom(*a: Any, **k: Any) -> dict[str, Any]:
-        raise sqlite3.OperationalError("no such column: r.advisor")
-
-    monkeypatch.setattr(store, "stats", boom)
-    data = js(get("/api/stats"))
-    assert "no such column" in data["unavailable"] and data["accounts"] == []
     assert get("/api/stats?days=0")[0] == 400
     assert get("/api/stats?days=x")[0] == 400
     assert get("/api/stats?b=nope")[0] == 404
@@ -624,7 +633,6 @@ def test_a_symlink_out_of_the_home_is_refused(
 def test_a_prompt_file_is_served_only_from_inside_the_home(
     conn: sqlite3.Connection, get: Get, run_row: Callable[..., int], home: Path, tmp_path: Path
 ) -> None:
-    to_v6(conn)
     inside = home / "runs" / "main" / "prompt-1.txt"
     inside.parent.mkdir(parents=True, exist_ok=True)
     inside.write_text("THE PROMPT")

@@ -11,7 +11,7 @@ function fmt(key, v) {
   if (typeof v === "boolean") return v ? "yes" : "no";
   if (typeof v !== "number") return JSON.stringify(v);
   const k = key.toLowerCase();
-  if (/cost|spend|usd|price/.test(k)) return money(v);
+  if (/cost|spend|usd|price|per_run/.test(k)) return money(v);
   if (/(^|_)ms$|_ms_/.test(k)) return dur(v / 1000);
   if (/seconds|duration|runtime|elapsed|(^|_)s$/.test(k)) return dur(v);
   if (/rate|share|pct|percent|ratio/.test(k)) return (v <= 1 ? v * 100 : v).toFixed(0) + "%";
@@ -19,7 +19,7 @@ function fmt(key, v) {
   return Number.isInteger(v) ? int(v) : v.toFixed(2);
 }
 
-const nice = (k) => k.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+const nice = (k) => k.replace(/_m?s$/, "").replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 
 function table(rows, opts = {}) {
   if (!rows || !rows.length) return null;
@@ -52,11 +52,13 @@ function bars(items, name = "name", valueKey = "calls", limit = 8) {
 
 function dayChart(data, days, now) {
   const byDay = new Map(data.map((d) => [d.day, d.cost]));
+  const keyOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const at = (i) => new Date((now - i * DAY) * 1000);
+  // the rolling window touches days + 1 calendar days: keep the oldest when it has spend, so the total matches the Spend tile
   const series = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date((now - i * DAY) * 1000);
-    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-    series.push({ day: key, cost: byDay.get(key) || 0, date: d });
+  for (let i = byDay.has(keyOf(at(days))) ? days : days - 1; i >= 0; i--) {
+    const d = at(i);
+    series.push({ day: keyOf(d), cost: byDay.get(keyOf(d)) || 0, date: d });
   }
   const total = series.reduce((a, d) => a + d.cost, 0);
   const wrap = h("figure", { class: "chart" });
@@ -195,7 +197,7 @@ export function createStats(root, S, nav) {
           .map(([k, v]) => h("div", null, h("dt", null, k), h("dd", { class: "mono num" }, v)))));
     }
     if (d.unmeasured_runs > 0) {
-      out.append(h("div", { class: "callout" }, icon("alert"), h("div", null, h("strong", null, `${int(d.unmeasured_runs)} run${d.unmeasured_runs === 1 ? "" : "s"} predate harness measurements`), h("p", null, "Their tool, skill and MCP counts are missing. Run ", h("code", null, "kanban stats --backfill"), " to read them from the saved streams."))));
+      out.append(h("div", { class: "callout" }, icon("alert"), h("div", null, h("strong", null, `${int(d.unmeasured_runs)} run${d.unmeasured_runs === 1 ? "" : "s"} predate harness measurements`), h("p", null, "Their tool, skill and MCP counts are missing. Run ", h("code", null, "kanban stats --backfill"), " to read them from the saved streams; a run whose stream was never saved, or is still going, stays without them."))));
     }
     if (!roles.length && !(d.cost_by_day || []).length) out.append(emptyState("No runs in this period", "Pick a longer period or another board."));
     const grid = h("div", { class: "panels" });

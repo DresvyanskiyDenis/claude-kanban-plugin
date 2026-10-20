@@ -335,8 +335,8 @@ export class Transcript {
   b_final(ev) {
     const u = ev.usage || {};
     const cells = [
-      ["cost", money(ev.cost)], ["turns", ev.turns], ["duration", ev.duration_ms != null ? dur(ev.duration_ms / 1000) : null],
-      ["api time", ev.api_ms != null ? dur(ev.api_ms / 1000) : null], ["input", u.input_tokens != null ? compact(u.input_tokens) : null],
+      ["session cost", money(ev.cost)], ["turns", ev.turns], ["last turn", ev.duration_ms != null ? dur(ev.duration_ms / 1000) : null],
+      ["session api", ev.api_ms != null ? dur(ev.api_ms / 1000) : null], ["input", u.input_tokens != null ? compact(u.input_tokens) : null],
       ["output", u.output_tokens != null ? compact(u.output_tokens) : null], ["cache write", u.cache_creation_input_tokens != null ? compact(u.cache_creation_input_tokens) : null],
       ["cache read", u.cache_read_input_tokens != null ? compact(u.cache_read_input_tokens) : null], ["ended", ev.terminal || ev.stop || ev.subtype],
     ].filter(([, v]) => v != null && v !== "");
@@ -473,10 +473,12 @@ export function logsPanel(root, card, runId, nav) {
     if (!raw) current.setFilter(chips.querySelector("[aria-pressed=true]").dataset.f);
     current.load();
     const file = raw ? run.log_file : run.stream_file;
-    fileRow.replaceChildren(
-      file ? h("code", { class: "path", title: file }, file) : h("span", { class: "dim" }, "No file recorded for this run"),
-      file && copyBtn(file, "Copy path", "Path copied"),
-      file && h("a", { class: "btn sm", href: "/api/run/raw?" + qs({ id: run.id, kind: raw ? "log" : "stream" }), download: "" }, icon("download"), raw ? "Download log" : "Download stream"));
+    // the left mark keeps the leading "/" in place inside the rtl ellipsis box
+    fileRow.replaceChildren(...(file ? [
+      h("code", { class: "path", title: file }, "\u200e" + file),
+      copyBtn(file, "Copy path", "Path copied"),
+      h("a", { class: "btn sm", href: "/api/run/raw?" + qs({ id: run.id, kind: raw ? "log" : "stream" }), download: "" }, icon("download"), raw ? "Download log" : "Download stream"),
+    ] : [h("span", { class: "dim" }, "No file recorded for this run")]));
   }
 
   root.append(
