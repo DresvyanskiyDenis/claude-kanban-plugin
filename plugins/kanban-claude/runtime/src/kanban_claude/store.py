@@ -133,8 +133,20 @@ INSERT INTO task_events(board, task_id, run_id, kind, actor, created_at)
   WHERE r.kind = 'review' AND r.terminal_verb IS NOT NULL;
 """
 
+# dev8: `ignore_merge` keeps a promote's --ignore-merge for claim and dispatch. `owner_merge` marks
+# an approved card whose PR only the owner merges (a partial review): merge_state stays 'pending',
+# so children wait, but the merge job skips it. A new merge_state value would need a table rebuild
+# for its CHECK. `touches` is a JSON list of the globs a card edits; `merge_method` overrides squash.
+MODERNIZE_SCHEMA = """
+ALTER TABLE tasks ADD COLUMN ignore_merge INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN owner_merge INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN touches TEXT;
+ALTER TABLE tasks ADD COLUMN merge_method TEXT
+  CHECK (merge_method IS NULL OR merge_method IN ('squash','merge','rebase'));
+"""
+
 # Forward-only: MIGRATIONS[i] takes user_version i to i + 1 (STO-03).
-MIGRATIONS: list[str] = [SCHEMA, JIRA_SCHEMA, USAGE_SCHEMA, CLAIM_SCHEMA]
+MIGRATIONS: list[str] = [SCHEMA, JIRA_SCHEMA, USAGE_SCHEMA, CLAIM_SCHEMA, MODERNIZE_SCHEMA]
 BACKUPS_KEPT = 5
 
 STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "archived")
@@ -167,6 +179,10 @@ DEFAULTS: dict[str, Any] = {
     "effort.default": "xhigh",
     "effort.review": "high",
     "effort.scout": "high",
+    "effort.smith": None,
+    "effort.designer": None,
+    "effort.warden": None,
+    "effort.atlassian": None,
     "runtime.scout": 1800,
     "runtime.smith": 7200,
     "runtime.designer": 7200,
@@ -174,12 +190,17 @@ DEFAULTS: dict[str, Any] = {
     "runtime.atlassian": 900,
     "budget.max_usd_per_run": 30,
     "budget.ceiling": 100,
+    "budget.max_usd_per_card": 15.0,
+    "budget.max_usd_per_board_day": None,
+    "notify.command": None,
     "quota.soft_wall": 0.9,
     "quota.requeue_s": 300,
     "worker.keep_awake": True,
     "worker.terminal_grace_s": 120,
     "worker.max_turns": None,
     "worker.env_passthrough": [],
+    "worker.plugin_allowlist": [],
+    "worker.mcp_allowlist": ["context7", "lightpanda", "code-review-graph"],
     "web.port": 9129,
     "web.jira_base_url": None,
     "retention.stream_days": 30,
