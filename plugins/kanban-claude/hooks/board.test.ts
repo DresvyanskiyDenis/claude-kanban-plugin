@@ -65,7 +65,7 @@ function world(on: On, answers: Partial<Record<Verb, Answer>> = {}, store: Recor
     clk: mock.clock(on, { now: NOW }),
     count: verb => w.runs.filter(a => a.includes(verb)).length,
   }
-  mock.env(on, { HOME: '/home/me', ...env })
+  mock.env(on, { HOME: '/srv/me', ...env })
   on('session.cwd', () => ({ value: w.cwd }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', () => ({ value: { command: 'kanban-board' } }))
@@ -291,7 +291,7 @@ test('a kanban that cannot start from PATH is found in ~/.local/bin', async ($, 
   await $.command.run(command())
   const ui = await $.ui.mount(pane())
   expect(await ui.find({ type: 'Text', text: /^main$/ })).toBeDefined()
-  expect(w.runs.some(r => r[0] === '/home/me/.local/bin/kanban')).toBe(true)
+  expect(w.runs.some(r => r[0] === '/srv/me/.local/bin/kanban')).toBe(true)
   await ui.unmount()
 })
 
@@ -305,7 +305,7 @@ test('a kanban that times out is not retried from ~/.local/bin', async ($, on) =
   await w.clk.settle()
   await w.clk.advance(10_000)
   await run
-  expect(w.runs.some(r => r[0] === '/home/me/.local/bin/kanban' && r.includes('list'))).toBe(false)
+  expect(w.runs.some(r => r[0] === '/srv/me/.local/bin/kanban' && r.includes('list'))).toBe(false)
 })
 
 test('an older CLI without digest still draws the board and hides the rest', async ($, on) => {

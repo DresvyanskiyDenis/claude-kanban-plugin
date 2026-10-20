@@ -14,7 +14,7 @@ KANBAN = "/opt/tools/bin/kanban"
 
 
 def rendered(env: dict[str, str] | None = None) -> dict[str, object]:
-    home, work = Path("/data/home"), Path("/data/work")
+    home, work = Path("/data/kanban"), Path("/data/work")
     return plistlib.loads(launchd.render(KANBAN, env or {"PATH": "/usr/bin"}, home, work))
 
 
@@ -29,15 +29,15 @@ def test_the_plist_carries_the_keys_of_ins_06() -> None:
         "ProcessType": "Standard",
         "LimitLoadToSessionType": "Aqua",
         "AbandonProcessGroup": True,
-        "WorkingDirectory": "/data/home",
+        "WorkingDirectory": "/data/kanban",
         "EnvironmentVariables": {
             "PATH": "/opt/tools/bin:/usr/bin",
             "LANG": "C",
-            "KANBAN_HOME": "/data/home",
+            "KANBAN_HOME": "/data/kanban",
             "KANBAN_WORK": "/data/work",
         },
-        "StandardOutPath": "/data/home/logs/daemon.log",
-        "StandardErrorPath": "/data/home/logs/daemon.log",
+        "StandardOutPath": "/data/kanban/logs/daemon.log",
+        "StandardErrorPath": "/data/kanban/logs/daemon.log",
     }
 
 
