@@ -79,3 +79,11 @@ def test_watch_line_shape(conn: Any, card: Card) -> None:
     ev = store.events_since(conn, 0)[-1]
     line = views.watch_line(ev)
     assert f" {tid} {ev['kind']}" in line and line.startswith("[")
+
+
+def test_watch_line_names_the_actor_not_the_assignee(conn: Any, card: Card) -> None:
+    tid = card("Task", assignee="smith")
+    store.comment(conn, tid, "from the owner", author="owner", actor="owner:cli")
+    ev = next(e for e in store.events_since(conn, 0) if e["kind"] == "commented")
+    line = views.watch_line(ev)
+    assert f" {tid} commented (owner:cli)" in line and "@smith" not in line

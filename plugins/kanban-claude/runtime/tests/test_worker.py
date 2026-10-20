@@ -1,13 +1,14 @@
 """TST-L2 (worker verbs bound to the run), REV-01 (PR check) and SEC3 against `worker.act`."""
 
 import json
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from kanban_claude import store, worker
+from kanban_claude import dispatcher, ghops, store, worker
 from kanban_claude.errors import Error
 
 from .conftest import git
@@ -79,47 +80,51 @@ def test_complete_by_a_builder_with_unpushed_work_is_refused(
     assert store.get_task(conn, tid)["status"] == "running"
 
 
-def test_request_review_checks_the_pr(
+def test_request_review_finds_the_pr_by_the_card_not_by_the_summary(
     conn: Any, wt: tuple[str, int], set_prs: Prs, env: Path
 ) -> None:
     tid, run = wt
-    set_prs({"7": PR})
-    got = ask(conn, run, "request-review", summary="done, PR #7")
+    set_prs({"3": {**PR, "state": "MERGED", "url": PR["url"].replace("/7", "/3")}, "7": PR})
+    got = ask(conn, run, "request-review", summary="follow-up to PR #3, now done")
     assert got["exit"] == 0, got
     t = store.get_task(conn, tid)
     assert (t["status"], t["pr_number"], t["pr_url"]) == ("review", 7, PR["url"])
     calls = [json.loads(x) for x in (env / "gh.log").read_text().splitlines()]
-    view = next(c for c in calls if c[:2] == ["pr", "view"])
-    assert view[view.index("-R") + 1] == "example.invalid/acme/proj"
+    listing = next(c for c in calls if c[:2] == ["pr", "list"])
+    assert listing[listing.index("-R") + 1] == "example.invalid/acme/proj"
+    assert [listing[listing.index(f) + 1] for f in ("--head", "--base", "--state")] == [
+        "feat/x", "main", "open",
+    ]  # fmt: skip
 
 
 @pytest.mark.parametrize(
     "change",
-    [
-        {"state": "MERGED"},
-        {"headRefName": "feat/other"},
-        {"baseRefName": "develop"},
-        {"url": "https://evil.invalid/acme/proj/pull/7"},
-    ],
+    [{"state": "MERGED"}, {"headRefName": "feat/other"}, {"baseRefName": "develop"}],
 )
-def test_request_review_refuses_a_mismatching_pr(
+def test_request_review_refuses_when_the_card_has_no_open_pr(
     conn: Any, wt: tuple[str, int], set_prs: Prs, change: dict[str, str]
 ) -> None:
     tid, run = wt
     set_prs({"7": {**PR, **change}})
     got = ask(conn, run, "request-review", summary="PR #7")
-    assert got["exit"] == 4, got
+    assert got["exit"] == 4 and "no open PR" in got["message"] and "feat/x" in got["message"], got
     assert store.get_task(conn, tid)["status"] == "running"
 
 
-def test_request_review_needs_a_pr_and_reports_gh_failure(
+def test_request_review_refuses_several_open_prs(
     conn: Any, wt: tuple[str, int], set_prs: Prs
 ) -> None:
+    tid, run = wt
+    set_prs({"7": PR, "8": {**PR, "url": PR["url"].replace("/7", "/8")}})
+    got = ask(conn, run, "request-review", summary="done")
+    assert got["exit"] == 4 and "#7" in got["message"] and "#8" in got["message"], got
+    assert store.get_task(conn, tid)["status"] == "running"
+
+
+def test_request_review_needs_a_summary(conn: Any, wt: tuple[str, int], set_prs: Prs) -> None:
     _, run = wt
-    assert ask(conn, run, "request-review", summary="no number")["exit"] == 4
-    set_prs({})
-    got = ask(conn, run, "request-review", summary="PR #9")
-    assert got["exit"] == 1 and "gh" in got["message"]
+    set_prs({"7": PR})
+    assert ask(conn, run, "request-review")["exit"] == 2
 
 
 def test_sec3_worker_inputs_are_validated(conn: Any, wt: tuple[str, int], set_prs: Prs) -> None:
@@ -127,9 +132,9 @@ def test_sec3_worker_inputs_are_validated(conn: Any, wt: tuple[str, int], set_pr
     assert ask(conn, run, "block", kind="not-a-kind", reason="r")["exit"] == 4
     assert ask(conn, run, "block", kind=["needs_input"], reason="r")["exit"] != 0
     set_prs({"7": {**PR, "url": "http://example.invalid/acme/proj/pull/7"}})
-    assert ask(conn, run, "request-review", summary="PR #7")["exit"] == 4
+    assert ask(conn, run, "request-review", summary="done")["exit"] == 4
     set_prs({"7": {**PR, "url": "https://evil.invalid/acme/proj/pull/7"}})
-    assert ask(conn, run, "request-review", summary="PR #7")["exit"] == 4
+    assert ask(conn, run, "request-review", summary="done")["exit"] == 4
     assert store.get_task(conn, tid)["status"] == "running"
 
 
@@ -171,3 +176,214 @@ def test_a_write_racing_the_end_of_its_run_is_refused(
     assert got["exit"] == 4 and "run ended" in got["message"]
     for table in ("task_comments", "task_attachments"):
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+# --- wait-ci (P1-3) -------------------------------------------------------------------------
+
+NO_CHECKS = "no checks reported on the 'feat/x' branch"
+Reply = tuple[int, str, str]
+
+
+def checks(*rows: tuple[str, str]) -> str:
+    return json.dumps([{"name": n, "bucket": b} for n, b in rows])
+
+
+class FakeGh:
+    """`gh` as a scripted replay: each (verb, noun) pair answers its replies in order, the last
+    one repeating. `time` is the clock `worker` sees, so a 540 s wait costs no real time."""
+
+    def __init__(self, replies: dict[tuple[str, str], list[Reply]]) -> None:
+        self.replies, self.calls, self.t, self.slept = replies, [], 0.0, 0
+
+    def __call__(self, *args: str, timeout: int = 60) -> "subprocess.CompletedProcess[str]":
+        self.calls.append(args)
+        queue = self.replies[args[0], args[1]]
+        rc, out, err = queue.pop(0) if len(queue) > 1 else queue[0]
+        return subprocess.CompletedProcess(args, rc, out, err)
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds
+        self.slept += 1
+
+
+@pytest.fixture
+def fake_gh(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeGh]:
+    def install(**replies: list[Reply]) -> FakeGh:
+        gh = FakeGh({tuple(k.split("_")): v for k, v in replies.items()})  # type: ignore[misc]
+        monkeypatch.setattr(ghops, "gh_rc", gh)
+        monkeypatch.setattr(worker, "time", gh)
+        return gh
+
+    return install
+
+
+def test_wait_ci_passes_and_names_the_count(fake_gh: Callable[..., FakeGh]) -> None:
+    gh = fake_gh(pr_checks=[(0, checks(("lint", "pass"), ("tests", "skipping")), "")])
+    assert worker.wait_ci("h/o/r", 7) == ("passed", "passed: 2 checks")
+    assert gh.slept == 0
+
+
+def test_wait_ci_fails_fast_and_names_the_failing_checks(fake_gh: Callable[..., FakeGh]) -> None:
+    rows = (("lint", "fail"), ("tests", "pending"), ("scan", "cancel"), ("fmt", "pass"))
+    gh = fake_gh(pr_checks=[(1, checks(*rows), "")])
+    assert worker.wait_ci("h/o/r", 7) == ("failed", "failed: lint, scan")
+    assert gh.slept == 0
+
+
+def test_wait_ci_polls_until_the_checks_settle(fake_gh: Callable[..., FakeGh]) -> None:
+    pending = (8, checks(("lint", "pass"), ("tests", "pending")), "")
+    gh = fake_gh(pr_checks=[pending, pending, (0, checks(("lint", "pass"), ("tests", "pass")), "")])
+    assert worker.wait_ci("h/o/r", 7)[0] == "passed"
+    assert gh.slept == 2
+
+
+def test_wait_ci_gives_up_inside_the_budget_and_says_pending(
+    fake_gh: Callable[..., FakeGh],
+) -> None:
+    gh = fake_gh(pr_checks=[(8, checks(("lint", "pass"), ("a", "pending"), ("b", "pending")), "")])
+    assert worker.wait_ci("h/o/r", 7) == ("pending", "pending: 2 of 3 checks still running")
+    assert 0 < gh.t <= worker.BUDGET_S and gh.t > worker.BUDGET_S - 2 * worker.POLL_S
+
+
+def test_wait_ci_with_no_checks_yet_falls_back_to_the_runs_of_the_head_commit(
+    fake_gh: Callable[..., FakeGh],
+) -> None:
+    running = [{"name": "ci", "status": "in_progress", "conclusion": ""}]
+    done = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+    gh = fake_gh(
+        pr_checks=[(1, "", NO_CHECKS)],
+        pr_view=[(0, json.dumps({"headRefOid": "abc123"}), "")],
+        run_list=[(0, json.dumps(running), ""), (0, json.dumps(done), "")],
+    )
+    assert worker.wait_ci("h/o/r", 7) == ("passed", "passed: 1 check")
+    listing = next(c for c in gh.calls if c[:2] == ("run", "list"))
+    assert listing[listing.index("--commit") + 1] == "abc123"
+    assert gh.slept == 1
+
+
+def test_wait_ci_failed_run_fails_and_no_run_at_all_stays_pending(
+    fake_gh: Callable[..., FakeGh],
+) -> None:
+    failed = [{"name": "build", "status": "completed", "conclusion": "failure"}]
+    fake_gh(
+        pr_checks=[(1, "", NO_CHECKS)],
+        pr_view=[(0, json.dumps({"headRefOid": "abc"}), "")],
+        run_list=[(0, json.dumps(failed), "")],
+    )
+    assert worker.wait_ci("h/o/r", 7) == ("failed", "failed: build")
+    fake_gh(
+        pr_checks=[(0, "[]", "")],
+        pr_view=[(0, json.dumps({"headRefOid": "abc"}), "")],
+        run_list=[(0, "[]", "")],
+    )
+    assert worker.wait_ci("h/o/r", 7) == ("pending", "pending: no checks reported yet")
+
+
+def test_wait_ci_survives_a_gh_error_and_reports_it_when_time_runs_out(
+    fake_gh: Callable[..., FakeGh],
+) -> None:
+    gh = fake_gh(
+        pr_checks=[(1, "", "HTTP 502"), (0, checks(("lint", "pass")), "")],
+    )
+    assert worker.wait_ci("h/o/r", 7)[0] == "passed" and gh.slept == 1
+    fake_gh(pr_checks=[(1, "", "HTTP 502")])
+    state, line = worker.wait_ci("h/o/r", 7)
+    assert state == "pending" and "HTTP 502" in line
+
+
+def test_wait_ci_verb_defaults_to_the_cards_pr_or_finds_it(
+    conn: Any, wt: tuple[str, int], set_prs: Prs, fake_gh: Callable[..., FakeGh]
+) -> None:
+    tid, run = wt
+    gh = fake_gh(
+        pr_list=[(0, json.dumps([{"number": 7, "url": PR["url"]}]), "")],
+        pr_checks=[(0, checks(("lint", "pass")), "")],
+    )
+    got = ask(conn, run, "wait-ci")
+    assert got["exit"] == 0 and got["data"] == {
+        "state": "passed", "summary": "passed: 1 check", "pr": 7,
+    }  # fmt: skip
+    checked = next(c for c in gh.calls if c[:2] == ("pr", "checks"))
+    assert checked[2] == "7" and "example.invalid/acme/proj" in checked
+    assert ask(conn, run, "wait-ci", pr=9)["data"]["pr"] == 9
+    assert store.get_task(conn, tid)["status"] == "running"
+
+
+def test_wait_ci_cli_exit_codes(
+    kb: Any, wt: tuple[str, int], fake_gh: Callable[..., FakeGh], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_RUN_ID", str(wt[1]))
+    for reply, code, word in (
+        ((0, checks(("lint", "pass")), ""), 0, "passed"),
+        ((1, checks(("lint", "fail")), ""), 1, "failed: lint"),
+        ((8, checks(("lint", "pending")), ""), 2, "pending"),
+    ):
+        fake_gh(pr_checks=[reply])
+        got, out, _ = kb("wait-ci", "--pr", "7")
+        assert (got, word in out) == (code, True)
+    monkeypatch.delenv("KANBAN_RUN_ID")
+    assert kb("wait-ci")[0] == 5
+
+
+# --- block --retry-after (P1-6) -------------------------------------------------------------
+
+
+def test_a_transient_block_with_retry_after_goes_back_to_ready_and_counts_as_a_failure(
+    conn: Any, wt: tuple[str, int], clock: Callable[[int], None], procs: Any
+) -> None:
+    tid, run = wt
+    got = ask(conn, run, "block", kind="transient", reason="Zscaler 403", retry_after="30m")
+    assert got["exit"] == 0 and got["data"]["status"] == "ready", got
+    t = store.get_task(conn, tid)
+    assert (t["status"], t["block_kind"], t["consecutive_failures"]) == ("ready", None, 1)
+    assert t["retry_after"] == store.now() + 1800
+    assert dispatcher.dispatch_once(conn, store.now(), procs, dry_run=True)["skipped"] == {
+        tid: "retry_after"
+    }
+    clock(1800)
+    assert dispatcher.dispatch_once(conn, store.now(), procs, dry_run=True)["claimed"] == [
+        {"id": tid}
+    ]
+    kinds = [
+        r["kind"] for r in conn.execute("SELECT kind FROM task_events WHERE task_id = ?", (tid,))
+    ]
+    assert "transient_retry" in kinds and "blocked" not in kinds
+    assert (
+        "Zscaler 403"
+        in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[
+            "body"
+        ]
+    )
+
+
+def test_transient_retries_stop_at_the_cards_failure_limit(conn: Any, wt: tuple[str, int]) -> None:
+    tid, run = wt
+    conn.execute("UPDATE tasks SET max_retries = 2 WHERE id = ?", (tid,))
+    assert ask(conn, run, "block", kind="transient", reason="slow", retry_after="1h")["exit"] == 0
+    again = store.claim(conn, tid)
+    assert again
+    got = ask(conn, again, "block", kind="transient", reason="slow", retry_after="1h")
+    assert got["exit"] == 0 and got["data"]["status"] == "blocked"
+    t = store.get_task(conn, tid)
+    assert (t["block_kind"], t["consecutive_failures"]) == ("gave_up", 2)
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'gave_up'", (tid,)
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_retry_after_is_only_for_transient_blocks_and_must_be_a_duration(
+    conn: Any, wt: tuple[str, int]
+) -> None:
+    tid, run = wt
+    for kind, after in (("needs_input", "30m"), ("transient", "soon"), ("transient", "0m")):
+        got = ask(conn, run, "block", kind=kind, reason="r", retry_after=after)
+        assert got["exit"] == 4, got
+    assert store.get_task(conn, tid)["status"] == "running"
+    plain = ask(conn, run, "block", kind="transient", reason="r")
+    assert plain["data"]["status"] == "blocked"

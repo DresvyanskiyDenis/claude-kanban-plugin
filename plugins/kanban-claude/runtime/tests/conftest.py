@@ -30,6 +30,14 @@ if args[:2] == ["pr", "view"]:
         sys.stderr.write("no pull requests found\\n")
         sys.exit(1)
     print(json.dumps(pr))
+elif args[:2] == ["pr", "list"]:
+    prs = json.load(open(os.environ["GH_FAKE_PRS"]))
+    want = {k: args[args.index(k) + 1] for k in ("--head", "--base", "--state")}
+    print(json.dumps([
+        {"number": int(n), "url": p["url"]} for n, p in prs.items()
+        if p["headRefName"] == want["--head"] and p["baseRefName"] == want["--base"]
+        and p["state"].lower() == want["--state"]
+    ]))
 elif args[:2] == ["pr", "merge"]:
     prs = json.load(open(os.environ["GH_FAKE_PRS"]))
     pr = prs.get(args[2])

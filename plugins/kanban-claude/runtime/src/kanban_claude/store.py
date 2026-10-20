@@ -446,6 +446,17 @@ def event(
     return cur.lastrowid
 
 
+# What needs the owner. `awaiting_owner_merge` is a partial approval; the owner's own events never count.
+ACTIONABLE_EVENTS = (
+    "blocked", "block_loop_detected", "gave_up", "merge_failed", "awaiting_owner_merge",
+    "account_paused", "quota_wall", "dispatch_paused",
+)  # fmt: skip
+
+
+def actionable(ev: dict[str, Any]) -> bool:
+    return ev["kind"] in ACTIONABLE_EVENTS and not str(ev["actor"]).startswith("owner:")
+
+
 def events_since(
     conn: sqlite3.Connection,
     after: int,
@@ -1687,15 +1698,37 @@ def _last_block(conn: sqlite3.Connection, task_id: str) -> tuple[str | None, int
     return (got[0], got[1] or 0) if got else (None, 0)
 
 
-def block(conn: sqlite3.Connection, run_id: int, kind: str, reason: str) -> dict[str, Any]:
+def block(
+    conn: sqlite3.Connection,
+    run_id: int,
+    kind: str,
+    reason: str,
+    *,
+    retry_after_s: int | None = None,
+) -> dict[str, Any]:
+    """`retry_after_s` (transient only) puts the card back in line after that long instead of
+    blocking it. It counts as a failure, so the card's failure limit ends the retries (`gave_up`)."""
     if kind not in WORKER_BLOCK_KINDS:
         raise Refused(f"block kind {kind!r} must be one of {', '.join(WORKER_BLOCK_KINDS)}")
+    if retry_after_s is not None and kind != "transient":
+        raise Refused("--retry-after goes with --kind transient only")
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         found = _verb_run(conn, run_id, "block")
         if found is None:
             return {"noop": True}
         run, t = found
+        if retry_after_s is not None:
+            end_run(
+                conn, run_id, "blocked", "retry", actor=_worker(run), event_kind="transient_retry",
+                payload={"kind": kind, "retry_after_s": retry_after_s}, counted=True,
+                retry_after=now() + retry_after_s, error=reason, summary=reason,
+                card_fields={"protocol_violations": 0}, run_fields={"terminal_verb": "block"},
+            )  # fmt: skip
+            to = get_task(conn, t["id"])["status"]
+            note = f" (retrying in {retry_after_s}s)" if to != "blocked" else ""
+            _comment(conn, t, run["role"], f"BLOCKED: {reason}{note}", _worker(run))
+            return {"id": t["id"], "status": to}
         prev = _last_block(conn, t["id"])
         loops = prev[1] + 1 if prev[0] == kind else 0
         looped = loops >= BLOCK_RECURRENCE_LIMIT

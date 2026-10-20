@@ -3,8 +3,11 @@
 Anything that needs git or the network runs before the transaction a terminal verb opens.
 """
 
-import re
+import json
 import sqlite3
+import subprocess
+import time
+from collections.abc import Callable
 from typing import Any
 
 from . import ghops, gitops, store, validate, views
@@ -20,8 +23,12 @@ VERBS = (
     "complete",
     "request-review",
     "request-changes",
+    "wait-ci",
 )
-_PR_RE = re.compile(r"PR #(\d+)|/pull/(\d+)")
+BUDGET_S = 540  # under the 600 s a worker's shell command may run
+POLL_S = 20
+CI_EXIT = {"passed": 0, "failed": 1, "pending": 2}
+_FAILED_RUNS = ("failure", "timed_out", "cancelled", "startup_failure", "action_required")
 
 
 def _text(body: dict[str, Any], key: str) -> str:
@@ -48,31 +55,99 @@ def _facts(t: sqlite3.Row, run: sqlite3.Row) -> tuple[int, str | None]:
     return ahead, default
 
 
-def _check_pr(t: sqlite3.Row, summary: str) -> tuple[int, str]:
-    """REV-01: the PR is open, its head is the card's branch and its base the card's base."""
-    m = _PR_RE.search(summary)
-    if not m:
-        raise Refused("the summary must name the PR as 'PR #<n>' or its URL")
-    number = int(m[1] or m[2])
+def _repo(t: sqlite3.Row) -> str:
+    """The card's repository as `HOST/OWNER/REPO`, from its worktree's origin (GIT-11)."""
     if t["workspace_kind"] != "worktree" or not t["branch_name"]:
-        raise Refused("request-review needs a worktree card with a branch; use complete instead")
-    root = t["workspace_path"]
-    origin = gitops.origin_url(root)
+        raise Refused("this needs a worktree card with a branch; use complete instead")
+    origin = gitops.origin_url(t["workspace_path"])
     if not origin:
-        raise Error(f"{root} has no origin remote; run: kanban doctor")
-    repo = gitops.repo_slug(origin)
-    pr = ghops.pr_view(repo, number)
-    base = t["base_branch"] or ghops.default_branch(root)
-    if pr.get("state") != "OPEN":
-        raise Refused(f"PR #{number} is {pr.get('state')}, not OPEN")
-    if pr.get("headRefName") != t["branch_name"]:
+        raise Error(f"{t['workspace_path']} has no origin remote; run: kanban doctor")
+    return gitops.repo_slug(origin)
+
+
+def _find_pr(t: sqlite3.Row) -> tuple[str, int, str]:
+    """(repo, number, url) of the card's one open PR, found by its branch and base (REV-01)."""
+    repo = _repo(t)
+    base = t["base_branch"] or ghops.default_branch(t["workspace_path"])
+    if base is None:
+        raise Error("cannot determine the default branch; run: kanban doctor")
+    found = ghops.pr_list(repo, t["branch_name"], base)
+    where = f"from {t['branch_name']} into {base} in {repo}"
+    if not found:
         raise Refused(
-            f"PR #{number} is from {pr.get('headRefName')}, not the card branch {t['branch_name']}"
+            f"no open PR {where}; push the branch and open the PR (gh pr create --base {base}), "
+            "then run this again"
         )
-    if pr.get("baseRefName") != base:
-        raise Refused(f"PR #{number} targets {pr.get('baseRefName')}, not {base}")
-    url = validate.pr_url(str(pr.get("url")), {repo.split("/")[0], "github.com"})
-    return number, url
+    if len(found) > 1:
+        numbers = ", ".join(f"#{pr.get('number')}" for pr in found)
+        raise Refused(f"several open PRs {where}: {numbers}; close the extra ones, then run again")
+    return repo, int(found[0]["number"]), str(found[0].get("url"))
+
+
+def _check_pr(t: sqlite3.Row) -> tuple[int, str]:
+    repo, number, url = _find_pr(t)
+    return number, validate.pr_url(url, {repo.split("/")[0], "github.com"})
+
+
+def _verdict(rows: list[tuple[str, str]]) -> tuple[str, str]:
+    """Fold (name, bucket) pairs, bucket being pass, fail, pending, skipping or cancel."""
+    failed = [n for n, b in rows if b in ("fail", "cancel")]
+    pending = [n for n, b in rows if b == "pending"]
+    if failed:
+        return "failed", "failed: " + ", ".join(failed[:8])
+    if pending:
+        return "pending", f"pending: {len(pending)} of {len(rows)} checks still running"
+    return "passed", f"passed: {len(rows)} check{'' if len(rows) == 1 else 's'}"
+
+
+def _runs(gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int) -> tuple[str, str]:
+    """The PR reports no checks yet: judge the workflow runs of its head commit instead."""
+    view = gh("pr", "view", str(number), "--json", "headRefOid")
+    if view.returncode != 0:
+        raise Error(f"gh pr view failed: {view.stderr.strip()[:300]}")
+    sha = json.loads(view.stdout)["headRefOid"]
+    listed = gh("run", "list", "--commit", sha, "--json", "name,status,conclusion")
+    if listed.returncode != 0:
+        raise Error(f"gh run list failed: {listed.stderr.strip()[:300]}")
+    rows = [
+        (r["name"], "pending" if r["status"] != "completed"
+         else "fail" if r["conclusion"] in _FAILED_RUNS else "pass")
+        for r in json.loads(listed.stdout)
+    ]  # fmt: skip
+    return _verdict(rows) if rows else ("pending", "pending: no checks reported yet")
+
+
+def _poll(gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int) -> tuple[str, str]:
+    p = gh("pr", "checks", str(number), "--json", "name,bucket")
+    try:
+        rows = json.loads(p.stdout)
+    except ValueError:
+        rows = None
+    if isinstance(rows, list) and rows:
+        return _verdict([(str(r["name"]), str(r["bucket"])) for r in rows])
+    # gh gives no stable exit code for "no checks yet", so the message decides, not the code.
+    if rows == [] or "no checks reported" in p.stdout + p.stderr:
+        return _runs(gh, number)
+    raise Error(f"gh pr checks failed: {(p.stderr or p.stdout).strip()[:300]}")
+
+
+def wait_ci(repo: str, number: int) -> tuple[str, str]:
+    """(state, one line): poll the PR's checks for at most BUDGET_S. `pending` means ask again;
+    a gh error or a PR with no checks yet is pending too, since the next call may see them."""
+    deadline = time.monotonic() + BUDGET_S
+
+    def gh(*args: str) -> "subprocess.CompletedProcess[str]":
+        left = max(1, min(30, int(deadline - time.monotonic())))
+        return ghops.gh_rc(*args, "-R", repo, timeout=left)
+
+    while True:
+        try:
+            state, line = _poll(gh, number)
+        except (Error, KeyError, TypeError, ValueError) as e:
+            state, line = "pending", f"pending: gh did not answer, will retry ({e})"
+        if state != "pending" or time.monotonic() + POLL_S > deadline:
+            return state, line
+        time.sleep(POLL_S)
 
 
 def act(conn: sqlite3.Connection, run_id: int, verb: str, args: dict[str, Any]) -> Any:
@@ -103,14 +178,22 @@ def act(conn: sqlite3.Connection, run_id: int, verb: str, args: dict[str, Any]) 
             uploaded_by=run["role"], actor=who, run_id=run_id,
         )  # fmt: skip
     if verb == "block":
-        return store.block(conn, run_id, _text(args, "kind"), _text(args, "reason"))
+        after = args.get("retry_after")
+        return store.block(
+            conn, run_id, _text(args, "kind"), _text(args, "reason"),
+            retry_after_s=None if after is None else validate.duration(after),
+        )  # fmt: skip
+    if verb == "wait-ci":
+        number = args.get("pr") or t["pr_number"] or _find_pr(t)[1]
+        state, line = wait_ci(_repo(t), number)
+        return {"state": state, "summary": line, "pr": number}
     if verb == "request-changes":
         return store.request_changes(conn, run_id, _text(args, "reason"))
     summary = _text(args, "summary")
     if verb == "complete":
         ahead, default = _facts(t, run)
         return store.complete(conn, run_id, summary, commits_ahead=ahead, default_branch=default)
-    number, url = _check_pr(t, summary)
+    number, url = _check_pr(t)
     reviewer = args.get("reviewer")
     return store.request_review(
         conn, run_id, summary, pr_number=number, pr_url=url,

@@ -75,7 +75,7 @@ def cap(text: str | None, limit: int) -> str:
 
 
 def watch_line(ev: dict[str, Any]) -> str:
-    who = f" (@{ev['assignee']})" if ev.get("assignee") else ""
+    who = f" ({ev['actor']})" if ev.get("actor") else ""
     payload = f" {ev['payload']}" if ev.get("payload") else ""
     return (
         f"[{iso(ev['created_at'])}] #{ev['id']} {ev['task_id'] or '-'} {ev['kind']}{who}{payload}"

@@ -274,6 +274,29 @@ def test_l4_watch_shows_the_events_of_the_daemon_and_of_housekeeping(
     assert all(kind in out for kind in ("repaired", "worktree_kept", "account_resumed"))
 
 
+def test_watch_actionable_shows_only_what_needs_the_owner(
+    kb: Kb, workdirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_BOARD", "alpha")
+    a = json.loads(kb("create", "A", "--body", "b", "--assignee", "smith", "--json")[1])["id"]
+    conn = store.connect()
+    with store.tx(conn):
+        t = store.get_task(conn, a)
+        store.event(conn, t, "blocked", "worker:smith#3", {"kind": "needs_input"})
+        store.event(conn, t, "commented", "worker:smith#3")
+        store.event(conn, t, "merge_failed", "housekeeping", {"reason": "conflict"})
+        store.event(conn, None, "dispatch_paused", store.OWNER, {"reason": "manual"})
+        store.event(conn, None, "dispatch_paused", "runner", {"reason": "systemic"})
+    conn.close()
+    lines = kb("watch", "--since-start", "--actionable")[1].splitlines()
+    assert [ln.split()[3] for ln in lines] == ["blocked", "merge_failed", "dispatch_paused"]
+    assert "(worker:smith#3)" in lines[0] and "(runner)" in lines[2]
+    assert kb("watch", "--actionable", "--kinds", "blocked")[0] == 2
+    assert {"awaiting_owner_merge", "gave_up", "account_paused", "quota_wall"} <= set(
+        store.ACTIONABLE_EVENTS
+    )
+
+
 def test_l4_watch_follow_exits_0_on_sigterm(workdirs: tuple[Path, Path], kb: Kb) -> None:
     assert kb("create", "A", "--board", "alpha", "--body", "b", "--assignee", "smith")[0] == 0
     p = subprocess.Popen(

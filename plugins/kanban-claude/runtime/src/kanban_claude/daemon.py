@@ -5,18 +5,23 @@ import fcntl
 import logging
 import logging.handlers
 import os
+import shlex
 import signal
+import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
 
-from . import dispatcher, housekeeping, protection, store, web
+from . import dispatcher, housekeeping, protection, store, views, web
 from .paths import add_file_log, dirs, ensure_dir
 from .procs import Procs
 
 HOUSEKEEPING_S = 60
 LOCK_WAIT_S = 1.0
 FAILURE_WAIT_S = 5.0
+NOTIFY_S = 5
+NOTIFY_TIMEOUT_S = 10.0
 log = logging.getLogger("kanban.daemon")
 
 
@@ -85,6 +90,48 @@ def housekeeping_loop(stop: threading.Event, unprotected: dict[str, list[str]]) 
         stop.wait(HOUSEKEEPING_S)
 
 
+def notify_new(conn: sqlite3.Connection) -> None:
+    """Run `notify.command` once for each actionable event raised since the last pass, with the
+    event line (as `kanban watch` prints it) on stdin. The cursor moves on whether or not a command
+    is set or works, so a restart, a late `config set` or a failing command never replays events."""
+    cursor = store.state_get(conn, "notify_cursor")
+    if cursor is None:  # first pass: "new" begins here
+        with store.tx(conn):
+            top = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+            store.state_put(conn, "notify_cursor", top)
+        return
+    while batch := store.events_since(conn, cursor, kinds=store.ACTIONABLE_EVENTS, limit=50):
+        command = store.cfg(conn, "notify.command")
+        for ev in batch:
+            if command and store.actionable(ev):
+                send(command, views.clean(views.watch_line(ev)))
+            cursor = ev["id"]
+            with store.tx(conn):
+                store.state_put(conn, "notify_cursor", cursor)
+
+
+def send(command: str, line: str) -> None:
+    """No shell, so the event text is never shell syntax; no output pipes, so a command that leaves
+    a child behind cannot hold the thread past the timeout."""
+    try:
+        subprocess.run(
+            shlex.split(command), input=line + "\n", text=True, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=NOTIFY_TIMEOUT_S, check=True,
+        )  # fmt: skip
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        log.warning("notify.command failed: %s", e)
+
+
+def notify_loop(stop: threading.Event) -> None:
+    conn = store.connect()
+    while not stop.is_set():
+        try:
+            notify_new(conn)
+        except Exception:
+            log.exception("notify failed")
+        stop.wait(NOTIFY_S)
+
+
 def serve() -> int:
     """`kanban daemon`: 0 on SIGTERM and when another daemon already runs; 1 when a thread died
     or the board port cannot be bound."""
@@ -116,6 +163,7 @@ def serve() -> int:
         threading.Thread(
             target=housekeeping_loop, args=(stop, unprotected), name="housekeeping", daemon=True
         ),
+        threading.Thread(target=notify_loop, args=(stop,), name="notify", daemon=True),
         threading.Thread(target=board.serve_forever, name="web", daemon=True),
     ]
     for t in threads:
