@@ -12,6 +12,9 @@ const RUN_MS = 10_000
 // process.run rejects both when the binary cannot start and when it times out: only a quick rejection means "not found".
 const SPAWN_MS = 1_000
 const SHOWN = 5
+// The card view: cards per lane in the dock, and the narrowest lane column (a card's text gets 4 cells less).
+const CARDS = 3
+const CARD_MIN = 22
 const LABEL = 10
 
 const SNAP = atom({ plugin: 'kanban-claude', key: 'snapshot' } as const, null)
@@ -20,6 +23,7 @@ const PIN = atom({ plugin: 'kanban-claude', key: 'pin' } as const, null)
 const OPEN = atom({ plugin: 'kanban-claude', key: 'open' } as const, null)
 const DETAIL = atom({ plugin: 'kanban-claude', key: 'detail' } as const, null)
 const SEEN = atom({ plugin: 'kanban-claude', key: 'seen' } as const, null)
+const VIEW = atom({ plugin: 'kanban-claude', key: 'view' } as const, null)
 
 // Colors are theme keys, not hex, so the pane follows the person's theme. One accent per lane.
 type Lane = { key: string; name: string; statuses: string[]; glyph: string; color: string; meta: (c: KanbanCard, now: number) => string }
@@ -94,6 +98,22 @@ function hintLines(s: string, n: number): string[] {
   return cells(s) <= n || at < 0 ? [fit(s, n)] : [fit(s.slice(0, at), n), fit(s.slice(at + 1), n)]
 }
 
+// Word-wrapped into at most `max` lines of `n` cells (the first line `first`), each padded to its width;
+// the last line takes the rest and ends in an ellipsis when it overflows.
+function wrap(s: string, first: number, n: number, max: number): string[] {
+  const words = s.replace(/\s+/g, ' ').trim().split(' ')
+  const out: string[] = []
+  let at = 0
+  while (out.length < max - 1 && at < words.length) {
+    const room = out.length ? n : first
+    let line = words[at++] ?? ''
+    while (at < words.length && cells(`${line} ${words[at] ?? ''}`) <= room) line += ` ${words[at++] ?? ''}`
+    if (at === words.length) return [...out, fit(line, room)]
+    out.push(fit(line, room))
+  }
+  return [...out, fit(words.slice(at).join(' '), out.length ? n : first)]
+}
+
 // Cells per segment, rounded on the running total so the segments always fill `width` exactly.
 // shortcut: a status holding a sliver of a big board can round to no cell; its lane still lists it.
 function segments(parts: { color: string; n: number }[], width: number) {
@@ -109,33 +129,34 @@ function segments(parts: { color: string; n: number }[], width: number) {
   })
 }
 
-// What each actionable event asks of the owner, in a few words.
-function ask(n: KanbanNeed, now: number): { label: string; title: string; hint: string } {
+// What each actionable event asks of the owner, in a few words: why it waits, and what to do about it.
+function ask(n: KanbanNeed, now: number): { label: string; title: string; why: string; act: string; hint: string } {
   const p = n.payload ?? {}
   const id = n.task_id ?? ''
   const title = n.title ?? ''
   const why = str(n.reason)
+  const of = (label: string, t: string, w: unknown, act = '') => ({ label, title: t, why: str(w), act, hint: join(' → ', str(w), act) })
   switch (n.kind) {
     case 'blocked':
-      if (p.kind === 'needs_input') return { label: 'question', title, hint: join(' → ', why, `kanban unblock ${id} --reason "…"`) }
-      if (p.kind === 'capability') return { label: 'grant', title, hint: join(' → ', why, `grant, then kanban unblock ${id}`) }
-      return { label: 'blocked', title, hint: join(' → ', why || words(p.kind), `kanban unblock ${id}`) }
+      if (p.kind === 'needs_input') return of('question', title, why, `kanban unblock ${id} --reason "…"`)
+      if (p.kind === 'capability') return of('grant', title, why, `grant, then kanban unblock ${id}`)
+      return of('blocked', title, why || words(p.kind), `kanban unblock ${id}`)
     case 'block_loop_detected':
-      return { label: 'loop', title, hint: join(' → ', `blocked ${str(p.recurrences)}× on the same thing`, 'rewrite the card') }
+      return of('loop', title, `blocked ${str(p.recurrences)}× on the same thing`, 'rewrite the card')
     case 'gave_up':
-      return { label: 'gave up', title, hint: join(' → ', p.failures ? `${str(p.failures)} failed runs` : why, `kanban log ${id} --tail 80`) }
+      return of('gave up', title, p.failures ? `${str(p.failures)} failed runs` : why, `kanban log ${id} --tail 80`)
     case 'merge_failed':
-      return { label: 'merge', title, hint: join(' → ', str(p.reason), `kanban merge-retry ${id}`) }
+      return of('merge', title, words(p.reason), `kanban merge-retry ${id}`)
     case 'awaiting_owner_merge':
-      return { label: 'merge PR', title, hint: `${p.pr ? `PR #${str(p.pr)} ` : ''}approved, merge it yourself` }
+      return of('merge PR', title, `${p.pr ? `PR #${str(p.pr)} ` : ''}approved, merge it yourself`)
     case 'account_paused':
-      return { label: 'login', title: `${str(p.config_dir) || 'account'} signed out`, hint: join(' → ', p.login ? `run ${str(p.login)}` : null, 'kanban resume') }
+      return of('login', `${str(p.config_dir) || 'account'} signed out`, p.login ? `run ${str(p.login)}` : '', 'kanban resume')
     case 'quota_wall':
-      return { label: 'quota', title: `${str(p.kind) || 'usage'} quota wall · ${Number(p.cards) === 1 ? '1 card waits' : `${str(p.cards || 0)} cards wait`}`, hint: `lifts by itself in ${ago(Number(p.until) - now)}` }
+      return of('quota', `${str(p.kind) || 'usage'} quota wall · ${Number(p.cards) === 1 ? '1 card waits' : `${str(p.cards || 0)} cards wait`}`, `lifts by itself in ${ago(Number(p.until) - now)}`)
     case 'dispatch_paused':
-      return { label: 'paused', title: 'Dispatch paused', hint: join(' → ', str(p.detail), 'kanban resume') }
+      return of('paused', 'Dispatch paused', p.detail, 'kanban resume')
     default:
-      return { label: words(n.kind), title, hint: why }
+      return of(words(n.kind), title, why)
   }
 }
 
@@ -309,6 +330,13 @@ async function back($: EngineInterface) {
   await update($, DETAIL, () => null)
 }
 
+// Cards or list: a look the person picks once, so it follows them into every folder.
+async function flip($: EngineInterface) {
+  const next = ((await read($, VIEW)) ?? 'cards') === 'cards' ? 'list' : 'cards'
+  await update($, VIEW, () => next)
+  await $.store.set('view', next).catch(() => undefined)
+}
+
 // Pinning another board drops what was read for the old one, and any read still out for it.
 async function pinTo($: EngineInterface, pin: string | null) {
   if ((await read($, PIN)) === pin) return
@@ -342,6 +370,8 @@ export const register: Register = on => {
       description: 'Show the kanban board beside the transcript, or close it',
       argumentHint: '[BOARD-SLUG|close]',
     })
+    const view = await $.store.get('view').catch(() => undefined)
+    if (view === 'cards' || view === 'list') await update($, VIEW, () => view)
     // The pre-dev8 reopen key followed the person into every folder.
     await $.store.delete('pane').catch(() => undefined)
     if ((await $.ui.panes()).some(p => p.id === PANE)) {
@@ -385,7 +415,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Link } = $.ui.resolve(e)
-    const [snap, fault, open, detail] = await Promise.all([read($, SNAP), read($, FAULT), read($, OPEN), read($, DETAIL)])
+    const [snap, fault, open, detail, picked] = await Promise.all([read($, SNAP), read($, FAULT), read($, OPEN), read($, DETAIL), read($, VIEW)])
     const now = (await $.clock.now()) / 1000
     const width = e.props.bodyColumns
     const narrow = width < 30
@@ -520,6 +550,9 @@ export const register: Register = on => {
     const needs = d?.needs_you ?? []
     const merged = (d?.merged ?? []).slice(-2).reverse()
     const wide = e.props.placement === 'inline' && width >= 72
+    const view = picked ?? 'cards'
+    // Rows the header, bar, footer, need strip and stale line take when inline.
+    const used = 3 + (needs.length > 0 ? 1 + Math.min(needs.length, 2) + (needs.length > 2 ? 1 : 0) : 0) + (fault ? 1 : 0)
 
     const health = (
       <Box flexDirection="row" gap={2} flexShrink={0}>
@@ -566,7 +599,15 @@ export const register: Register = on => {
             </Box>
           ))}
         </Box>
-        {refreshButton}
+        {/* Hotkeys reach the pane only while it holds the keyboard; until then they would type into the prompt. */}
+        {e.props.isFocused ? (
+          <Box flexDirection="row" gap={2}>
+            <Button key="view" label={view === 'cards' ? 'list' : 'cards'} hotkey="v" plain dimColor onPress={() => flip($)} />
+            {refreshButton}
+          </Box>
+        ) : (
+          <Text dimColor>ctrl+x tab: keys</Text>
+        )}
       </Box>
     )
 
@@ -663,11 +704,129 @@ export const register: Register = on => {
         </Box>
       )
 
+    if (view === 'cards') {
+      // The lanes as columns of cards, as many across as fit, spread evenly over the rows they need.
+      // Every lane keeps its place, an empty one drawn faint, so nothing moves when a lane empties.
+      const gap = 2
+      const grid = LANES.map(l => ({ ...l, cards: of(l.statuses) }))
+      const across = Math.min(Math.max(1, Math.floor((width + gap) / (CARD_MIN + gap))), grid.length)
+      const perRow = Math.ceil(grid.length / Math.ceil(grid.length / across))
+      const colW = Math.floor((width - gap * (perRow - 1)) / perRow)
+      const groups = Array.from({ length: Math.ceil(grid.length / perRow) }, (_, i) => grid.slice(i * perRow, (i + 1) * perRow))
+      const shown = needs.slice(0, CARDS).map(n => ask(n, now))
+      const lines = (c: KanbanCard) => {
+        const badge = c.priority > 0 ? `P${c.priority} ` : ''
+        return { badge, title: wrap(c.title, colW - 4 - cells(badge), colW - 4, 2) }
+      }
+      // As many cards a lane as the frame holds, so the footer and its keys stay in view.
+      // A tile is its border's two rows, its title lines and the meta line.
+      const lift = wide ? 0 : 1
+      const above =
+        3 +
+        lift +
+        (stale ? 1 : 0) +
+        (needs.length === 0 ? 0 : wide ? 1 + Math.min(needs.length, 2) + (needs.length > 2 ? 1 : 0) : lift + 1 + shown.reduce((a, x) => a + 3 + (x.why ? 1 : 0) + (x.act ? 1 : 0), 0) + (needs.length > CARDS ? 1 : 0)) +
+        (!wide && merged.length > 0 ? lift + 1 + merged.length : 0)
+      const tall = (k: number) =>
+        groups.reduce((a, g) => a + lift + 1 + Math.max(...g.map(l => l.cards.slice(0, k).reduce((b, c) => b + 3 + lines(c).title.length, 0)), 1) + (g.some(l => l.cards.length > k) ? 1 : 0), 0)
+      let room = CARDS
+      while (room > 1 && above + tall(room) > e.props.scroll.bodyRows) room--
+      // The border sits on a Box, since a Button holds only text: its first title line is the Button,
+      // so the focus marks the card and Enter opens it.
+      const tile = (l: Lane, c: KanbanCard) => {
+        const {
+          badge,
+          title: [first, ...rest],
+        } = lines(c)
+        const top = [
+          ...(badge
+            ? [
+                <Text key="badge" bold color="warning">
+                  {badge}
+                </Text>,
+              ]
+            : []),
+          <Text key="title">{first}</Text>,
+        ]
+        return (
+          <Box key={`box:${c.id}`} flexDirection="column" width={colW} borderStyle="round" borderColor={l.color} borderDimColor paddingX={1} hover={{ borderDimColor: false }}>
+            <Button key={`card:${c.id}`} plain onPress={() => show($, c.id)}>
+              {top}
+            </Button>
+            {rest.map((s, i) => (
+              <Text key={`line:${i}`}>{s}</Text>
+            ))}
+            <Text dimColor wrap="truncate-end">
+              {l.meta(c, now)}
+            </Text>
+          </Box>
+        )
+      }
+      // What waits on the owner, loudest on the pane: a card per need, the reason, then the command on its own line.
+      const asks = needs.length > 0 && (
+        <Box flexDirection="column" marginTop={1}>
+          {head('▲', 'Needs you', 'warning', needs.length, width)}
+          {shown.map((a, i) => {
+            const n = needs[i] as KanbanNeed
+            const top = [
+              <Text key="label" bold color="warning">
+                {fit(a.label, LABEL)}
+              </Text>,
+              <Text key="title">{' ' + fit(a.title, width - 5 - LABEL)}</Text>,
+            ]
+            return (
+              <Box key={`ask:${i}`} flexDirection="column" width={width} borderStyle="round" borderColor="warning" paddingX={1}>
+                {n.task_id ? (
+                  <Button key={`need:${i}`} plain onPress={() => show($, n.task_id as string)}>
+                    {top}
+                  </Button>
+                ) : (
+                  <Box flexDirection="row">{top}</Box>
+                )}
+                {a.why && <Text dimColor>{a.why}</Text>}
+                {a.act && <Text bold>{`→ ${a.act}`}</Text>}
+              </Box>
+            )
+          })}
+          {needs.length > CARDS && <Text dimColor italic>{`  +${needs.length - CARDS} more`}</Text>}
+        </Box>
+      )
+      return (
+        <Box flexDirection="column" width={width}>
+          {header}
+          {bar}
+          {stale}
+          {wide ? strip(2, true) : asks}
+          {lanes.length === 0 && <Text dimColor>Nothing running or planned.</Text>}
+          {lanes.length > 0 &&
+            groups.map((g, i) => (
+              <Box key={`lanes:${i}`} flexDirection="row" gap={gap} marginTop={wide ? 0 : 1}>
+                {g.map(l => (
+                  <Box key={`lane:${l.key}`} flexDirection="column" width={colW} flexShrink={0}>
+                    {head(l.glyph, l.name, l.cards.length ? l.color : 'inactive', l.cards.length, colW)}
+                    {l.cards.length === 0 && <Text dimColor>{'  —'}</Text>}
+                    {l.cards.slice(0, room).map(c => tile(l, c))}
+                    {l.cards.length > room && <Text dimColor italic>{`  +${l.cards.length - room} more`}</Text>}
+                  </Box>
+                ))}
+              </Box>
+            ))}
+          {!wide && merged.length > 0 && (
+            <Box flexDirection="column" marginTop={1}>
+              {recent(width)}
+            </Box>
+          )}
+          <Box flexDirection="column" marginTop={lift}>
+            {footer}
+          </Box>
+        </Box>
+      )
+    }
+
     if (wide) {
       // Inline: the lanes side by side, as many rows as the frame holds.
       const gap = 2
       const colW = Math.floor((width - gap * Math.max(0, lanes.length - 1)) / Math.max(1, lanes.length))
-      const used = 3 + (needs.length > 0 ? 1 + Math.min(needs.length, 2) + (needs.length > 2 ? 1 : 0) : 0) + (fault ? 1 : 0)
       const room = Math.max(1, Math.min(SHOWN, e.props.scroll.bodyRows - used - 2))
       return (
         <Box flexDirection="column" width={width}>

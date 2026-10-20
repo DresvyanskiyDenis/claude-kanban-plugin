@@ -85,11 +85,11 @@ def test_v1_a_clean_approval_squash_merges_and_posts_a_comment(
 
 
 FIXES = {
-    "approval_not_clean": "merge the PR on GitHub if you accept it",
+    "approval_not_clean": "merge the PR on GitHub if you accept it, then run: kanban merge-retry t_",
     "pr_not_open": "kanban merge-retry",
     "base_changed": "point it back at feature/x",
     "head_branch_changed": "another branch than the card's",
-    "base_is_default": "which only the owner merges",
+    "base_is_default": "which only the owner merges; merge it on GitHub, or retarget it; then run: kanban merge-retry t_",
     "head_moved": "so warden reviews the new head",
     "closed": "not merged: closed",
 }

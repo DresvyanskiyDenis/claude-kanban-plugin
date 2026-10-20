@@ -26,11 +26,11 @@ METHOD_DONE = {
 }
 # One fix per precondition failure (REV-05), not one reopen-review string for all of them.
 FIX = {
-    "approval_not_clean": "the approval is not clean; merge the PR on GitHub if you accept it, or run: kanban reopen-review {id} --reason TEXT",
+    "approval_not_clean": "the approval is not clean; merge the PR on GitHub if you accept it, then run: kanban merge-retry {id}; or have it reviewed again with: kanban reopen-review {id} --reason TEXT",
     "pr_not_open": "the PR is not open; reopen it or mark it ready on GitHub, then run: kanban merge-retry {id}",
     "default_branch_unknown": "gh could not name the repository's default branch; check gh auth and the network, then run: kanban merge-retry {id}",
     "head_branch_changed": "the PR now comes from another branch than the card's; run: kanban reopen-review {id} --reason TEXT",
-    "base_is_default": "the PR targets the default branch, which only the owner merges; merge it on GitHub, or retarget it and run: kanban merge-retry {id}",
+    "base_is_default": "the PR targets the default branch, which only the owner merges; merge it on GitHub, or retarget it; then run: kanban merge-retry {id}",
     "base_changed": "the PR was retargeted; point it back at {base} and run: kanban merge-retry {id}",
     "head_moved": "commits were pushed after the approval; run: kanban reopen-review {id} --reason TEXT so warden reviews the new head",
     "pr_closed": "reopen the card with: kanban reopen {id} --reason TEXT, or let its children start with: kanban promote CHILD --reason TEXT --ignore-merge",
