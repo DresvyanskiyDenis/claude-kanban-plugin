@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0.dev10
+
+### Added
+
+- The `/kanban-board` pane opens on a card view: Running, Review, Blocked and Up next as columns of bordered cards (priority, the title wrapped onto two lines, then owner and age, or PR number or block kind), as many across as fit and as many down as the pane's height holds, then `+N more`. An empty lane keeps its place, drawn faint. `v` switches to the list and back, and the pane remembers the choice across sessions.
+
+### Changed
+
+- Each need on the pane is a card in the warning color: the reason on one line, the command on the next after `→`. A failed merge's reason reads in words (`approval not clean`).
+- The pane's footer reads `ctrl+x tab: keys` until the pane has the keyboard, and shows the hotkeys after. Before, `v` and `r` looked armed while they typed into the prompt.
+- The merge fixes for `approval_not_clean` and `base_is_default` end in `then run: kanban merge-retry <id>`. A card whose PR the owner merged on GitHub stayed in Needs you until a retry saw the PR merged, and the old text did not say so.
+
 ## 0.2.0.dev9
 
 ### Changed
