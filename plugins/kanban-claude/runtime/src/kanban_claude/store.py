@@ -771,8 +771,8 @@ def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> No
     if kind == "scratch":
         if t["branch_name"]:
             raise Refused(
-                "a scratch card has no repo, so --branch cannot apply; "
-                "pass --workspace worktree:<repo> with it, or drop --branch"
+                "a scratch card has no repo, so a branch cannot apply; "
+                "pass --workspace worktree:<repo> with --branch, or leave the branch out"
             )
         return
     validate.workspace(kind, t["workspace_path"], claude_dirs=claude_dirs(conn, board))
@@ -1154,7 +1154,8 @@ def reopen(
         _cas(
             conn, task_id, expected, version=expect_version, status=status, completed_at=None,
             merge_state=None, merge_attempts=0, merge_next_at=None, merged_at=None,
-            retry_after=None, assignee=t["implementer"] or t["assignee"], ignore_merge=0,
+            retry_after=None, assignee=t["implementer"] or t["assignee"],
+            ignore_merge=0,
         )  # fmt: skip
         if actor != "jira":  # jira.py pushes owner comments to the issue it just reopened from
             _comment(conn, t, "owner", f"REOPEN: {reason}", actor)
@@ -1228,6 +1229,8 @@ def link(
             raise Refused(f"linking {parent} -> {child} would create a cycle")
         conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, child))
         event(conn, c, "linked", actor, {"parent": parent, "child": child})
+        if c["ignore_merge"]:  # the owner waived the merge of the old parents, not of this one
+            conn.execute("UPDATE tasks SET ignore_merge = 0 WHERE id = ?", (child,))
         if c["status"] == "ready" and not parents_satisfied(conn, child):
             _cas(conn, child, ["ready"], status="todo")
             event(conn, c, "dependency_wait", actor, {"parent": parent})

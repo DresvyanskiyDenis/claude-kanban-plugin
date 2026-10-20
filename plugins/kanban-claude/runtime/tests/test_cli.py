@@ -354,3 +354,18 @@ def test_create_scratch_with_a_branch_names_the_fix(
     monkeypatch.setenv("KANBAN_BOARD", "alpha")
     code, _, err = kb("create", "T", "--body", "b", "--assignee", "smith", "--branch", "feat/x")
     assert code == 4 and "--workspace worktree:<repo>" in err
+
+
+def test_config_set_turns_the_budget_caps_on_and_off(kb: Kb, workdirs: tuple[Path, Path]) -> None:
+    def get(key: str) -> Any:
+        return json.loads(kb("config", "get", key, "--json")[1])["value"]
+
+    assert get("budget.max_usd_per_card") == 15.0
+    assert kb("config", "set", "budget.max_usd_per_card", "0")[0] == 0
+    assert get("budget.max_usd_per_card") == 0
+    assert kb("config", "set", "budget.max_usd_per_board_day", "75")[0] == 0
+    assert get("budget.max_usd_per_board_day") == 75
+    assert kb("config", "set", "budget.max_usd_per_board_day", "null")[0] == 0
+    assert get("budget.max_usd_per_board_day") is None
+    assert kb("config", "set", "budget.max_usd_per_board_day", '"lots"')[0] == 4
+    assert kb("config", "set", "budget.max_usd_per_card", "-3")[0] == 4

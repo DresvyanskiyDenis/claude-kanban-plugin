@@ -911,3 +911,14 @@ def test_board_day_cap_off_states(conn: Any, card: Card, off: Any) -> None:
 def test_budget_caps_refuse_non_numbers_and_negatives(conn: Any, key: str, value: Any) -> None:
     with pytest.raises(Refused, match=key):
         store.config_set(conn, key, value)
+
+
+def test_link_ends_the_waiver_for_the_new_parent(conn: Any, card: Card) -> None:
+    _, child = unmerged_parent_and_child(conn, card)
+    store.promote(conn, child, "r", ignore_merge=True)
+    newer = card("newer")
+    store.complete(conn, claim_run(conn, newer), "ok")
+    conn.execute("UPDATE tasks SET merge_state = 'pending' WHERE id = ?", (newer,))
+    store.link(conn, newer, child)
+    assert row(conn, child)["ignore_merge"] == 0
+    assert status(conn, child) == "todo"
