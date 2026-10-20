@@ -73,7 +73,7 @@ To follow the board from a session, run `kanban watch --actionable --wait --boar
 
 - **Needs you** comes first: questions, grants, merges, logins and quota walls, each a card with its reason and, on its own line, the command that answers it. A new need raises one toast.
 - A health line shows whether the daemon is live, whether dispatch is paused, and the last 24 hours' spend.
-- Running, Review, Blocked and Up next are columns of cards: priority, the title on up to two lines, then owner and age, or PR number or block kind. A lane shows as many cards as the pane's height holds, then `+N more`; an empty lane keeps its place, drawn faint. Recently merged and a bar of the board's spread follow.
+- Running, Review, Blocked and Up next are columns of cards: priority, the title on up to two lines, then owner and age, or PR number or block kind. A lane shows as many cards as the pane's height holds, then `+N more`; an empty lane keeps its place, drawn faint. Triage cards follow as rows, in the rows the lanes leave, and Enter opens one; in the list, Triage is a fifth lane. Recently merged and a bar of the board's spread follow.
 - `v` switches to a compact list, one row a card, and back; the pane remembers the choice across sessions.
 - Select a card for its detail (branch, PR, last run, comments); `back` (or `b`) returns.
 - Card columns sit as many across as fit, at least 22 cells each: two in a dock, four inline at 120 columns. In the list, inline from 72 columns the lanes sit side by side; in a dock or narrower they stack. Colors are Claude Code theme keys, so the pane follows your theme.
