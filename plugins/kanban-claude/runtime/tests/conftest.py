@@ -12,6 +12,7 @@ import pytest
 from kanban_claude import cli, daemon, install, launchd, paths, store
 from kanban_claude.procs import Procs
 
+from .fake_gh import Fake as GhFake
 from .fake_jira_mcp import Fake
 
 HERE = Path(__file__).resolve().parent
@@ -321,6 +322,18 @@ def jira_fake(
     store.config_set(conn, "jira.mcp_command", [sys.executable, str(HERE / "fake_jira_mcp.py")])
     store.board_edit(conn, "main", jira_project="KAN")
     return Fake(env / "jira.json")
+
+
+@pytest.fixture
+def gh_fake(env: Path, conn: Any, board: str, clock: Callable[[int], None],
+            monkeypatch: pytest.MonkeyPatch) -> GhFake:  # fmt: skip
+    """`gh` is the stateful fake, and board `main` is paired with the repository `o/r`."""
+    monkeypatch.setenv("GH_FAKE_STATE", str(env / "gh.json"))
+    shim = env / "bin" / "gh"
+    shim.write_text(f'#!/bin/sh\nexec {sys.executable} {HERE / "fake_gh.py"} "$@"\n')
+    shim.chmod(0o755)
+    store.board_edit(conn, "main", github_repo="o/r")
+    return GhFake(env / "gh.json")
 
 
 @pytest.fixture

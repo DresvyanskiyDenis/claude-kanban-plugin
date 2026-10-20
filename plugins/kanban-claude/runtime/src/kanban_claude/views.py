@@ -241,6 +241,19 @@ def _frame(what: str, author: str | None, ts: int | None, text: str, limit: int)
     return f"{what} from worker `{author or 'unknown'}`{when}:\n{cap(text, limit)}"
 
 
+def github_line(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """A card tied to a GitHub issue says so, with the line that makes its PR close the issue on merge."""
+    lk = conn.execute(
+        "SELECT repo, number FROM github_links WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    if lk is None:
+        return []
+    ref = f"{lk['repo'].partition('/')[2]}#{lk['number']}"
+    return [
+        f"- github issue: {ref}; put the line `Closes {ref}` in the PR body so the merge closes it"
+    ]
+
+
 def context_md(conn: sqlite3.Connection, task_id: str) -> str:
     t = store.get_task(conn, task_id)
     runtime = f"{t['max_runtime_seconds']} s" if t["max_runtime_seconds"] else "-"
@@ -258,6 +271,7 @@ def context_md(conn: sqlite3.Connection, task_id: str) -> str:
         f"- base: {t['base_branch'] or '-'}",
         f"- pr: {pr}",
         f"- worktree: {worktree}",
+        *github_line(conn, task_id),
         "",
         "## Body",
         cap(t["body"], BODY_CAP) or "(empty)",
