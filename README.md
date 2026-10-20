@@ -2,7 +2,7 @@
 
 A local kanban board for Claude Code. Cards are dispatched to headless Claude workers (`claude -p`) under a macOS LaunchAgent; the board is a SQLite file you read with the `kanban` CLI and the `/kanban-board` pane. No external service.
 
-Status: pre-release (`0.2.0.dev8`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
+Status: stable (`0.3.0`). The plugin surface (agents, skills, hooks), setup, doctor and uninstall are in place; see [CHANGELOG](plugins/kanban-claude/CHANGELOG.md).
 
 ## Install
 

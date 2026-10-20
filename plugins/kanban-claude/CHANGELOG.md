@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+
+The first stable release. Its code is 0.2.0.dev11's, plus the README line that describes the pane's triage rows; the 0.2.0.dev0 to 0.2.0.dev11 sections below are what it holds. Development continues as `0.4.0.devN` pre-releases, starting at `0.4.0.dev1`.
+
 ## 0.2.0.dev11
 
 ### Fixed
