@@ -1,6 +1,7 @@
 """TST-L2 (worker verbs bound to the run), REV-01 (PR check) and SEC3 against `worker.act`."""
 
 import json
+import re
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 
 from kanban_claude import dispatcher, ghops, store, worker
 from kanban_claude.errors import Error
+from kanban_claude.paths import run_files
 
 from .conftest import git
 
@@ -398,3 +400,61 @@ def test_retry_after_is_only_for_transient_blocks_and_must_be_a_duration(
     assert store.get_task(conn, tid)["status"] == "running"
     plain = ask(conn, run, "block", kind="transient", reason="r")
     assert plain["data"]["status"] == "blocked"
+
+
+# --- gate (0.4.0) -----------------------------------------------------------------------------
+
+
+def gate(conn: Any, run: int, *command: str, lines: int | None = None) -> dict[str, Any]:
+    return ask(conn, run, "gate", command=list(command), lines=lines)
+
+
+def test_gate_passes_the_exit_code_through_and_logs_beside_the_run(
+    conn: Any, wt: tuple[str, int]
+) -> None:
+    tid, run = wt
+    out = gate(conn, run, "echo hello; exit 3")["data"]
+    row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run,)).fetchone()
+    log = Path(out["log"])
+    assert out["exit"] == 3 and log.parent == run_files("main", tid, row["n"])[0].parent
+    assert log.name == f"run-{row['n']}.gate-1.log" and "hello" in log.read_text()
+    assert re.fullmatch(
+        rf"gate: exit 3 after \d+s, 1 lines; full log: {re.escape(str(log))}\nhello", out["text"]
+    )
+    assert Path(gate(conn, run, "true")["data"]["log"]).name.endswith(".gate-2.log")
+
+
+def test_gate_one_argument_is_a_shell_string_and_several_are_an_argv(
+    conn: Any, wt: tuple[str, int]
+) -> None:
+    _, run = wt
+    piped = gate(conn, run, "false | cat")["data"]
+    assert piped["exit"] == 1  # pipefail
+    argv = gate(conn, run, "echo", "a  b", "$HOME")["data"]
+    assert argv["text"].splitlines()[1] == "a  b $HOME"
+    assert gate(conn, run, "no-such-command-x", "arg")["data"]["exit"] == 127
+
+
+def test_gate_shows_the_failures_first_then_the_tail_and_never_more_than_the_limit(
+    conn: Any, wt: tuple[str, int]
+) -> None:
+    _, run = wt
+    script = (
+        "for i in $(seq 1 100); do echo line $i; done; "
+        "echo 'FAILED test_a'; echo 'FAILED test_a'; for i in $(seq 1 100); do echo more $i; done; "
+        "echo '== 1 failed, 5 passed =='; exit 1"
+    )
+    out = gate(conn, run, script, lines=10)["data"]
+    body = out["text"].splitlines()[1:]
+    assert len(body) <= 10 and body[-1] == "more 100" and body[0] == "FAILED test_a"
+    assert body.count("FAILED test_a") == 1 and "== 1 failed, 5 passed ==" in body[:3]
+    assert "--- last lines ---" in body
+    assert len(Path(out["log"]).read_text().splitlines()) == 203  # the log keeps everything
+    quiet = gate(conn, run, "seq 1 100", lines=5)["data"]["text"].splitlines()
+    assert quiet[1:] == ["96", "97", "98", "99", "100"]
+
+
+def test_gate_refuses_no_command_and_a_zero_limit(conn: Any, wt: tuple[str, int]) -> None:
+    _, run = wt
+    assert gate(conn, run)["exit"] == 2
+    assert gate(conn, run, "true", lines=0)["exit"] == 2
