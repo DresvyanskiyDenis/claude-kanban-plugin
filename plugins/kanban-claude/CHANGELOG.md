@@ -30,6 +30,8 @@
 - `promote --ignore-merge` stays on the card until `reopen`, `hold` or `link`. A scratch card with `--branch` is refused. A worktree card with no `--base` and one same-repo worktree parent takes that parent's base.
 - The run prompts live in `prompts/*.md`, with one rules file and a terminal list per run kind. `kanban context` is leaner. `preflight.py` ignores base merges and reports a merge-only re-review.
 - The daemon writes its pid and version into `daemon.lock`; `doctor` and `setup` read them from there. An upgrade now waits up to 30 s for the restarted daemon to report the new version.
+- The agent files no longer set `effort:`; `effort.<role>` replaces it.
+- The runner no longer writes the unread `last_output_at` column.
 - Jira sync is frozen: bug fixes only.
 
 ### Fixed

@@ -238,7 +238,8 @@ def closed_unmerged(conn: sqlite3.Connection, t: Row) -> None:
 
 def sweep(conn: sqlite3.Connection) -> None:
     """GIT-06: finished worktree cards, the scratch directories of archived cards, and the TMPDIR
-    of any card that is archived or deleted (a done card keeps it for a resumed run)."""
+    of any card that is archived or deleted (a done card keeps it until cleanup_card removes it
+    with the card's worktree)."""
     for t in conn.execute(
         "SELECT * FROM tasks WHERE status IN ('done', 'archived') AND workspace_kind = 'worktree' "
         "AND worktree_state IN ('active', 'kept_dirty', 'kept_unpushed')"
