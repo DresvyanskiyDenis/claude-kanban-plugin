@@ -34,6 +34,27 @@ INFRA_RETRIES = 3
 BILLING_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
 STRIPPED_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_ENABLE_TODO_TOOLS")
 MCP_DIR = Path(__file__).parent / "mcp"
+OWN_PLUGIN = "kanban-claude"
+OWN_DEPENDENCIES = ("frontend-design",)  # plugin.json "dependencies"; a test keeps the two equal
+OWN_AGENTS = (
+    "atlassian",
+    "card-checker",
+    "card-helper",
+    "designer",
+    "review-helper",
+    "scout",
+    "smith",
+    "warden",
+)
+BUILTIN_AGENTS = ("Explore", "Plan", "general-purpose", "statusline-setup", "claude")
+HELPERS = {
+    "smith": "card-helper",
+    "designer": "card-helper",
+    "scout": "card-helper",
+    "warden": "review-helper",
+}
+NO_FILE_WRITES = {"warden": ("Edit", "Write"), "atlassian": ("Edit", "Write"), "scout": ("Edit",)}
+ROLE_SERVERS = {"atlassian": ("atlassian",)}
 EOF = object()
 Row = sqlite3.Row
 
@@ -57,18 +78,63 @@ def model_effort(conn: sqlite3.Connection, t: Row, run: Row) -> tuple[str, str]:
     return t["model_override"] or store.cfg(conn, "models.default"), effort
 
 
-def settings_json(home: Path, rules: list[str]) -> str:
-    """RUN-06: guard rails, the active grants and the one plugin switch."""
+def json_section(path: Path, key: str) -> dict[str, Any]:
+    try:
+        section = json.loads(path.read_text()).get(key)
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return section if isinstance(section, dict) else {}
+
+
+def plugins_off(conn: sqlite3.Connection, config_dir: str) -> dict[str, bool]:
+    """P2-1: every plugin the account's own settings enable, switched off for the worker, but
+    kanban-claude, what it depends on and `worker.plugin_allowlist` (names or full ids)."""
+    keep = {OWN_PLUGIN, *OWN_DEPENDENCIES, *store.cfg(conn, "worker.plugin_allowlist")}
+    enabled = json_section(Path(config_dir).expanduser() / "settings.json", "enabledPlugins")
+    off = {k: False for k, v in enabled.items() if v and not {k, k.partition("@")[0]} & keep}
+    return {**off, "cc-plugin-you-should-know@builtin": False}
+
+
+def role_denies(role: str) -> list[str]:
+    """D1: a role may spawn only its helper, and a read-only role may not write files."""
+    deny = list(NO_FILE_WRITES.get(role, ()))
+    if role in HELPERS:
+        agents = [*BUILTIN_AGENTS, *(f"{OWN_PLUGIN}:{a}" for a in OWN_AGENTS)]
+        deny += [f"Agent({a})" for a in agents if a != f"{OWN_PLUGIN}:{HELPERS[role]}"]
+    return deny
+
+
+def settings_json(
+    home: Path, rules: list[str], role: str = "", off: dict[str, bool] | None = None
+) -> str:
+    """RUN-06: guard rails, the role's denies, the active grants and the plugin switches."""
     deny = [
         "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(gh pr merge:*)",
-        "Bash(kanban grant:*)", f"Edit(/{home}/**)",
+        "Bash(kanban grant:*)", f"Edit(/{home}/**)", *role_denies(role),
     ]  # fmt: skip
-    return json.dumps(
-        {
-            "permissions": {"deny": deny, "allow": rules},
-            "enabledPlugins": {"cc-plugin-you-should-know@builtin": False},
-        }
-    )
+    plugins = off or {"cc-plugin-you-should-know@builtin": False}
+    return json.dumps({"permissions": {"deny": deny, "allow": rules}, "enabledPlugins": plugins})
+
+
+def mcp_config(
+    conn: sqlite3.Connection, role: str, workspace: Path, config_dir: str
+) -> dict[str, Any]:
+    """P2-1 step 2, for `--strict-mcp-config`: the role's own servers plus the allowlisted ones,
+    copied from the account's `.claude.json` (user scope), else from the repo's `.mcp.json`."""
+    base = Path(config_dir).expanduser()
+    home = Path.home()
+    user = json_section(
+        home / ".claude.json" if base.resolve() == (home / ".claude").resolve() else base / ".claude.json",
+        "mcpServers",
+    )  # fmt: skip
+    # a repo's .mcp.json is untrusted: it supplies only a name the account does not define
+    known = {**json_section(workspace / ".mcp.json", "mcpServers"), **user}
+    servers = {
+        n: known[n]
+        for n in (*store.cfg(conn, "worker.mcp_allowlist"), *ROLE_SERVERS.get(role, ()))
+        if n in known
+    }
+    return {"mcpServers": {**servers, **json_section(MCP_DIR / f"{role}.json", "mcpServers")}}
 
 
 def base_env(conn: sqlite3.Connection) -> dict[str, str]:
@@ -167,16 +233,12 @@ def build_prompt(
 
 def build_argv(
     claude: str, prompt: str, role: str, task: str, model: str, effort: str, settings: str,
-    budget: float, turns: int | None, sid: str, resumed: bool,
+    budget: float, turns: int | None, sid: str, resumed: bool, mcp: str,
 ) -> list[str]:  # fmt: skip
     argv = [
-        claude, "-p", prompt, "--agent", f"kanban-claude:{role}", "--model", model,
+        claude, "-p", prompt, "--agent", f"{OWN_PLUGIN}:{role}", "--model", model,
         "--effort", effort, "--permission-mode", "auto", "--permission-prompts", "none",
-        "--settings", settings,
-    ]  # fmt: skip
-    if (MCP_DIR / f"{role}.json").is_file():
-        argv += ["--mcp-config", str(MCP_DIR / f"{role}.json")]
-    argv += [
+        "--settings", settings, "--strict-mcp-config", "--mcp-config", mcp,
         "--output-format", "stream-json", "--verbose", "--no-chrome",
         "--name", f"kanban {task} {role}", "--max-budget-usd", f"{budget:g}",
     ]  # fmt: skip
@@ -252,7 +314,15 @@ class Runner:
         if self.signalled or self.row()["status"] != "running":
             self.end("interrupted", error="stopped before claude started")
             return 0
-        return self.launch(t, workspace)
+        try:
+            return self.launch(t, workspace)
+        finally:
+            self.mcp_path().unlink(missing_ok=True)
+
+    def mcp_path(self) -> Path:
+        """The run's MCP config: it holds the allowlisted servers' credentials, so it is private
+        and `go` removes it when the run ends."""
+        return Path(self.row()["log_path"]).with_suffix(".mcp.json")
 
     def on_signal(self, signum: int, frame: object) -> None:
         self.signalled = True
@@ -316,11 +386,17 @@ class Runner:
             if not g["revoked_at"]
             for r in g["rules"]
         ]
+        mcp = self.mcp_path()
+        ensure_dir(mcp.parent)
+        fd = os.open(mcp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(mcp_config(self.conn, run["role"], workspace, self.config_dir), f)
         argv = build_argv(
             store.cfg(self.conn, "claude.bin") or shutil.which("claude") or "claude",
             build_prompt(self.conn, t, workspace, self.config_dir, resumed), run["role"], t["id"],
-            model, effort, settings_json(dirs().home, rules), budget,
-            store.cfg(self.conn, "worker.max_turns"), sid, resumed,
+            model, effort,
+            settings_json(dirs().home, rules, run["role"], plugins_off(self.conn, self.config_dir)),
+            budget, store.cfg(self.conn, "worker.max_turns"), sid, resumed, str(mcp),
         )  # fmt: skip
         with store.tx(self.conn):
             self.conn.execute(
