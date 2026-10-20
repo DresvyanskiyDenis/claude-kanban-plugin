@@ -982,6 +982,27 @@ def test_budget_caps_refuse_non_numbers_and_negatives(conn: Any, key: str, value
         store.config_set(conn, key, value)
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("effort.smith", "turbo"),
+        ("effort.smith", 5),
+        ("effort.default", "turbo"),
+        ("effort.review", "turbo"),
+        ("models.default", "bad model!"),
+        ("models.review", "bad model!"),
+    ],
+)
+def test_effort_and_model_keys_refuse_what_claude_would_reject(
+    conn: Any, key: str, value: Any
+) -> None:
+    """A bad value reaches every run's argv: each run then fails, or Popen raises TypeError."""
+    with pytest.raises(Refused):
+        store.config_set(conn, key, value)
+    store.config_set(conn, "effort.smith", "max")
+    store.config_set(conn, "effort.smith", None)
+
+
 def test_link_ends_the_waiver_for_the_new_parent(conn: Any, card: Card) -> None:
     _, child = unmerged_parent_and_child(conn, card)
     store.promote(conn, child, "r", ignore_merge=True)

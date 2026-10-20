@@ -361,6 +361,10 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         ok_number = isinstance(default, float) and type(value) is int
         if not ok_number:
             raise Refused(f"{key} must be {type(default).__name__}, got {value!r}")
+    if value is not None and key.startswith("effort."):
+        validate.effort(value)
+    if value is not None and key.startswith("models."):
+        validate.model(value)
     roles = active_roles(conn, value if key == "dispatch.roles" else None)
     if key == "dispatch.roles":
         if not value or not all(isinstance(r, str) for r in value):
