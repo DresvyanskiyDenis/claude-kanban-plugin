@@ -1101,6 +1101,19 @@ def last_run_kind(conn: sqlite3.Connection, task_id: str) -> str | None:
     return row["kind"] if row else None
 
 
+def blocked_in_review(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether a blocked card left review: blocked by a review run, or by a budget cap at a review claim."""
+    row = conn.execute(
+        "SELECT kind, json_extract(payload, '$.from') AS src FROM task_events WHERE task_id = ? "
+        "AND (kind = 'claimed' OR (kind = 'blocked' AND json_extract(payload, '$.from') IS NOT NULL)) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row and row["kind"] == "blocked":
+        return bool(row["src"] == "review")
+    return last_run_kind(conn, task_id) == "review"
+
+
 def unblock(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1112,7 +1125,7 @@ def unblock(
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         t = get_task(conn, task_id)
-        if last_run_kind(conn, task_id) == "review":
+        if blocked_in_review(conn, task_id):
             target = "review"
         else:
             target = "ready" if parents_satisfied(conn, task_id) else "todo"
@@ -1524,7 +1537,13 @@ def claim(
             if over := _over_budget(conn, t):
                 _cas(conn, task_id, [source], status="blocked", block_kind="capability")
                 _comment(conn, t, "kanban", f"BLOCKED: {over}", actor)
-                event(conn, t, "blocked", actor, {"kind": "capability", "recurrences": 0})
+                event(
+                    conn,
+                    t,
+                    "blocked",
+                    actor,
+                    {"kind": "capability", "recurrences": 0, "from": source},
+                )
                 return None
             _cas(conn, task_id, [source], status="running", started_at=t["started_at"] or now())
             n = conn.execute(
@@ -1953,7 +1972,7 @@ def owner_builder(conn: sqlite3.Connection, t: Row) -> str:
         raise Refused(f"card {t['id']} is {t['status']}; request-review needs it blocked")
     if t["assignee"] in BUILDERS:
         return str(t["assignee"])
-    if last_run_kind(conn, t["id"]) == "review" and t["implementer"] in BUILDERS:
+    if blocked_in_review(conn, t["id"]) and t["implementer"] in BUILDERS:
         return str(t["implementer"])
     raise Refused(
         f"card {t['id']} has no smith or designer to review; "
@@ -1996,7 +2015,7 @@ def request_changes_owner(
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
         t = get_task(conn, task_id)
-        if t["status"] != "blocked" or last_run_kind(conn, task_id) != "review":
+        if t["status"] != "blocked" or not blocked_in_review(conn, task_id):
             raise Refused(
                 f"card {task_id} is {t['status']}; request-changes needs a card blocked in a review run"
             )
