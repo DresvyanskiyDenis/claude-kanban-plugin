@@ -55,6 +55,9 @@ export class Transcript {
         this.onFollow(false);
       }
     });
+    // Follow also holds when the box itself resizes (a toolbar row wrapping, a rotated phone), not only on new lines.
+    this.resize = new ResizeObserver(() => this.toBottom());
+    this.resize.observe(this.el);
   }
 
   async load() {
@@ -115,6 +118,7 @@ export class Transcript {
   destroy() {
     this.dead = true;
     clearTimeout(this.timer);
+    this.resize.disconnect();
   }
 
   async earlier() {

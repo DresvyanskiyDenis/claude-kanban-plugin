@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `kanban web`: a followed transcript ended up to 42 px short of its last lines when the run finished on a narrow screen, because the longer "(completed)" label wrapped the logs toolbar onto a second row and nothing scrolled again. Follow now also re-pins when the log box resizes (toolbar wrap, window resize, rotated phone) and still leaves a paused view where it is.
+
 ## 0.4.0.dev1
 
 Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup/scripts/bootstrap.sh`) so the daemon and the CLI move together. The first command of this version migrates the database to schema 7, after a backup, and a 0.3.0 daemon then refuses it (`database schema 7 is newer than this kanban`). Then run `kanban stats --backfill` once to measure the runs that finished before the upgrade.
