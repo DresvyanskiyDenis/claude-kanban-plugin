@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- Designer: checks pages in Chromium and in WebKit, and tests that every dialog opens, closes, cancels and stays open on a click inside. When the `playwright` MCP tools are missing it writes a short Playwright script under `uv run --no-project --with playwright` instead, after installing the browsers that match that version.
+- `kanban doctor` check 22 warns when a board's repo turns off `playwright` in the account's `.claude.json` (`projects[<repo>].disabledMcpServers`). Claude applies that list to the card worktrees inside the repo, even to the server the designer brings with it, so the designer had no browser on such a repo.
+- Warden: `kanban request-changes` on a card with no builder, a PR reviewed on its own, now blocks the card `needs_input` with a `CHANGES REQUESTED:` reason for the owner instead of being refused. Wardens had worked around the refusal with a hand-written block.
+
 ### Fixed
 
 - `kanban web`: a followed transcript ended up to 42 px short of its last lines when the run finished on a narrow screen, because the longer "(completed)" label wrapped the logs toolbar onto a second row and nothing scrolled again. Follow now also re-pins when the log box resizes (toolbar wrap, window resize, rotated phone) and still leaves a paused view where it is.

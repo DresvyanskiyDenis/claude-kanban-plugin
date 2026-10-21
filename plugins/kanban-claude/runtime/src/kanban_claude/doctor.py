@@ -106,6 +106,11 @@ def config_dirs(c: Ctx) -> dict[str, list[str]]:
     return found
 
 
+def claude_in(d: str) -> str:
+    """What the owner types to start Claude on the account in config directory `d`."""
+    return runner.login_command(runner.with_config_dir({}, d)).removesuffix(" /login")
+
+
 def describe(d: str, boards: list[str]) -> str:
     return f"{d} (board {', '.join(boards)})" if boards else d
 
@@ -223,11 +228,7 @@ def plugin_enabled(c: Ctx) -> Result:
             enabled = {}
         if not (isinstance(enabled, dict) and enabled.get(PLUGIN_KEY) is True):
             problems.append(f"{describe(d, boards)}: {PLUGIN_KEY} is not enabled at user scope")
-            prefix = runner.login_command(runner.with_config_dir({}, d)).split(" claude")[0]
-            fixes.append(
-                f"{prefix + ' ' if prefix != 'claude /login' else ''}claude, then "
-                f"{install.PLUGIN_INSTALL}"
-            )
+            fixes.append(f"{claude_in(d)}, then {install.PLUGIN_INSTALL}")
             continue
         if c.probe:
             env = install.probe_env(c.stamp.get("env") or {}, d)
@@ -518,6 +519,34 @@ def github_pairing(c: Ctx) -> Result:
         return warn(f"sync paused on {why}", "kanban github sync")
     probed = ", the repository and project read" if c.probe else ""
     return ok(f"{', '.join(b['slug'] for b in boards)}: gh logged in to {', '.join(hosts)}{probed}")
+
+
+# --- 22: the roles' own MCP servers ---------------------------------------------------------
+
+
+@check(22, "designer's browser MCP")
+def designer_mcp(c: Ctx) -> Result:
+    """Claude applies a repo's `disabledMcpServers` to the card worktrees inside it, even to the
+    servers a role brings in `mcp/<role>.json`."""
+    if "designer" not in store.active_roles(c.conn):
+        return ok("designer is not dispatched")
+    names = runner.json_section(runner.MCP_DIR / "designer.json", "mcpServers")
+    repos, found, fixes = protection.repos(c.conn), [], []
+    for d, boards in config_dirs(c).items():
+        projects = runner.json_section(runner.account_json(d), "projects")
+        for board in boards:
+            for top in repos.get(board, {}).values():
+                project = projects.get(str(top))
+                disabled = project.get("disabledMcpServers") if isinstance(project, dict) else None
+                if off := [n for n in names if isinstance(disabled, list) and n in disabled]:
+                    found.append(f"{board}: {top} turns off {', '.join(off)}")
+                    fixes.append(
+                        f"cd {top} && {claude_in(d)}, then /mcp and enable {', '.join(off)}"
+                    )
+    if found:
+        why = "; ".join(found)
+        return warn(f"{why}, so designer checks pages with a Playwright script", "; ".join(fixes))
+    return ok(f"no board's repo turns off {', '.join(names)}")
 
 
 # --- running them, and --fix ----------------------------------------------------------------

@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import __version__, github, install, jira, launchd, paths, store, views
+from kanban_claude import __version__, github, gitops, install, jira, launchd, paths, store, views
 
 from .conftest import PLUGIN, Kb, enable
 from .fake_gh import Fake as GhFake
@@ -51,10 +51,10 @@ def edit_stamp(**fields: Any) -> None:
     install.write_stamp({**stamp, **fields})
 
 
-def test_a_healthy_install_passes_all_twenty_one_checks(doctor: Doctor) -> None:
+def test_a_healthy_install_passes_all_twenty_two_checks(doctor: Doctor) -> None:
     report = doctor()
-    assert [c["n"] for c in report["checks"]] == list(range(1, 22))
-    assert [c["status"] for c in report["checks"]] == ["ok"] * 21, report["checks"]
+    assert [c["n"] for c in report["checks"]] == list(range(1, 23))
+    assert [c["status"] for c in report["checks"]] == ["ok"] * 22, report["checks"]
     assert report["ok"] and report["code"] == 0 and report["fixed"] == []
 
 
@@ -123,7 +123,7 @@ def test_a_config_row_for_the_removed_web_port_does_not_trip_the_doctor(
     doctor: Doctor, conn: Any
 ) -> None:
     store.config_put(conn, "web.port", 9129)
-    assert [c["status"] for c in doctor()["checks"]] == ["ok"] * 21
+    assert [c["status"] for c in doctor()["checks"]] == ["ok"] * 22
 
 
 def test_a_released_daemon_lock_fails_check_2(doctor: Doctor, daemon_up: int) -> None:
@@ -565,3 +565,23 @@ def test_a_paused_github_sync_warns_with_its_reason(
     check = got(doctor(), 21)
     assert check["status"] == "warn" and "main: " in check["detail"] and "401" in check["detail"]
     assert check["fix"] == "kanban github sync"
+
+
+def test_a_board_repo_that_turns_off_the_designer_browser_warns_check_22(
+    doctor: Doctor, used: Path, conn: Any
+) -> None:
+    top = str(gitops.toplevel(str(used)))
+    off = {"projects": {top: {"disabledMcpServers": ["atlassian", "playwright"]}}}
+    (Path.home() / ".claude.json").write_text(json.dumps(off))
+    report = doctor()
+    check = got(report, 22)
+    assert check["status"] == "warn" and f"main: {top} turns off playwright" in check["detail"]
+    assert check["fix"] == f"cd {top} && claude, then /mcp and enable playwright"
+    assert report["code"] == 0
+    store.config_set(conn, "dispatch.roles", ["smith", "warden"])
+    assert got(doctor(), 22) == {
+        **check,
+        "status": "ok",
+        "detail": "designer is not dispatched",
+        "fix": None,
+    }

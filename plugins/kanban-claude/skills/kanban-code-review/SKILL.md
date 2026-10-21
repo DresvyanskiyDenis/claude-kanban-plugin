@@ -73,5 +73,5 @@ First compare `git status --porcelain` with the count pre-flight printed. If it 
 Then exactly one of:
 
 - No open `blocker` or `major`, CI green on the head, gate verified: `kanban complete $KANBAN_TASK --summary "WARDEN: APPROVED PR #<n> @ <head sha> ..."`. After the sha you may add `PARTIAL REVIEW` with its file list, minors, unverified concerns and unverifiable contract items. The marker `WARDEN: APPROVED PR #<n> @ <sha>` must be exact: the board refuses an approval without it. A `PARTIAL REVIEW` approval goes to the owner to merge: the daemon never auto-merges it and emits `awaiting_owner_merge`, so say in the summary what was left unread.
-- Otherwise: post the ledger, then `kanban request-changes $KANBAN_TASK --reason "<the required changes, by finding ID>"`.
+- Otherwise: post the ledger, then `kanban request-changes $KANBAN_TASK --reason "<the required changes, by finding ID>"`. On a card with no builder, a PR reviewed on its own, the same call blocks the card for the owner to pass on.
 - Something only the owner can settle, or a finding stuck for two rounds: `kanban block $KANBAN_TASK --kind needs_input --reason "<what and why>"`.

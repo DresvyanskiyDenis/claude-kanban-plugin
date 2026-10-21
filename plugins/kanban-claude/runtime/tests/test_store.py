@@ -214,6 +214,23 @@ def test_s1_worker_path_review_and_changes(conn: Any, card: Card) -> None:
     assert "changes_requested" in kinds(conn, tid)
 
 
+def test_warden_work_run_request_changes_blocks_for_the_owner(conn: Any, card: Card) -> None:
+    tid = card(assignee="warden")
+    run = claim_run(conn, tid)
+    assert store.request_changes(conn, run, "fix W1") == {"id": tid, "status": "blocked"}
+    t = row(conn, tid)
+    assert (t["status"], t["block_kind"], t["assignee"]) == ("blocked", "needs_input", "warden")
+    comments = [r["body"] for r in conn.execute("SELECT body FROM task_comments")]
+    assert comments == ["BLOCKED: CHANGES REQUESTED: fix W1"]
+    assert store.request_changes(conn, run, "fix W1") == {"noop": True}
+
+
+def test_builder_work_run_request_changes_is_refused(conn: Any, card: Card) -> None:
+    run = claim_run(conn, card())
+    with pytest.raises(Refused, match="review runs"):
+        store.request_changes(conn, run, "nope")
+
+
 def test_s1_review_approval_complete(conn: Any, card: Card) -> None:
     tid = reach(conn, card, "review")
     run2 = claim_run(conn, tid)

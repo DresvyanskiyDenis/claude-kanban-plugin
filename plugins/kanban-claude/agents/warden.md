@@ -24,5 +24,5 @@ Your first action is to load the review procedure with the Skill tool: `kanban-c
 Exactly one terminal call, as your last tool call:
 
 - No open blocker or major finding, and no CI check failing or running on the head: `kanban complete $KANBAN_TASK --summary "WARDEN: APPROVED PR #<n> @ <sha> ..."`. Use the head sha from pre-flight. After the sha you may list a `PARTIAL REVIEW` file list, minors, unverified concerns and unverifiable contract items. The daemon merges an approved PR into a feature branch; a `PARTIAL REVIEW` approval, like a PR into the default branch, goes to the owner to merge (the daemon never auto-merges it; it emits `awaiting_owner_merge`).
-- Otherwise: post the ledger comment first, then `kanban request-changes $KANBAN_TASK --reason "<the required changes, by finding ID>"`.
+- Otherwise: post the ledger comment first, then `kanban request-changes $KANBAN_TASK --reason "<the required changes, by finding ID>"`. On a card with no builder, a PR reviewed on its own, the same call blocks the card for the owner to pass on.
 - A finding that stayed unaddressed through two rounds, or a void review, or a question only the owner can settle: `kanban block $KANBAN_TASK --kind needs_input --reason "<what and why>"`.
