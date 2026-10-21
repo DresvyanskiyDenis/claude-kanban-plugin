@@ -172,17 +172,22 @@ def settings_json(
     )
 
 
+def account_json(config_dir: str) -> Path:
+    """The account's `.claude.json`: beside Claude's own default directory, else inside the directory."""
+    base, home = Path(config_dir).expanduser(), Path.home()
+    return (
+        home / ".claude.json"
+        if base.resolve() == (home / ".claude").resolve()
+        else base / ".claude.json"
+    )
+
+
 def mcp_config(
     conn: sqlite3.Connection, role: str, workspace: Path, config_dir: str
 ) -> dict[str, Any]:
     """P2-1 step 2, for `--strict-mcp-config`: the role's own servers plus the allowlisted ones,
     copied from the account's `.claude.json` (user scope), else from the repo's `.mcp.json`."""
-    base = Path(config_dir).expanduser()
-    home = Path.home()
-    user = json_section(
-        home / ".claude.json" if base.resolve() == (home / ".claude").resolve() else base / ".claude.json",
-        "mcpServers",
-    )  # fmt: skip
+    user = json_section(account_json(config_dir), "mcpServers")
     # a repo's .mcp.json is untrusted: it supplies only a name the account does not define
     known = {**json_section(workspace / ".mcp.json", "mcpServers"), **user}
     # a role's own server is its alone, and such a role gets nothing else
