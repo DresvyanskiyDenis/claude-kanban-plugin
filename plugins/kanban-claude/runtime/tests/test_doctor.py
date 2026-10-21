@@ -365,16 +365,20 @@ def test_a_ca_variable_in_the_shell_but_not_in_the_plist_warns(
 def test_a_plist_path_that_lost_a_tool_fails_check_13_and_a_lost_npx_only_warns(
     doctor: Doctor, env: Path
 ) -> None:
-    edit_plist(lambda p: p["EnvironmentVariables"].update(PATH="/usr/bin:/bin"))
+    # PATHs of the test's own: a CI runner's /usr/bin can hold gh, node or npx
+    (env / "empty").mkdir()
+    edit_plist(lambda p: p["EnvironmentVariables"].update(PATH=str(env / "empty")))
     check = got(doctor(), 13)
     assert check["status"] == "fail"
     assert all(t in check["detail"] for t in ("gh", "uv", "claude"))
 
-    system = "/usr/bin:/bin"
     (env / "slim").mkdir()
     for tool in ("gh", "uv", "claude"):
         shutil.copy(env / "bin" / tool, env / "slim" / tool)
-    edit_plist(lambda p: p["EnvironmentVariables"].update(PATH=f"{env / 'slim'}:{system}"))
+    git = shutil.which("git")
+    assert git
+    (env / "slim" / "git").symlink_to(git)
+    edit_plist(lambda p: p["EnvironmentVariables"].update(PATH=str(env / "slim")))
     check = got(doctor(), 13)
     assert check["status"] == "warn" and "npx" in check["detail"]
 
