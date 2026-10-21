@@ -152,6 +152,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "KANBAN_BOARD",
         "KANBAN_TASK",
         "CLAUDE_CONFIG_DIR",
+        "GH_HOST",
         *launchd.CAPTURED,
     ):
         monkeypatch.delenv(var, raising=False)
