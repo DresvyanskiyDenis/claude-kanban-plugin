@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.0.dev2
+
+Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup/scripts/bootstrap.sh`) so the daemon and the CLI move together. The schema stays at 7. Then run `kanban doctor`: check 22 names each board repo that turns off the designer's browser, with the command to turn it back on.
 
 ### Changed
 
