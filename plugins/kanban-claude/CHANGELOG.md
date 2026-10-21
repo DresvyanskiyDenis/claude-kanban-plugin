@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Warden: `kanban request-changes` on a card with no builder, a PR reviewed on its own, now blocks the card `needs_input` with a `CHANGES REQUESTED:` reason for the owner instead of being refused. Wardens had worked around the refusal with a hand-written block.
+
 ### Fixed
 
 - `kanban web`: a followed transcript ended up to 42 px short of its last lines when the run finished on a narrow screen, because the longer "(completed)" label wrapped the logs toolbar onto a second row and nothing scrolled again. Follow now also re-pins when the log box resizes (toolbar wrap, window resize, rotated phone) and still leaves a paused view where it is.

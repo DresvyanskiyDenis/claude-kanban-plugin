@@ -2149,6 +2149,10 @@ def request_review(
 def request_changes(conn: sqlite3.Connection, run_id: int, reason: str) -> dict[str, Any]:
     reason = _need(reason, "reason", "pass --reason")
     with tx(conn):
+        run = conn.execute("SELECT kind, role FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        if run and run["kind"] == "work" and run["role"] == cfg(conn, "dispatch.reviewer"):
+            # A standalone review card has no builder to send back to, so the owner relays the verdict.
+            return block(conn, run_id, "needs_input", f"CHANGES REQUESTED: {reason}")
         found = _verb_run(conn, run_id, "request-changes")
         if found is None:
             return {"noop": True}
