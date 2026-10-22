@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import cli, daemon, install, launchd, paths, store
+from kanban_claude import cli, daemon, install, paths, service, store
 from kanban_claude.procs import Procs
 
 from .fake_gh import Fake as GhFake
@@ -116,6 +116,56 @@ else:
     fail(64, "fake launchctl: unexpected " + " ".join(args))
 """
 
+SYSTEMCTL_SCRIPT = """#!__PYTHON__
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["SYSTEMCTL_FAKE_LOG"], "a") as f:
+    f.write(json.dumps(args) + "\\n")
+state_path = os.environ["SYSTEMCTL_FAKE_STATE"]
+loaded = os.path.exists(state_path) and bool(open(state_path).read())
+unit = "kanban-claude.daemon.service"
+unit_file = os.path.join(os.environ["HOME"], ".config", "systemd", "user", unit)
+
+
+def fail(code, message):
+    sys.stderr.write(message + "\\n")
+    sys.exit(code)
+
+
+def put(value):
+    with open(state_path, "w") as f:
+        f.write(value)
+
+
+if args[:1] != ["--user"]:
+    fail(64, "fake systemctl: the daemon is a user unit")
+args = args[1:]
+if args == ["is-enabled", unit]:
+    print("enabled" if loaded else "disabled")
+    sys.exit(0 if loaded else 1)
+elif args == ["daemon-reload"]:
+    pass
+elif args == ["enable", "--now", unit]:
+    if not os.path.exists(unit_file):
+        fail(1, f"Failed to enable unit: Unit file {unit} does not exist.")
+    put("1")
+elif args == ["disable", "--now", unit]:
+    put("")
+elif args == ["restart", unit]:
+    if not loaded:
+        fail(5, f"Failed to restart {unit}: Unit {unit} not found.")
+else:
+    fail(64, "fake systemctl: unexpected " + " ".join(args))
+"""
+
+LOGINCTL_SCRIPT = """#!__PYTHON__
+import os, sys
+if sys.argv[1] == "show-user":
+    print("Linger=" + os.environ.get("LOGINCTL_FAKE_LINGER", "yes"))
+else:
+    sys.exit(64)
+"""
+
 UV_SCRIPT = """#!__PYTHON__
 import json, os, sys
 args = sys.argv[1:]
@@ -153,7 +203,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "KANBAN_TASK",
         "CLAUDE_CONFIG_DIR",
         "GH_HOST",
-        *launchd.CAPTURED,
+        *service.CAPTURED,
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
@@ -165,6 +215,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     bindir.mkdir()
     install_fake(bindir / "gh", GH_SCRIPT)
     install_fake(bindir / "launchctl", LAUNCHCTL_SCRIPT)
+    install_fake(bindir / "systemctl", SYSTEMCTL_SCRIPT)
+    install_fake(bindir / "loginctl", LOGINCTL_SCRIPT)
     install_fake(bindir / "uv", UV_SCRIPT)
     install_fake(bindir / "claude", NO_CLAUDE_SCRIPT)
     # the fakes stand in for the Mac, so setup's macOS check passes on a Linux CI runner too
@@ -172,6 +224,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("LAUNCHCTL_FAKE_LOG", str(tmp_path / "launchctl.log"))
     monkeypatch.setenv("LAUNCHCTL_FAKE_STATE", str(tmp_path / "launchctl.state"))
+    monkeypatch.setenv("SYSTEMCTL_FAKE_LOG", str(tmp_path / "systemctl.log"))
+    monkeypatch.setenv("SYSTEMCTL_FAKE_STATE", str(tmp_path / "systemctl.state"))
     monkeypatch.setenv("UV_FAKE_LOG", str(tmp_path / "uv.log"))
     monkeypatch.setenv("UV_FAKE_BIN", str(user / ".local" / "bin"))
     monkeypatch.setenv("GH_FAKE_LOG", str(tmp_path / "gh.log"))
@@ -204,6 +258,11 @@ def launchctl_calls(env: Path) -> Calls:
 
 
 @pytest.fixture
+def systemctl_calls(env: Path) -> Calls:
+    return Calls(env / "systemctl.log")
+
+
+@pytest.fixture
 def uv_calls(env: Path) -> Calls:
     return Calls(env / "uv.log")
 
@@ -213,6 +272,14 @@ def agent_loaded(env: Path) -> Callable[[], bool]:
     """Whether the fake launchd currently holds `kanban-claude.daemon`."""
     return lambda: (
         (env / "launchctl.state").exists() and bool((env / "launchctl.state").read_text())
+    )
+
+
+@pytest.fixture
+def unit_enabled(env: Path) -> Callable[[], bool]:
+    """Whether the fake systemd currently has `kanban-claude.daemon.service` enabled."""
+    return lambda: (
+        (env / "systemctl.state").exists() and bool((env / "systemctl.state").read_text())
     )
 
 

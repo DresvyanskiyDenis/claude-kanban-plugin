@@ -2,44 +2,19 @@
 
 import os
 import plistlib
-import re
 import subprocess
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from .errors import Error
 from .paths import write_private
+from .service import LABEL, mask
 
-LABEL = "kanban-claude.daemon"
-CAPTURED = (
-    "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
-    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy", "LANG",
-)  # fmt: skip
-SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
-SECRET_NAME = re.compile("TOKEN|KEY|SECRET|PASSWORD|AUTH", re.IGNORECASE)
-USERINFO = re.compile(r"(://)[^/@\s]*@")
+NOUN = "LaunchAgent"
+FILE = "plist"
 BOOTOUT_WAIT_S = 10.0
-
-
-def mask(text: str) -> str:
-    """A proxy URL's `user:pass@` is kept in the plist, because the proxy needs it, and never logged."""
-    return USERINFO.sub(r"\1***@", text)
-
-
-def capture_env(
-    shell: Mapping[str, str], passthrough: Iterable[str], tool_dirs: Iterable[str]
-) -> dict[str, str]:
-    """INS-05 step 3 under SEC-09: the fixed names, plus any the owner lists in
-    `worker.env_passthrough`, minus every name that looks like a credential unless listed."""
-    listed = set(passthrough)
-    path = [*dict.fromkeys(tool_dirs), *SYSTEM_PATH]
-    env = {"PATH": os.pathsep.join(dict.fromkeys(path))}
-    for name in (*CAPTURED, *listed):
-        if name in shell and (name in listed or not SECRET_NAME.search(name)):
-            env[name] = shell[name]
-    return env
 
 
 def render(kanban: str, env: Mapping[str, str], home: Path, work: Path) -> bytes:
@@ -80,6 +55,19 @@ def read_plist() -> dict[str, Any] | None:
     except (OSError, plistlib.InvalidFileException, ValueError):
         return None
     return data if isinstance(data, dict) else None
+
+
+definition_path = plist_path
+
+
+def read_env() -> dict[str, str] | None:
+    plist = read_plist()
+    return None if plist is None else dict(plist.get("EnvironmentVariables") or {})
+
+
+def read_entry() -> str | None:
+    plist = read_plist()
+    return None if plist is None else (plist.get("ProgramArguments") or [""])[0]
 
 
 def target() -> str:

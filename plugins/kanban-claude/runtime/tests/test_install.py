@@ -1,10 +1,14 @@
 """TST-I: what a teammate's install has to get right, apart from setup itself (test_setup.py)."""
 
+import shutil
 import stat
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from kanban_claude import install
+from kanban_claude.errors import Error
 
 from .conftest import Calls
 
@@ -108,3 +112,28 @@ def test_the_shipped_files_name_no_absolute_user_path() -> None:
     assert shipped
     home_prefix = "/".join(["", "Users", ""])  # spelled out in pieces so this file is not a hit
     assert [str(p) for p in shipped if home_prefix in p.read_text(errors="replace")] == []
+
+
+def test_check_host_accepts_macos_and_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    for platform in ("darwin", "linux"):
+        monkeypatch.setattr(install.sys, "platform", platform)
+        install.check_host()
+
+
+def test_check_host_refuses_a_platform_with_no_service_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(install.sys, "platform", "win32")
+    with pytest.raises(Error, match="macOS and Linux only"):
+        install.check_host()
+
+
+def test_check_host_on_linux_without_systemctl_names_no_daemon_as_the_way_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = shutil.which
+    monkeypatch.setattr(install.sys, "platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda cmd: None if cmd == "systemctl" else real(cmd))
+    with pytest.raises(Error, match="--no-daemon"):
+        install.check_host()
+    install.check_host(no_daemon=True)

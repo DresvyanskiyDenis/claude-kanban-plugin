@@ -20,9 +20,9 @@ from . import (
     github,
     install,
     jira,
-    launchd,
     protection,
     runner,
+    service,
     store,
     views,
 )
@@ -91,11 +91,6 @@ def claude_path(c: Ctx) -> str:
     return str(found)
 
 
-def plist_env() -> dict[str, str] | None:
-    plist = launchd.read_plist()
-    return None if plist is None else dict(plist.get("EnvironmentVariables") or {})
-
-
 def config_dirs(c: Ctx) -> dict[str, list[str]]:
     """Every Claude config directory in use, with the boards that name it (none: the global one)."""
     glob = c.stamp.get("claude_config_dir") or store.cfg(c.conn, "claude.config_dir")
@@ -118,11 +113,12 @@ def describe(d: str, boards: list[str]) -> str:
 # --- 1-3: the daemon ------------------------------------------------------------------------
 
 
-@check(1, "LaunchAgent loaded")
+@check(1, "daemon service loaded")
 def launchagent(c: Ctx) -> Result:
-    if launchd.loaded():
-        return ok(launchd.target())
-    return fail(f"{launchd.LABEL} is not loaded in launchd", FIX, "agent")
+    svc = service.backend()
+    if svc.loaded():
+        return ok(svc.target())
+    return fail(f"{service.LABEL} is not loaded as a {svc.NOUN}", FIX, "agent")
 
 
 @check(2, "daemon holds its lock")
@@ -284,23 +280,26 @@ def uv(c: Ctx) -> Result:
 
 @check(12, "CA variables reach the daemon")
 def ca_variables(c: Ctx) -> Result:
-    env = plist_env()
+    svc = service.backend()
+    env = svc.read_env()
     if env is None:
-        return Result("skip", "no LaunchAgent plist to compare with")
+        return Result("skip", f"no {svc.NOUN} {svc.FILE} to compare with")
     lost = [v for v in CA_VARS if v in os.environ and v not in env]
     if lost:
-        return warn(f"{', '.join(lost)} set in this shell but not in the plist", f"rerun {SETUP}")
-    return ok("every CA variable of this shell is in the plist")
+        return warn(
+            f"{', '.join(lost)} set in this shell but not in the {svc.FILE}", f"rerun {SETUP}"
+        )
+    return ok(f"every CA variable of this shell is in the {svc.FILE}")
 
 
-@check(13, "plist PATH resolves the tools")
+@check(13, "service PATH resolves the tools")
 def plist_tools(c: Ctx) -> Result:
-    plist, env = launchd.read_plist(), plist_env()
-    if plist is None or env is None:
-        return Result("skip", "no LaunchAgent plist to read")
+    svc = service.backend()
+    entry, env = svc.read_entry(), svc.read_env()
+    if entry is None or env is None:
+        return Result("skip", f"no {svc.NOUN} {svc.FILE} to read")
     path = env.get("PATH", "")
     lost = [t for t in ("claude", "gh", "git", "uv") if not shutil.which(t, path=path)]
-    entry = (plist.get("ProgramArguments") or [""])[0]
     if not os.access(entry, os.X_OK):
         lost.append(f"kanban ({entry})")
     if lost:
@@ -376,7 +375,7 @@ def mode_problems() -> list[tuple[Path, int, int]]:
         (p, 0o600)
         for p in (
             home / "kanban.db", home / "kanban.db-wal", home / "kanban.db-shm",
-            install.stamp_path(), launchd.plist_path(),
+            install.stamp_path(), service.backend().definition_path(),
             *sorted(p for p in (home / "logs").rglob("*") if p.is_file()),
         )
     ]  # fmt: skip
@@ -393,7 +392,7 @@ def mode_problems() -> list[tuple[Path, int, int]]:
 def modes(c: Ctx) -> Result:
     wrong = mode_problems()
     if not wrong:
-        return ok("directories 0700; database, stamp, logs and plist 0600")
+        return ok("directories 0700; database, stamp, logs and the service file 0600")
     return fail("; ".join(f"{p} is {h:04o}, want {w:04o}" for p, h, w in wrong), FIX, "modes")
 
 
@@ -568,20 +567,21 @@ def evaluate(c: Ctx) -> list[tuple[int, str, Result]]:
 
 def restore_agent(c: Ctx) -> str:
     d = dirs()
-    plist = launchd.plist_path()
-    if plist.exists():
-        launchd.bootstrap(plist)
+    svc = service.backend()
+    definition = svc.definition_path()
+    if definition.exists():
+        svc.bootstrap(definition)
     elif c.stamp.get("env"):
-        plist = launchd.load(install.kanban_entry(), c.stamp["env"], d.home, d.work)
+        definition = svc.load(install.kanban_entry(), c.stamp["env"], d.home, d.work)
     else:
-        raise Error(f"the plist is gone and installed.json cannot rebuild it; run {SETUP}")
+        raise Error(f"the {svc.FILE} is gone and installed.json cannot rebuild it; run {SETUP}")
     with contextlib.suppress(Error):
         install.wait_for_daemon()
-    return f"loaded {launchd.LABEL} from {plist}"
+    return f"loaded {service.LABEL} from {definition}"
 
 
 def repair(c: Ctx, results: list[tuple[int, str, Result]]) -> tuple[list[str], list[str]]:
-    """Only what is safe: file modes, a missing LaunchAgent, the STO-06 mismatch through reconcile."""
+    """Only what is safe: file modes, a service that is not loaded, the STO-06 mismatch through reconcile."""
     wanted = {r.auto for _, _, r in results if r.status != "ok" and r.auto}
     fixed: list[str] = []
     unfixed: list[str] = []

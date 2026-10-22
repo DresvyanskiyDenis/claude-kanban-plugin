@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import fcntl
+import getpass
 import json
 import logging
 import logging.handlers
@@ -18,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from . import __version__, classify, daemon, gitops, launchd, runner, store
+from . import __version__, classify, daemon, gitops, runner, service, store, systemd
 from .errors import Error, Refused, Usage
 from .paths import add_file_log, dirs, ensure_dir, write_private
 from .procs import Procs
@@ -44,7 +45,7 @@ log = logging.getLogger("kanban.install")
 
 def say(message: str) -> None:
     """Progress goes to stderr and to `logs/upgrade.log`, with any proxy password masked."""
-    message = launchd.mask(message)
+    message = service.mask(message)
     print(message, file=sys.stderr)
     log.info(message)
 
@@ -104,9 +105,14 @@ def upgrade_log(home: Path) -> Iterator[None]:
 # --- preflight (INS-05 step 1) --------------------------------------------------------------
 
 
-def check_host() -> None:
-    if sys.platform != "darwin":
-        raise Error("kanban-claude runs on macOS only (it needs launchd); setup stopped")
+def check_host(no_daemon: bool = False) -> None:
+    if sys.platform not in ("darwin", "linux"):
+        raise Error("kanban-claude runs on macOS and Linux only; setup stopped")
+    if sys.platform == "linux" and not no_daemon and not shutil.which("systemctl"):
+        raise Error(
+            "systemctl is not on PATH, so there is no systemd to run the daemon; "
+            "rerun setup with --no-daemon and start it yourself with: kanban daemon"
+        )
     for tool, fix in TOOL_FIX.items():
         if not shutil.which(tool):
             raise Error(f"{tool} is not on PATH; install it with: {fix}")
@@ -334,7 +340,7 @@ def kanban_entry() -> str:
 
 
 def setup(a: argparse.Namespace) -> tuple[dict[str, Any], str]:
-    check_host()
+    check_host(a.no_daemon)
     d = dirs()
     ensure_dir(d.home)
     ensure_dir(d.work)
@@ -363,7 +369,7 @@ def run_setup(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str
         if before < now and not (a.claude_bin or a.claude_config_dir):
             return upgrade(a, conn, old)
     config_dir = config_dir_for(a, conn)
-    captured = launchd.capture_env(
+    captured = service.capture_env(
         os.environ, store.cfg(conn, "worker.env_passthrough"), tool_dirs(claude)
     )
     say("captured environment: " + " ".join(captured))
@@ -385,8 +391,14 @@ def run_setup(a: argparse.Namespace, conn: sqlite3.Connection) -> tuple[dict[str
     if not a.no_daemon:
         entry = kanban_entry()
         ensure_dir(d.home / "logs")
-        plist = launchd.load(entry, captured, d.home, d.work)
-        say(f"LaunchAgent {launchd.LABEL} loaded from {plist}")
+        svc = service.backend()
+        definition = svc.load(entry, captured, d.home, d.work)
+        say(f"{svc.NOUN} {service.LABEL} loaded from {definition}")
+        if not service.darwin() and systemd.linger_off(user := getpass.getuser()):
+            say(
+                f"warning: {user} is not lingering, so the daemon stops at logout; "
+                f"fix it with: loginctl enable-linger {user}"
+            )
     stamp(
         {
             "version": __version__,
@@ -422,7 +434,7 @@ def upgrade(
     say(f"upgrading {old['version']} -> {__version__}")
     say(f"database schema is {conn.execute('PRAGMA user_version').fetchone()[0]}")
     if not a.no_daemon:
-        launchd.restart()
+        service.backend().restart()
         wait_for_daemon(__version__)
         say("the daemon runs the new code")
     stamp({k: v for k, v in old.items() if k != "setup_at"} | {"version": __version__})
@@ -510,8 +522,9 @@ def uninstall(a: argparse.Namespace) -> tuple[dict[str, Any], str]:
                 f"{len(active)} run(s) are active (run {', '.join(str(r['id']) for r in active)}); "
                 "wait for them, or stop them with: kanban uninstall --force"
             )
-        launchd.bootout()
-        launchd.plist_path().unlink(missing_ok=True)
+        svc = service.backend()
+        svc.bootout()
+        svc.definition_path().unlink(missing_ok=True)
         if conn:
             runners = []
             for r in active:
