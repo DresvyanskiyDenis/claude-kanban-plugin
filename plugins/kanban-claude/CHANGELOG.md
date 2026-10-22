@@ -4,6 +4,10 @@
 
 Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup/scripts/bootstrap.sh`) so the daemon and the CLI move together. The schema stays at 7. Then run `kanban doctor`: check 22 names each board repo that turns off the designer's browser, with the command to turn it back on.
 
+### Added
+
+- Linux support. Setup, upgrade, `kanban doctor --fix` and `kanban uninstall` now run on Linux with a systemd user unit, `~/.config/systemd/user/kanban-claude.daemon.service` (0600, one `Environment=` line per variable the LaunchAgent carries, `Restart=on-failure`, `KillMode=process` so a restart leaves the detached runners alone, as `AbandonProcessGroup` does on macOS), driven by `systemctl --user`. Setup needs `systemctl` on Linux and says to pass `--no-daemon` when it is missing, and warns with `loginctl enable-linger <user>` when lingering is off, because the unit would stop at logout. `launchd.py` stays for macOS; `service.py` picks the backend, and doctor checks 1, 12, 13 and 17 name the LaunchAgent or the unit by platform.
+
 ### Changed
 
 - Designer: checks pages in Chromium and in WebKit, and tests that every dialog opens, closes, cancels and stays open on a click inside. When the `playwright` MCP tools are missing it writes a short Playwright script under `uv run --no-project --with playwright` instead, after installing the browsers that match that version.
@@ -12,6 +16,8 @@ Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup
 
 ### Fixed
 
+- Every worker crashed at claim (`exit -`, `0 turns`) when this process's `LC_TIME` was not English and the daemon's environment had no `LANG` (the common `LANG=en_US.UTF-8` with `LC_TIME=de_DE.UTF-8`): `start_time()` ran `ps` in the C locale but parsed its date with `strptime` in the daemon's own locale. On Linux it now reads `/proc/<pid>/stat` and the boot time from `/proc/stat`, with no subprocess and no locale; on macOS it keeps `ps` and reads the English date by hand.
+- `boot_time()` returned 0 on Linux (`sysctl kern.boottime` is macOS only), so a run left `running` by a reboot was never reclaimed. It reads `btime` from `/proc/stat` there.
 - `kanban web`: a followed transcript ended up to 42 px short of its last lines when the run finished on a narrow screen, because the longer "(completed)" label wrapped the logs toolbar onto a second row and nothing scrolled again. Follow now also re-pins when the log box resizes (toolbar wrap, window resize, rotated phone) and still leaves a paused view where it is.
 
 ## 0.4.0.dev1
