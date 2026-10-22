@@ -1,5 +1,7 @@
 """Process facts (DSP-02, RUN-08): liveness is pid plus start time; unknown is never dead."""
 
+import locale
+import os
 import subprocess
 import sys
 import time
@@ -127,3 +129,86 @@ def test_the_runner_is_spawned_without_the_daemons_directory_on_the_path(
     monkeypatch.setattr(procs.subprocess, "Popen", popen)
     Procs().spawn(7, tmp_path / "run.log")
     assert seen == [[sys.executable, "-P", "-m", "kanban_claude", "run", "7"]]
+
+
+@pytest.fixture
+def linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+@pytest.mark.usefixtures("linux")
+class TestProc:
+    def test_the_start_time_of_a_live_process_is_read_from_proc(
+        self, sleeper: subprocess.Popen[bytes]
+    ) -> None:
+        found = start_time(sleeper.pid)
+        assert found is not None and abs(found - time.time()) < 5
+
+    def test_a_pid_that_is_gone_has_no_start_time(self) -> None:
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        assert start_time(gone.pid) is None
+
+    def test_a_zombie_is_not_alive(self) -> None:
+        child = subprocess.Popen(["true"])
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if Path(f"/proc/{child.pid}/stat").read_text().rpartition(")")[2].split()[0] == "Z":
+                    break
+                time.sleep(0.05)
+            assert start_time(child.pid) is None
+        finally:
+            child.wait()
+
+    def test_the_boot_time_is_a_real_epoch_in_the_past(self) -> None:
+        assert 0 < procs.boot_time() < time.time()
+
+    def test_a_start_time_never_precedes_the_boot(self, sleeper: subprocess.Popen[bytes]) -> None:
+        found = start_time(sleeper.pid)
+        assert found is not None and procs.boot_time() <= found
+
+    def test_a_probe_that_cannot_read_proc_raises_instead_of_declaring_death(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        unreadable = tmp_path / "stat"
+        unreadable.write_text("1 (x) S\n")
+        real = Path.read_text
+        monkeypatch.setattr(
+            Path, "read_text", lambda p, *a, **k: real(unreadable if p.name == "stat" else p)
+        )
+        with pytest.raises(ValueError):
+            start_time(os.getpid())
+
+
+@pytest.mark.parametrize(
+    "comm", ["sleep", "my prog", "a (b) c", ") S 1 2 (", "x) R 9 8 7 (y z", "(((", "))) "]
+)
+def test_a_comm_with_spaces_and_parentheses_does_not_shift_the_fields(comm: str) -> None:
+    """Issue 13: field 22 is counted after the last `)`, whatever `comm` holds."""
+    tail = " ".join(["S", *["0"] * 18, "424242", "0", "0", "0"])  # fields 3 to 25
+    assert procs.parse_proc_stat(f"123 ({comm}) {tail}") == ("S", 424242)
+
+
+def test_a_stat_line_cut_short_is_unreadable() -> None:
+    with pytest.raises(ValueError):
+        procs.parse_proc_stat("123 (x) S 1 2 3")
+
+
+def test_the_ps_date_is_parsed_by_hand_so_a_german_lc_time_cannot_break_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    english = "Thu Oct 22 09:29:23 2026"
+    saved = locale.setlocale(locale.LC_TIME)
+    try:
+        locale.setlocale(locale.LC_TIME, "de_DE.UTF-8")
+    except locale.Error:
+        pytest.skip("no de_DE.UTF-8 locale on this machine")
+    try:
+        with pytest.raises(ValueError):
+            time.strptime(english, "%a %b %d %H:%M:%S %Y")  # what the old parse did
+        expected = int(time.mktime(time.strptime("2026-10-22 09:29:23", "%Y-%m-%d %H:%M:%S")))
+        assert procs.parse_lstart(english) == expected
+    finally:
+        locale.setlocale(locale.LC_TIME, saved)

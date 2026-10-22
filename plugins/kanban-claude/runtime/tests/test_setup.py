@@ -203,14 +203,14 @@ def test_a_missing_tool_is_named_with_its_fix(
     untouched(launchctl_calls)
 
 
-def test_setup_needs_macos_and_an_absolute_claude(
+def test_setup_needs_macos_or_linux_and_an_absolute_claude(
     setup: Setup, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     code, _, err = setup("--claude-bin", "claude")
     assert code == 1 and "absolute" in err
-    monkeypatch.setattr(install.sys, "platform", "linux")
+    monkeypatch.setattr(install.sys, "platform", "win32")
     code, _, err = setup()
-    assert code == 1 and "macOS" in err
+    assert code == 1 and "macOS and Linux" in err
 
 
 def test_a_login_failure_prints_the_login_command_and_installs_nothing(

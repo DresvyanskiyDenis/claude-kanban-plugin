@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from kanban_claude import launchd
+from kanban_claude import launchd, service
 from kanban_claude.errors import Error
 
 from .conftest import Calls
@@ -47,7 +47,7 @@ def test_the_captured_environment_never_takes_a_secret_like_name() -> None:
         "DB_PASSWORD": "p", "SSH_AUTH_SOCK": "/sock", "github_token": "t2", "API_KEY_FILE": "f",
         "SSL_CERT_FILE": "/ca.pem", "LANG": "en_US.UTF-8", "HOME": "/h", "EDITOR": "vi",
     }  # fmt: skip
-    got = launchd.capture_env(shell, [], ["/opt/bin"])
+    got = service.capture_env(shell, [], ["/opt/bin"])
     assert got == {
         "PATH": "/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "SSL_CERT_FILE": "/ca.pem",
@@ -57,8 +57,8 @@ def test_the_captured_environment_never_takes_a_secret_like_name() -> None:
 
 def test_only_the_names_the_owner_lists_pass_the_secret_scrub() -> None:
     shell = {"MY_TOKEN": "t", "OTHER_SECRET": "s"}
-    assert launchd.capture_env(shell, ["MY_TOKEN"], [])["MY_TOKEN"] == "t"
-    assert "OTHER_SECRET" not in launchd.capture_env(shell, ["MY_TOKEN"], [])
+    assert service.capture_env(shell, ["MY_TOKEN"], [])["MY_TOKEN"] == "t"
+    assert "OTHER_SECRET" not in service.capture_env(shell, ["MY_TOKEN"], [])
 
 
 def test_proxies_and_ca_bundles_are_captured_in_both_cases_and_userinfo_is_kept() -> None:
@@ -66,18 +66,18 @@ def test_proxies_and_ca_bundles_are_captured_in_both_cases_and_userinfo_is_kept(
         "HTTPS_PROXY": "http://u:p@proxy:3128", "no_proxy": "localhost", "NODE_EXTRA_CA_CERTS": "/c",
         "REQUESTS_CA_BUNDLE": "/r", "http_proxy": "http://proxy:3128",
     }  # fmt: skip
-    got = launchd.capture_env(shell, [], [])
+    got = service.capture_env(shell, [], [])
     assert {k: v for k, v in got.items() if k != "PATH"} == shell
 
 
 def test_the_path_lists_each_tool_directory_once_before_the_system_ones() -> None:
-    got = launchd.capture_env({}, [], ["/a", "/b", "/a", "/usr/bin"])
+    got = service.capture_env({}, [], ["/a", "/b", "/a", "/usr/bin"])
     assert got["PATH"] == "/a:/b:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 def test_a_proxy_password_is_masked_in_every_message() -> None:
-    assert launchd.mask("via http://user:pa55@proxy:3128/x") == "via http://***@proxy:3128/x"
-    assert launchd.mask("no credentials: https://example.invalid/a@b") == (
+    assert service.mask("via http://user:pa55@proxy:3128/x") == "via http://***@proxy:3128/x"
+    assert service.mask("no credentials: https://example.invalid/a@b") == (
         "no credentials: https://example.invalid/a@b"
     )
 
