@@ -6,24 +6,47 @@ import re
 import signal
 import subprocess
 import sys
-import time
+from datetime import datetime
 from pathlib import Path
 
+from . import service
 from .paths import ensure_dir
 
+MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1
+    )
+}  # not calendar.month_abbr: that follows LC_TIME
 
-def start_time(pid: int) -> int | None:
-    """Epoch start time of a live, non-zombie process, or None when it is gone.
 
-    A probe that itself fails (`ps` times out, errors or prints something unreadable) raises:
-    the caller must treat that as "unknown", never as "dead".
-    """
+def parse_proc_stat(line: str) -> tuple[str, int]:
+    """The state (field 3) and `starttime` in clock ticks since boot (field 22) of a /proc/PID/stat line.
+    `comm` (field 2) may hold spaces and parentheses, so the fields are counted after the last `)`."""
+    rest = line.rpartition(")")[2].split()
+    if len(rest) < 20:
+        raise ValueError(f"unreadable /proc stat line {line!r}")
+    return rest[0], int(rest[19])
+
+
+def proc_start_time(pid: int) -> int | None:
+    """Linux: the process's `starttime` plus the boot epoch, with no subprocess and no locale."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        line = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
         return None
-    except PermissionError:
-        pass
+    state, ticks = parse_proc_stat(line)
+    if state.startswith("Z"):
+        return None
+    boot = boot_time()
+    if not boot:
+        raise OSError("no btime in /proc/stat")
+    return boot + ticks // os.sysconf("SC_CLK_TCK")
+
+
+def ps_start_time(pid: int) -> int | None:
+    """macOS: `ps` prints `lstart` in English under LC_ALL=C; it is read by hand because `strptime`
+    would use this process's own LC_TIME."""
     env = {**os.environ, "LC_ALL": "C"}
     p = subprocess.run(
         ["ps", "-o", "stat=,lstart=", "-p", str(pid)],
@@ -38,10 +61,41 @@ def start_time(pid: int) -> int | None:
         raise ValueError(f"unreadable ps output {p.stdout!r}")
     if fields[0].startswith("Z"):
         return None
-    return int(time.mktime(time.strptime(fields[1], "%a %b %d %H:%M:%S %Y")))
+    return parse_lstart(fields[1])
+
+
+def parse_lstart(text: str) -> int:
+    """`Thu Oct  9 16:45:44 2026` in local time, whatever this process's LC_TIME."""
+    try:
+        _, month, day, clock, year = text.split()
+        hour, minute, second = clock.split(":")
+        started = datetime(int(year), MONTHS[month], int(day), int(hour), int(minute), int(second))
+        return int(started.timestamp())
+    except (KeyError, ValueError, OverflowError) as e:
+        raise ValueError(f"unreadable ps start time {text!r}") from e
+
+
+def start_time(pid: int) -> int | None:
+    """Epoch start time of a live, non-zombie process, or None when it is gone.
+
+    A probe that itself fails (`ps` times out, errors or prints something unreadable) raises:
+    the caller must treat that as "unknown", never as "dead".
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    return ps_start_time(pid) if service.darwin() else proc_start_time(pid)
 
 
 def boot_time() -> int:
+    if not service.darwin():
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return int(line.split()[1])
+        return 0
     out = subprocess.run(
         ["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=10, check=False
     ).stdout
