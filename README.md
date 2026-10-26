@@ -106,7 +106,7 @@ The checks, in order: 1 the daemon's service (LaunchAgent or systemd unit) loade
 
 ### Branch protection
 
-Workers push with your login, so the only server-side stop for a push to the wrong branch is branch protection (GIT-08). Check 19 asks GitHub, for the default branch and one existing `feature/*` branch of every repo a board uses, through both `repos/<owner>/<repo>/rules/branches/<branch>` (rulesets) and `repos/<owner>/<repo>/branches/<branch>` (classic protection); either one counts. A repo with neither is a warning in `doctor`, and never delays dispatch. One that cannot be read (you lack the rights) is listed as "could not be read" in `doctor` only. The answer is cached in the database and refreshed every six hours.
+Workers push with your login, so the only server-side stop for a push to the wrong branch is branch protection (GIT-08). Check 19 asks GitHub, for the default branch and one existing `feature/*` and one `milestone/*` branch of every repo a board uses, through both `repos/<owner>/<repo>/rules/branches/<branch>` (rulesets) and `repos/<owner>/<repo>/branches/<branch>` (classic protection); either one counts. A repo with neither is a warning in `doctor`, and never delays dispatch. One that cannot be read (you lack the rights) is listed as "could not be read" in `doctor` only. The answer is cached in the database and refreshed every six hours.
 
 Setting it up needs admin rights on the repo. For the default branch (no direct pushes, no force pushes, a pull request required; use `--hostname <host>` for GitHub Enterprise):
 
@@ -129,15 +129,15 @@ gh api --method POST repos/<owner>/<repo>/rulesets --input - <<'JSON'
 JSON
 ```
 
-For `feature/*`, leave the pull request rule off: a part card of a feature pushes its own branch `feature/<slug>-<part>`, which matches the same pattern, so requiring a pull request there would stop the worker it is meant to serve. Forbid deleting and rewriting instead:
+For `feature/*`, leave the pull request rule off: a part card of a feature or milestone pushes its own branch (`feature/<slug>-<part>`, `milestone/<n>-<slug>-<part>`), which matches the same pattern, so requiring a pull request there would stop the worker it is meant to serve. Forbid deleting and rewriting instead:
 
 ```sh
 gh api --method POST repos/<owner>/<repo>/rulesets --input - <<'JSON'
 {
-  "name": "kanban-claude: feature branches",
+  "name": "kanban-claude: feature and milestone branches",
   "target": "branch",
   "enforcement": "active",
-  "conditions": {"ref_name": {"include": ["refs/heads/feature/*"], "exclude": []}},
+  "conditions": {"ref_name": {"include": ["refs/heads/feature/*", "refs/heads/milestone/*"], "exclude": []}},
   "rules": [{"type": "non_fast_forward"}, {"type": "deletion"}]
 }
 JSON
