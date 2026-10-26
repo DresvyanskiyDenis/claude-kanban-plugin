@@ -206,6 +206,7 @@ NOT_RUNNING = tuple(s for s in STATUSES if s != "running")
 WORKER_BLOCK_KINDS = ("needs_input", "capability", "transient")
 BUILDERS = ("smith", "designer")
 PR_WORD = re.compile(r"\bPR\b|pull request", re.I)
+NEGATION = re.compile(r"\b(?:no|not|never|without|none)\b|n't", re.I)
 PARTIAL_REVIEW = "PARTIAL REVIEW"  # a warden approval the owner merges (D10), never the daemon
 MERGE_METHODS = ("squash", "merge", "rebase")
 ADVISOR_POLICIES = ("inherit", "off", "ab")
@@ -940,6 +941,15 @@ def _columns(conn: sqlite3.Connection, fields: dict[str, Any], board: Row) -> di
     return out
 
 
+def _deliverable_is_pr(text: str) -> bool:
+    """A PR mention counts unless a negation sits among the four words before it in its sentence
+    ("Do not open a PR", "no PR"). shortcut: a negation after the PR word is not read."""
+    return any(
+        not NEGATION.search(" ".join(re.split(r"[.;:!?\n]", text[: m.start()])[-1].split()[-4:]))
+        for m in PR_WORD.finditer(text)
+    )
+
+
 def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> None:
     """The non-triage checks of lifecycle #1, on a merged card (SEC-10, GIT-01/09, MN-31)."""
     _need(
@@ -961,7 +971,7 @@ def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> No
                 "pass --workspace worktree:<repo> with --branch, or leave the branch out"
             )
         deliverable = re.search(r"^## Deliverable[ \t]*\n(.*?)(?=^## |\Z)", t["body"], re.M | re.S)
-        if t["assignee"] in BUILDERS and deliverable and PR_WORD.search(deliverable[1]):
+        if t["assignee"] in BUILDERS and deliverable and _deliverable_is_pr(deliverable[1]):
             raise Refused(
                 "the Deliverable is a PR, but a scratch card has no repo or branch, so its worker "
                 "cannot run request-review and the PR would skip the warden; pass "

@@ -888,6 +888,51 @@ def test_scratch_card_without_a_pr_deliverable_is_still_fine(
     )  # fmt: skip
 
 
+NO_PR_DELIVERABLE = "## Goal\ng\n\n## Deliverable\nA file at /abs/report.md. Do not open a PR.\n\n## Out of scope\nx\n"
+
+
+@pytest.mark.parametrize(
+    "deliverable",
+    [
+        "A file at /abs/report.md. Do not open a PR.",
+        "A summary; the card opens no pull request.",
+        "No PR: a file at /abs/report.md.",
+        "A report, without a PR.",
+    ],
+)
+def test_a_negated_pr_deliverable_does_not_count_as_a_pr(
+    conn: Any, card: Card, deliverable: str
+) -> None:
+    assert card(body=f"## Deliverable\n{deliverable}\n\n## Out of scope\nx\n", assignee="smith")
+
+
+@pytest.mark.parametrize(
+    "deliverable",
+    [
+        "PR against host/acme/proj:main. Do not touch docs.",
+        "One PR from `feature/x` into `main`, no other changes.",
+        "A file, then open a pull request.",
+    ],
+)
+def test_an_affirmative_pr_deliverable_still_counts_as_a_pr(
+    conn: Any, card: Card, deliverable: str
+) -> None:
+    with pytest.raises(Refused, match="Deliverable is a PR"):
+        card(body=f"## Deliverable\n{deliverable}\n", assignee="smith")
+
+
+def test_edit_refuses_a_scratch_builder_card_that_would_deliver_a_pr(
+    conn: Any, card: Card
+) -> None:
+    tid = card(body=NO_PR_DELIVERABLE, assignee="smith")
+    with pytest.raises(Refused, match="Deliverable is a PR"):
+        store.edit(conn, tid, {"body": PR_DELIVERABLE})
+    scout = card(body=PR_DELIVERABLE, assignee="scout")
+    with pytest.raises(Refused, match="Deliverable is a PR"):
+        store.edit(conn, scout, {"title": "t"}, assignee="smith")
+    assert store.edit(conn, tid, {"title": "still fine"})["fields"] == ["title"]
+
+
 def test_base_defaults_to_the_only_worktree_parent_base(conn: Any, board: str, repo: Path) -> None:
     store.board_create(conn, "wt", default_workdir=str(repo))
     ws = f"worktree:{repo}"
