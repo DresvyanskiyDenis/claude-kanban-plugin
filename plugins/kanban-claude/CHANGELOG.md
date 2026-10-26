@@ -1,12 +1,46 @@
 # Changelog
 
-## 0.4.0.dev2
+## 0.4.0.dev3
 
-Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup/scripts/bootstrap.sh`) so the daemon and the CLI move together. The schema stays at 7. Then run `kanban doctor`: check 22 names each board repo that turns off the designer's browser, with the command to turn it back on.
+Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup/scripts/bootstrap.sh`) so the daemon and the CLI move together. The schema stays at 7. Then run `kanban doctor`: check 19 now also reads protection on one `milestone/*` branch per repo, and the README's ruleset covers both `feature/*` and `milestone/*`. On Linux the daemon is a systemd user unit and needs `loginctl enable-linger $USER` once. Workers that began under 0.4.0.dev2 keep running without the new stall watchdog.
 
 ### Added
 
 - Linux support. Setup, upgrade, `kanban doctor --fix` and `kanban uninstall` now run on Linux with a systemd user unit, `~/.config/systemd/user/kanban-claude.daemon.service` (0600, one `Environment=` line per variable the LaunchAgent carries, `Restart=on-failure`, `KillMode=process` so a restart leaves the detached runners alone, as `AbandonProcessGroup` does on macOS), driven by `systemctl --user`. Setup needs `systemctl` on Linux and says to pass `--no-daemon` when it is missing, and warns with `loginctl enable-linger <user>` when lingering is off, because the unit would stop at logout. `launchd.py` stays for macOS; `service.py` picks the backend, and doctor checks 1, 12, 13 and 17 name the LaunchAgent or the unit by platform.
+- Automatic milestone branches. Two or more `smith` or `designer` cards in one repo become numbered milestones (`milestone/<n>-<slug>`, one finalize PR each) without asking the owner; exactly one code card still goes straight to the default branch. Milestone n+1 runs while milestone n awaits the owner's merge.
+- `kanban wait-ci` exits 6 with `no_ci` when the repo has no workflows (checked after a 60 s grace, on the workflows API and on the PR head). It is never reported as passed.
+- `kanban wait-ci` exits 7 (`skipped`) when every check on the head was skipped or neutral. A worker never reports that as passed.
+- The run outcomes `network` and `stalled`, both uncounted. A `network` or `stalled` retry waits 5, 10, 20, then 30 minutes, and only the seventh in a row counts as a failure.
+- The `worker.stall_s` config key (default 1200 s, 0 turns it off): a run with no assistant or tool event for that long is stopped as `stalled`. It accepts only 0 or at least 700, so the watchdog cannot kill a healthy `wait-ci` or foreground Bash call.
+- A `systemic` dispatch pause now lifts itself after a passing model-call probe (5, 15 and 60 minutes, then hourly) and logs `dispatch_resumed`.
+
+### Changed
+
+- `references/feature-branch.md` is now `references/milestone-branches.md`. A finalize card builds `milestone/<n>-<slug>-final` from the default branch with `--base <default>` and replays only its milestone's commits, so a squash, merge or rebase of the previous milestone leaves no conflict and no force-push.
+- Warden skips the full gate re-run when every check on the head sha is successful and the `Gate:` line names that sha. A missing, failing, running or absent check keeps the re-run.
+- Designer and warden agree that a written description or screenshot file paths satisfy a screenshot request where the host cannot attach images; warden no longer requests changes over a missing image alone.
+- `kanban request-review` refuses, for a card tied to a GitHub issue, a PR body without `Closes OWNER/REPO#N`. Smith and designer instructions list the line.
+- Creating, specifying or editing a smith or designer scratch card whose Deliverable is a PR is refused, with the worktree flags to use. A negated mention ("Do not open a PR") is ignored. The scratch refusal in `request-review` now tells the worker to block, not to complete.
+- `kanban wait-ci` stops waiting for checks that never register after 180 s on a repo with workflows (still exit 2). `rules.md` no longer tells workers to treat missing CI as passed.
+- Workers run with `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, so `claude -p` waits for background tasks instead of stopping them after 10 minutes.
+- A 401 or 403 pauses the account only after a fresh login probe fails too; when the probe passes, the run ends as `network`.
+- Doctor checks 1, 12, 13 and 17 name the LaunchAgent or the systemd unit by platform.
+- Two tests no longer depend on the environment the runner is started in.
+
+### Fixed
+
+- Preflight prints `ok CI green on the head` only when every check on the head passed (skipped, neutral and non-required failing checks no longer count as green), and it reads `gh pr checks` output when gh exits 1 or 8 instead of failing with "cannot read the PR".
+- A worker on a scratch PR card no longer completes past the warden because the refusal said to complete.
+- DNS and connection outages were counted as crashes and could trip the systemic pause.
+- Runs that sat in endless `api_retry` loops for hours were never stopped.
+- The stall clock restarts when a background wait or an API-retry spell begins or ends, so a quiet background wait is not stopped as stalled.
+- Every worker crashed at claim (`exit -`, `0 turns`) when this process's `LC_TIME` was not English and the daemon's environment had no `LANG` (the common `LANG=en_US.UTF-8` with `LC_TIME=de_DE.UTF-8`): `start_time()` ran `ps` in the C locale but parsed its date with `strptime` in the daemon's own locale. On Linux it now reads `/proc/<pid>/stat` and the boot time from `/proc/stat`, with no subprocess and no locale; on macOS it keeps `ps` and reads the English date by hand.
+- `boot_time()` returned 0 on Linux (`sysctl kern.boottime` is macOS only), so a run left `running` by a reboot was never reclaimed. It reads `btime` from `/proc/stat` there.
+
+## 0.4.0.dev2
+
+Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup/scripts/bootstrap.sh`) so the daemon and the CLI move together. The schema stays at 7. Then run `kanban doctor`: check 22 names each board repo that turns off the designer's browser, with the command to turn it back on.
+
 
 ### Changed
 
@@ -16,8 +50,6 @@ Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup
 
 ### Fixed
 
-- Every worker crashed at claim (`exit -`, `0 turns`) when this process's `LC_TIME` was not English and the daemon's environment had no `LANG` (the common `LANG=en_US.UTF-8` with `LC_TIME=de_DE.UTF-8`): `start_time()` ran `ps` in the C locale but parsed its date with `strptime` in the daemon's own locale. On Linux it now reads `/proc/<pid>/stat` and the boot time from `/proc/stat`, with no subprocess and no locale; on macOS it keeps `ps` and reads the English date by hand.
-- `boot_time()` returned 0 on Linux (`sysctl kern.boottime` is macOS only), so a run left `running` by a reboot was never reclaimed. It reads `btime` from `/proc/stat` there.
 - `kanban web`: a followed transcript ended up to 42 px short of its last lines when the run finished on a narrow screen, because the longer "(completed)" label wrapped the logs toolbar onto a second row and nothing scrolled again. Follow now also re-pins when the log box resizes (toolbar wrap, window resize, rotated phone) and still leaves a paused view where it is.
 
 ## 0.4.0.dev1

@@ -54,18 +54,19 @@ def protected(host: str, repo: str, branch: str) -> bool | None:
 
 
 def branches(root: Path) -> list[str]:
-    """The default branch, and the first remote `feature/*` branch if one exists (a pattern has no
-    API path of its own). ponytail: one sample stands for the pattern; list them all when rulesets
-    that differ per feature branch turn up."""
+    """The default branch, and the first remote `feature/*` and `milestone/*` branch of each kind
+    that exists (a pattern has no API path of its own). ponytail: one sample stands for the
+    pattern; list them all when rulesets that differ per branch turn up."""
     names = []
     if default := ghops.default_branch(root):
         names.append(default)
-    rc, out = gitops.run(
-        "for-each-ref", "--count=1", "--format=%(refname:short)", "refs/remotes/origin/feature/",
-        root=root,
-    )  # fmt: skip
-    if rc == 0 and out.startswith("origin/"):
-        names.append(out.removeprefix("origin/"))
+    for prefix in ("feature", "milestone"):
+        rc, out = gitops.run(
+            "for-each-ref", "--count=1", "--format=%(refname:short)", f"refs/remotes/origin/{prefix}/",
+            root=root,
+        )  # fmt: skip
+        if rc == 0 and out.startswith("origin/"):
+            names.append(out.removeprefix("origin/"))
     return names
 
 

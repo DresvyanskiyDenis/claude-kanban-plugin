@@ -1,5 +1,6 @@
 """TST-R: the runner (RUN), through a real `kanban run` process against the fake `claude`."""
 
+import io
 import json
 import os
 import re
@@ -948,3 +949,73 @@ def test_an_ab_role_records_its_arm_on_the_run_and_the_switch_in_its_params(
     run = execute(card())
     assert run["advisor"] == "off"
     assert json.loads(run["params"])["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+
+
+def test_a_worker_waits_for_its_background_tasks_without_claudes_10_minute_ceiling(
+    conn: Any, card: Card, tmp_path: Path
+) -> None:
+    """`-p` stops background work 10 min after the last turn and exits 0; 0 waits indefinitely.
+    The no-progress watchdog (worker.stall_s) is what ends a background task that hangs."""
+    assert env_for(conn, card("t"), tmp_path)["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == "0"
+
+
+def quiet_runner(
+    conn: Any, claim: Claim, card: Card, monkeypatch: pytest.MonkeyPatch, stall_s: int
+):
+    """A runner fed by hand on a fake clock: `clock[0]` is the monotonic time."""
+    r = runner.Runner(conn, claim(card()))
+    r.sidecar = io.StringIO()
+    r.stall_s, r.progress_at = stall_s, 0.0
+    clock = [0.0]
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+    return r, clock
+
+
+BG_START = json.dumps(
+    {"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "b"}]}
+)
+BG_END = json.dumps({"type": "system", "subtype": "background_tasks_changed", "tasks": []})
+RETRY = json.dumps({"type": "system", "subtype": "api_retry"})
+
+
+def test_the_stall_clock_restarts_when_a_background_wait_ends(
+    conn: Any, card: Card, claim: Claim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r, clock = quiet_runner(conn, claim, card, monkeypatch, 100)
+    clock[0] = 1
+    r.on_line(BG_START)
+    clock[0] = 500  # a quiet wait many times the limit, unwatched by design
+    r.on_line(BG_END)
+    clock[0] = 550
+    r.timers(550, 10**9)
+    assert not r.stalled, "the wait just ended; the run has had 50 s of silence, not 550"
+    r.timers(601, 10**9)
+    assert r.stalled
+
+
+def test_the_stall_clock_restarts_when_api_retries_begin_during_a_background_wait(
+    conn: Any, card: Card, claim: Claim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r, clock = quiet_runner(conn, claim, card, monkeypatch, 100)
+    clock[0] = 1
+    r.on_line(BG_START)
+    clock[0] = 500
+    r.on_line(RETRY)
+    r.timers(550, 10**9)
+    assert not r.stalled
+    r.timers(601, 10**9)
+    assert r.stalled
+
+
+@pytest.mark.parametrize(("stall_s", "stalled"), [(100, True), (0, False)])
+def test_a_zero_stall_limit_turns_the_watchdog_off(
+    conn: Any,
+    card: Card,
+    claim: Claim,
+    monkeypatch: pytest.MonkeyPatch,
+    stall_s: int,
+    stalled: bool,
+) -> None:
+    r, _ = quiet_runner(conn, claim, card, monkeypatch, stall_s)
+    r.timers(10**6, 10**9 * 2)
+    assert r.stalled is stalled

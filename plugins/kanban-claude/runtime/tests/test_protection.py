@@ -62,6 +62,13 @@ def test_an_existing_feature_branch_is_checked_too(conn: Any, used: Path, set_ap
     assert protection.refresh(conn)["boards"] == {"main": [SLUG]}
 
 
+def test_an_existing_milestone_branch_is_checked_too(conn: Any, used: Path, set_api: Api) -> None:
+    git("update-ref", "refs/remotes/origin/milestone/1-x", "HEAD", cwd=used)
+    set_api({RULES: [{"type": "pull_request"}], "repos/acme/proj/rules/branches/milestone/1-x": [],
+             "repos/acme/proj/branches/milestone/1-x": {"protected": False}})  # fmt: skip
+    assert protection.refresh(conn)["boards"] == {"main": [SLUG]}
+
+
 def test_a_repo_two_boards_share_is_asked_once(
     conn: Any, used: Path, set_api: Api, env: Path
 ) -> None:

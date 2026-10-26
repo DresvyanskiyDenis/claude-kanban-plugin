@@ -5,6 +5,25 @@ from typing import Any, NamedTuple
 
 QUOTA_RE = re.compile(r"^(You've hit your .*limit|.*\b(session|usage|weekly) limit\b.*resets)")
 AUTH_RE = re.compile(r"^(Invalid API key|Please run /login|.*[Nn]ot logged in)")
+NETWORK_RE = re.compile(
+    r"Can't reach the API server|ENOTFOUND|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ETIMEDOUT"
+)
+PROGRESS_SYSTEM = (
+    "task_progress",
+    "task_notification",
+)  # subagent work and a finished background task
+
+
+def is_progress(ev: dict[str, Any]) -> bool:
+    """Did the model or a tool just do something? api_retry, status, hook and thinking_tokens
+    events say only that claude is alive: a run in an API outage emits them for hours. The
+    synthetic "cut off mid-stream" user turn and the API-error assistant turn are claude's own."""
+    kind = ev.get("type")
+    if kind == "user":
+        return not ev.get("isSynthetic")
+    if kind == "assistant":
+        return not ev.get("is_api_error_message")
+    return kind == "tool_progress" or (kind == "system" and ev.get("subtype") in PROGRESS_SYSTEM)
 
 
 def number(value: Any) -> float | None:
@@ -74,6 +93,7 @@ def classify(
     now: int,
     requeue_s: int,
     stderr: str = "",
+    stalled_s: int = 0,
 ) -> Verdict:
     """RUN-12 rows 3..9 (rows 1 and 2 are decided by `end_run`'s compare-and-swap)."""
     result = stream.result or {}
@@ -85,8 +105,12 @@ def classify(
         return Verdict("auth_lost", line or f"authentication failed ({status})")
     if result.get("subtype") == "error_max_budget_usd":
         return Verdict("budget_exceeded", "the per-run budget fuse ended the run")
+    if (result.get("is_error") if result else exit_code) and NETWORK_RE.search(line or stderr):
+        return Verdict("network", line or stderr.strip()[-300:])
     if timed_out:
         return Verdict("timed_out", "the runtime cap ended the run")
+    if stalled_s:
+        return Verdict("stalled", f"no assistant or tool event for {stalled_s // 60} min; stopped")
     if exit_code == 0:
         return Verdict("protocol_violation", "claude exited 0 without a terminal kanban call")
     detail = line or stderr.strip()[-1500:]

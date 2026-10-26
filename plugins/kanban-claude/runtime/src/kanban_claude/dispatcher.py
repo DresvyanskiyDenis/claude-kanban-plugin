@@ -126,6 +126,35 @@ def reprobe_logins(conn: sqlite3.Connection, ts: int) -> None:
                     )  # fmt: skip
 
 
+def reprobe_dispatch(conn: sqlite3.Connection, ts: int) -> None:
+    """A `systemic` pause (three crashes in 10 minutes) lifts itself once a model call goes through
+    again, probed after 5, 15, then every 60 minutes like a paused login. A pause the owner set,
+    or one whose reason is anything else, stays until `kanban resume`. The probe runs claude for
+    up to 120 s, so housekeeping calls it, never the tick."""
+    paused = store.state_get(conn, "dispatch_paused")
+    if not paused or paused.get("reason") != "systemic":
+        return
+    probes = paused.get("probes", 0)
+    if ts < paused.get("next_probe_at", paused["since"] + PROBE_BACKOFF_S[0]):
+        return
+    logins = {
+        store.effective_config_dir(conn, b)
+        for b in conn.execute("SELECT * FROM boards WHERE archived_at IS NULL").fetchall()
+    } or {store.effective_config_dir(conn, {"claude_config_dir": None})}  # type: ignore[arg-type]
+    reason = next((r for d in sorted(logins) if (r := runner.api_probe(conn, d))), None)
+    with store.tx(conn):
+        if store.state_get(conn, "dispatch_paused") != paused:  # lifted or changed during the probe
+            return
+        if reason is None:
+            conn.execute("DELETE FROM state WHERE key = 'dispatch_paused'")
+            store.event(conn, None, "dispatch_resumed", "dispatcher")
+            return
+        wait = PROBE_BACKOFF_S[min(probes + 1, len(PROBE_BACKOFF_S) - 1)]
+        store.state_put(
+            conn, "dispatch_paused", {**paused, "probes": probes + 1, "next_probe_at": ts + wait}
+        )
+
+
 def promote(conn: sqlite3.Connection) -> list[str]:
     """DSP-03, second half."""
     promoted = []

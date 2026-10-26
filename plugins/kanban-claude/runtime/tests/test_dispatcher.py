@@ -306,6 +306,56 @@ def test_a_paused_login_is_probed_after_5_15_then_60_minutes_and_lifts_when_it_p
     assert "account_resumed" in kinds(conn)
 
 
+def systemic_pause(conn: Any, since: int) -> None:
+    with store.tx(conn):
+        store.state_put(
+            conn, "dispatch_paused", {"reason": "systemic", "since": since, "detail": "ENOTFOUND"}
+        )
+
+
+def test_a_systemic_pause_lifts_itself_when_the_api_answers_again(
+    conn: Any, card: Card, procs: FakeProcs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tid = card()
+    systemic_pause(conn, NOW)
+    answers: list[str | None] = []
+    monkeypatch.setattr(runner, "api_probe", lambda _c, _d: answers.pop(0))
+    answers[:] = ["Can't reach the API server"]
+    dispatcher.reprobe_dispatch(conn, NOW + 299)
+    assert answers  # not due yet
+    dispatcher.reprobe_dispatch(conn, NOW + 300)
+    assert not answers and store.state_get(conn, "dispatch_paused")["probes"] == 1
+    answers[:] = [None]
+    dispatcher.reprobe_dispatch(conn, NOW + 300 + 899)
+    assert answers  # backed off to 15 min
+    dispatcher.reprobe_dispatch(conn, NOW + 300 + 900)
+    assert store.state_get(conn, "dispatch_paused") is None
+    assert [c["id"] for c in tick(conn, procs, NOW + 1200)["claimed"]] == [tid]
+    assert "dispatch_resumed" in kinds(conn)
+
+
+def test_a_pause_changed_during_the_probe_is_left_alone(
+    conn: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    systemic_pause(conn, NOW)
+
+    def owner_pauses_meanwhile(_c: Any, _d: str) -> None:
+        with store.tx(conn):
+            store.state_put(conn, "dispatch_paused", {"reason": "owner", "since": NOW + 1})
+
+    monkeypatch.setattr(runner, "api_probe", owner_pauses_meanwhile)
+    dispatcher.reprobe_dispatch(conn, NOW + 300)
+    assert store.state_get(conn, "dispatch_paused")["reason"] == "owner"
+
+
+def test_an_owner_pause_is_never_probed_away(conn: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    with store.tx(conn):
+        store.state_put(conn, "dispatch_paused", {"reason": "owner", "since": NOW})
+    monkeypatch.setattr(runner, "api_probe", lambda _c, _d: pytest.fail("probed"))
+    dispatcher.reprobe_dispatch(conn, NOW + 10**6)
+    assert store.state_get(conn, "dispatch_paused")
+
+
 def test_the_tick_never_probes_a_paused_login(
     conn: Any, card: Card, procs: FakeProcs, monkeypatch: pytest.MonkeyPatch
 ) -> None:

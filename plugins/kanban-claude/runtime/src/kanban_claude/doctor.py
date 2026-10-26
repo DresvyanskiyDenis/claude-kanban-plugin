@@ -415,7 +415,9 @@ def runners(c: Ctx) -> Result:
 def branch_protection(c: Ctx) -> Result:
     found = protection.refresh(c.conn)
     flagged = sorted({s for slugs in found["boards"].values() for s in slugs})
-    notes = [f"{s}: the default branch or feature/* has no protection" for s in flagged]
+    notes = [
+        f"{s}: the default branch, feature/* or milestone/* has no protection" for s in flagged
+    ]
     if found["unknown"]:
         notes.append(f"could not be read: {', '.join(found['unknown'])}")
     if notes:

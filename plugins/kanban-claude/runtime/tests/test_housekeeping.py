@@ -118,6 +118,7 @@ def test_housekeeping_reprobes_paused_logins_and_survives_a_failure(
         raise RuntimeError("probe crashed")
 
     monkeypatch.setattr(dispatcher, "reprobe_logins", reprobe)
+    monkeypatch.setattr(dispatcher, "reprobe_dispatch", reprobe)
     monkeypatch.setattr(housekeeping, "sweep", lambda _c: None)
     housekeeping.run_due(conn, 1000)
-    assert calls == [1000]
+    assert calls == [1000, 1000]

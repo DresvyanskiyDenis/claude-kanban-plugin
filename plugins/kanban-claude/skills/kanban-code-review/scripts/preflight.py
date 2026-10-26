@@ -68,16 +68,22 @@ def gate_fact(
     ]
 
 
+_SETTLED = ("pass", "fail", "cancel", "pending")  # the buckets `checks_fact` words itself
+
+
 def checks_fact(checks: list[dict[str, str]]) -> list[str]:
     if not checks:
         return ["INFO no CI checks reported for this PR"]
     bad = [c["name"] for c in checks if c["bucket"] in ("fail", "cancel")]
     pending = [c["name"] for c in checks if c["bucket"] == "pending"]
+    other = [f"{c['name']} ({c['bucket']})" for c in checks if c["bucket"] not in _SETTLED]
     out = []
     if bad:
         out.append(f"CHECK CI failing on the head: {', '.join(bad)}")
     if pending:
         out.append(f"CHECK CI still running on the head: {', '.join(pending)}")
+    if other:  # skipped, neutral or a bucket this script does not know is not a success
+        out.append(f"CHECK CI not green on the head, these checks did not pass: {', '.join(other)}")
     return out or [f"ok CI green on the head ({len(checks)} checks)"]
 
 
@@ -261,18 +267,16 @@ def gh_json(argv: list[str]) -> object:
 
 
 def pr_checks(number: str, scope: list[str]) -> object:
-    """The required checks, else all of them. `gh pr checks` exits 1 with "no checks reported"
-    instead of printing [] when the repo has no CI at all."""
-    argv = ["pr", "checks", number, *scope, "--json", "name,bucket"]
+    """Every check on the head, required or not: the review skips its gate re-run only when all of
+    them passed. `gh pr checks` exits 1 (failing) or 8 (pending) with the JSON on stdout, and exits
+    1 with "no checks reported" instead of printing [] when the repo has no CI at all."""
+    r = call(["gh", "pr", "checks", number, *scope, "--json", "name,bucket"])
     try:
-        try:
-            return gh_json([*argv, "--required"])
-        except RuntimeError:
-            return gh_json(argv)
-    except RuntimeError as e:
-        if "no checks reported" in str(e):
+        return json.loads(r.stdout)
+    except ValueError:
+        if "no checks reported" in r.stderr + r.stdout:
             return []
-        raise
+        raise RuntimeError(f"gh pr checks failed: {(r.stderr or r.stdout).strip()}") from None
 
 
 def main(argv: list[str]) -> int:

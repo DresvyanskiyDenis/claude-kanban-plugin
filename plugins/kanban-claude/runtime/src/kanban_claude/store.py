@@ -205,6 +205,8 @@ STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "
 NOT_RUNNING = tuple(s for s in STATUSES if s != "running")
 WORKER_BLOCK_KINDS = ("needs_input", "capability", "transient")
 BUILDERS = ("smith", "designer")
+PR_WORD = re.compile(r"\bPR\b|pull request", re.I)
+NEGATION = re.compile(r"\b(?:no|not|never|without|none)\b|n't", re.I)
 PARTIAL_REVIEW = "PARTIAL REVIEW"  # a warden approval the owner merges (D10), never the daemon
 MERGE_METHODS = ("squash", "merge", "rebase")
 ADVISOR_POLICIES = ("inherit", "off", "ab")
@@ -216,6 +218,11 @@ SYSTEMIC_CRASH_COUNT = 3
 SYSTEMIC_WINDOW_S = 600
 MAX_ATTACH_BYTES = 25 * 1024 * 1024
 COUNTED_OUTCOMES = ("budget_exceeded", "timed_out", "crashed")
+# the machine or the network, not the card: retried with a growing wait, counted only past the cap
+TRANSIENT_OUTCOMES = ("network", "stalled")
+TRANSIENT_RETRIES = 6
+TRANSIENT_COOLDOWN_S = 300
+TRANSIENT_COOLDOWN_MAX_S = 1800
 TRIAGE_RUNTIME_S = 7200
 OWNER = "owner:cli"
 RUN_ENDED = "run ended; the owner stopped it or it already finished. Stop working and exit"
@@ -271,6 +278,9 @@ DEFAULTS: dict[str, Any] = {
     "quota.requeue_s": 300,
     "worker.keep_awake": True,
     "worker.terminal_grace_s": 120,
+    # awake seconds with no assistant/tool event before the run is stopped and retried (0 = off);
+    # above the 600 s Bash cap and the 540 s `wait-ci` poll
+    "worker.stall_s": 1200,
     "worker.max_turns": None,
     "worker.env_passthrough": [],
     "worker.plugin_allowlist": [],
@@ -297,6 +307,7 @@ DEFAULTS: dict[str, Any] = {
     },
 }  # fmt: skip
 
+STALL_MIN_S = 700  # above the 600 s Bash cap and the 540 s `wait-ci`, which are quiet by design
 BOUNDS: dict[str, tuple[int, int | None]] = {
     "jira.poll_s": (1, None),
     "github.poll_s": (1, None),
@@ -305,6 +316,7 @@ BOUNDS: dict[str, tuple[int, int | None]] = {
     "dispatch.failure_limit": (1, None),
     "retention.stream_days": (1, None),
     "worker.max_turns": (1, None),
+    "worker.stall_s": (0, None),
 }
 
 Row = sqlite3.Row
@@ -465,6 +477,11 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         if type(value) is not int or value < low or (high is not None and value > high):
             span = f"from {low} to {high}" if high else f"of at least {low}"
             raise Refused(f"{key} must be an integer {span}")
+    if key == "worker.stall_s" and value is not None and 0 < value < STALL_MIN_S:
+        raise Refused(
+            f"worker.stall_s must be 0 (off) or at least {STALL_MIN_S}: a shorter value would stop a "
+            "healthy `kanban wait-ci` (up to 540 s) or a foreground Bash call (up to 600 s)"
+        )
     if key == "budget.ceiling" and value <= 0:
         raise Refused("budget.ceiling must be positive")
     if (
@@ -930,6 +947,15 @@ def _columns(conn: sqlite3.Connection, fields: dict[str, Any], board: Row) -> di
     return out
 
 
+def _deliverable_is_pr(text: str) -> bool:
+    """A PR mention counts unless a negation sits among the four words before it in its sentence
+    ("Do not open a PR", "no PR"). shortcut: a negation after the PR word is not read."""
+    return any(
+        not NEGATION.search(" ".join(re.split(r"[.;:!?\n]", text[: m.start()])[-1].split()[-4:]))
+        for m in PR_WORD.finditer(text)
+    )
+
+
 def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> None:
     """The non-triage checks of lifecycle #1, on a merged card (SEC-10, GIT-01/09, MN-31)."""
     _need(
@@ -949,6 +975,13 @@ def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> No
             raise Refused(
                 "a scratch card has no repo, so a branch cannot apply; "
                 "pass --workspace worktree:<repo> with --branch, or leave the branch out"
+            )
+        deliverable = re.search(r"^## Deliverable[ \t]*\n(.*?)(?=^## |\Z)", t["body"], re.M | re.S)
+        if t["assignee"] in BUILDERS and deliverable and _deliverable_is_pr(deliverable[1]):
+            raise Refused(
+                "the Deliverable is a PR, but a scratch card has no repo or branch, so its worker "
+                "cannot run request-review and the PR would skip the warden; pass "
+                f"--workspace worktree:{board['default_workdir'] or '<repo>'} --branch feature/<slug>"
             )
         return
     validate.workspace(kind, t["workspace_path"], claude_dirs=claude_dirs(conn, board))
@@ -1919,6 +1952,20 @@ def infra_streak(conn: sqlite3.Connection, task_id: str, before_run: int, cap: i
     return streak
 
 
+def transient_streak(conn: sqlite3.Connection, task_id: str, before_run: int) -> int:
+    """How many of the card's latest runs before this one ended `network` or `stalled`, unbroken
+    by any other outcome; counted up to `TRANSIENT_RETRIES`."""
+    streak = 0
+    for (outcome,) in conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+        (task_id, before_run, TRANSIENT_RETRIES),
+    ):
+        if outcome not in TRANSIENT_OUTCOMES:
+            break
+        streak += 1
+    return streak
+
+
 def _retry_rule(
     conn: sqlite3.Connection,
     t: Row,
@@ -1947,6 +1994,12 @@ def _retry_rule(
             )
             event(conn, None, "dispatch_paused", "runner", {"reason": "systemic", "detail": detail})
             count = False
+    if outcome in TRANSIENT_OUTCOMES:
+        streak = transient_streak(conn, t["id"], run["id"])
+        if streak >= TRANSIENT_RETRIES:
+            count = True  # a real fault hides behind "the network": let the failure limit end it
+        elif retry_after is None:
+            retry_after = ts + min(TRANSIENT_COOLDOWN_S * 2**streak, TRANSIENT_COOLDOWN_MAX_S)
     limit_card = t["max_retries"]
     if outcome == "protocol_violation":
         streak = t["protocol_violations"] + 1

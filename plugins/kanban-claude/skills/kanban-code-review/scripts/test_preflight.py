@@ -169,6 +169,13 @@ def test_ci_checks_separate_failing_pending_and_green():
     assert levels(p.checks_fact([])) == ["INFO"]
 
 
+@pytest.mark.parametrize("bucket", ["skipping", "neutral", "surprise"])
+def test_ci_is_not_green_while_any_check_did_not_pass(bucket: str):
+    facts = p.checks_fact([{"name": "a", "bucket": "pass"}, {"name": "lint", "bucket": bucket}])
+    assert levels(facts) == ["CHECK"]
+    assert f"lint ({bucket})" in facts[0]
+
+
 def test_commit_messages_are_checked_against_conventional_commits():
     assert levels(p.nonconventional(["feat: a", "fix(core): b", "docs!: c"])) == ["ok"]
     bad = p.nonconventional(["feat: a", "Update stuff", "wip"])
@@ -281,7 +288,6 @@ def run_script(tmp_path: Path, card: dict, pr: dict, cwd: Path) -> tuple[str, li
         f"open({str(log)!r}, 'a').write('gh ' + ' '.join(sys.argv[1:]) + '\\n')\n"
         "a = sys.argv[1:3]\n"
         f"if a == ['pr', 'view']: print({json.dumps(pr)!r})\n"
-        "elif a == ['pr', 'checks'] and '--required' in sys.argv: sys.exit(1)\n"
         'elif a == [\'pr\', \'checks\']: print(\'[{"name": "ci", "bucket": "pass"}]\')\n'
         "elif a == ['pr', 'diff']: print('+++ b/docs/a.md\\n+hello')\n"
         "else: sys.exit(2)\n",
@@ -319,9 +325,7 @@ def test_run_reads_the_card_through_kanban_show_json(tmp_path: Path):
     stdout, calls = run_script(tmp_path, card, pr, tmp_path / "w")
     assert "kanban show --json" in calls
     assert any(c.startswith("gh pr view 7 -R git.example.com/o/r") for c in calls)
-    assert any("--required" in c for c in calls) and any(
-        c.startswith("gh pr checks 7") and "--required" not in c for c in calls
-    )
+    assert any(c.startswith("gh pr checks 7") and "--required" not in c for c in calls)
     prefixes = {line.split(" ", 1)[0] for line in stdout.splitlines()}
     assert prefixes <= {"ok", "CHECK", "TIER", "SIZE", "INFO"}
     assert "INFO PR #7 fix/x -> main @ abc1234, review round 2" in stdout
@@ -372,3 +376,15 @@ def test_a_repo_without_ci_reads_as_no_checks(monkeypatch):
 
     monkeypatch.setattr(p, "call", gh)
     assert p.pr_checks("7", []) == []
+
+
+def test_pr_checks_reads_every_check_and_keeps_json_gh_prints_with_a_nonzero_exit(monkeypatch):
+    asked = []
+
+    def gh(argv):
+        asked.append(argv)
+        return subprocess.CompletedProcess(argv, 8, '[{"name": "x", "bucket": "pending"}]', "")
+
+    monkeypatch.setattr(p, "call", gh)
+    assert p.pr_checks("7", []) == [{"name": "x", "bucket": "pending"}]
+    assert "--required" not in asked[0]
