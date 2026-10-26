@@ -289,6 +289,10 @@ def run_due(conn: sqlite3.Connection, ts: int | None = None) -> None:
         dispatcher.reprobe_logins(conn, ts)
     except Exception:
         log.exception("login re-probe failed")
+    try:
+        dispatcher.reprobe_dispatch(conn, ts)
+    except Exception:
+        log.exception("dispatch re-probe failed")
     due = store.state_get(conn, "housekeeping") or {}
     jobs: tuple[tuple[str, int, Callable[[], object]], ...] = (
         ("sweep", SWEEP_S, lambda: sweep(conn)),

@@ -540,6 +540,35 @@ def test_systemic_crashes_pause_dispatch_without_counting(
     assert store.state_get(conn, "dispatch_paused") is None
 
 
+def test_transient_outcomes_back_off_uncounted_then_surface_as_failures(
+    conn: Any, card: Card, clock: Callable[[int], None]
+) -> None:
+    tid = card()
+    for streak in range(store.TRANSIENT_RETRIES):
+        run = claim_run(conn, tid)
+        assert end(conn, run, ("network", "stalled")[streak % 2], error="x")
+        t = row(conn, tid)
+        wait = min(store.TRANSIENT_COOLDOWN_S * 2**streak, store.TRANSIENT_COOLDOWN_MAX_S)
+        assert (t["status"], t["consecutive_failures"], t["retry_after"]) == (
+            "ready", 0, store.now() + wait,
+        )  # fmt: skip
+        clock(wait)
+    run = claim_run(conn, tid)
+    end(conn, run, "network", error="x")
+    assert row(conn, tid)["consecutive_failures"] == 1
+    assert store.state_get(conn, "dispatch_paused") is None
+
+
+def test_another_outcome_restarts_the_transient_streak(
+    conn: Any, card: Card, clock: Callable[[int], None]
+) -> None:
+    tid = card()
+    for outcome in ("network", "network", "interrupted", "network"):
+        end(conn, claim_run(conn, tid), outcome)
+        clock(3600)
+    assert row(conn, tid)["retry_after"] == store.now() - 3600 + store.TRANSIENT_COOLDOWN_S
+
+
 def test_sec5_second_end_run_after_stop_is_a_noop(conn: Any, card: Card) -> None:
     tid = card()
     run = claim_run(conn, tid)
