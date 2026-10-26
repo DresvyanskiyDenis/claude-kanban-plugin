@@ -106,7 +106,7 @@ The checks, in order: 1 the daemon's service (LaunchAgent or systemd unit) loade
 
 ### Branch protection
 
-Workers push with your login, so the only server-side stop for a push to the wrong branch is branch protection (GIT-08). Check 19 asks GitHub, for the default branch and one existing `feature/*` branch of every repo a board uses, through both `repos/<owner>/<repo>/rules/branches/<branch>` (rulesets) and `repos/<owner>/<repo>/branches/<branch>` (classic protection); either one counts. A repo with neither is a warning in `doctor`, and never delays dispatch. One that cannot be read (you lack the rights) is listed as "could not be read" in `doctor` only. The answer is cached in the database and refreshed every six hours.
+Workers push with your login, so the only server-side stop for a push to the wrong branch is branch protection (GIT-08). Check 19 asks GitHub, for the default branch and one existing `feature/*` and one `milestone/*` branch of every repo a board uses, through both `repos/<owner>/<repo>/rules/branches/<branch>` (rulesets) and `repos/<owner>/<repo>/branches/<branch>` (classic protection); either one counts. A repo with neither is a warning in `doctor`, and never delays dispatch. One that cannot be read (you lack the rights) is listed as "could not be read" in `doctor` only. The answer is cached in the database and refreshed every six hours.
 
 Setting it up needs admin rights on the repo. For the default branch (no direct pushes, no force pushes, a pull request required; use `--hostname <host>` for GitHub Enterprise):
 
