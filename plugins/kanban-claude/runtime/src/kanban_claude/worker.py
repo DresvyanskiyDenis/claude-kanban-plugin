@@ -136,7 +136,8 @@ def _verdict(rows: list[tuple[str, str]]) -> tuple[str, str]:
         return "failed", "failed: " + ", ".join(failed[:8])
     if pending:
         return "pending", f"pending: {len(pending)} of {len(rows)} checks still running"
-    if all(b == "skipping" for _, b in rows):  # nothing ran: a pass needs at least one passing check
+    # nothing ran when every check was skipped: a pass needs at least one passing check
+    if all(b == "skipping" for _, b in rows):
         return "skipped", f"skipped: all {len(rows)} check{'' if len(rows) == 1 else 's'} skipped"
     return "passed", f"passed: {len(rows)} check{'' if len(rows) == 1 else 's'}"
 
