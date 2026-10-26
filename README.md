@@ -129,15 +129,15 @@ gh api --method POST repos/<owner>/<repo>/rulesets --input - <<'JSON'
 JSON
 ```
 
-For `feature/*`, leave the pull request rule off: a part card of a feature pushes its own branch `feature/<slug>-<part>`, which matches the same pattern, so requiring a pull request there would stop the worker it is meant to serve. Forbid deleting and rewriting instead:
+For `feature/*`, leave the pull request rule off: a part card of a feature or milestone pushes its own branch (`feature/<slug>-<part>`, `milestone/<n>-<slug>-<part>`), which matches the same pattern, so requiring a pull request there would stop the worker it is meant to serve. Forbid deleting and rewriting instead:
 
 ```sh
 gh api --method POST repos/<owner>/<repo>/rulesets --input - <<'JSON'
 {
-  "name": "kanban-claude: feature branches",
+  "name": "kanban-claude: feature and milestone branches",
   "target": "branch",
   "enforcement": "active",
-  "conditions": {"ref_name": {"include": ["refs/heads/feature/*"], "exclude": []}},
+  "conditions": {"ref_name": {"include": ["refs/heads/feature/*", "refs/heads/milestone/*"], "exclude": []}},
   "rules": [{"type": "non_fast_forward"}, {"type": "deletion"}]
 }
 JSON
