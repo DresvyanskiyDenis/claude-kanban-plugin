@@ -33,7 +33,12 @@ VERBS = (
 )
 BUDGET_S = 540  # under the 600 s a worker's shell command may run
 POLL_S = 20
-CI_EXIT = {"passed": 0, "failed": 1, "pending": 2}
+# GitHub registers a check within seconds of a push; a minute covers a slow one before a repo
+# with no workflows is called CI-less. With workflows, 3 minutes without any check means a path
+# or event filter kept them off the head, so the wait ends instead of burning the whole budget.
+NO_CI_GRACE_S = 60
+NO_CHECKS_CAP_S = 180
+CI_EXIT = {"passed": 0, "failed": 1, "pending": 2, "no_ci": 6}  # no_ci is never a pass
 GATE_LINES = 40
 GATE_RE = re.compile(r"FAIL|Error|error:|failed|Traceback|AssertionError|✗")
 _FAILED_RUNS = ("failure", "timed_out", "cancelled", "startup_failure", "action_required")
@@ -66,7 +71,12 @@ def _facts(t: sqlite3.Row, run: sqlite3.Row) -> tuple[int, str | None]:
 def _repo(t: sqlite3.Row) -> str:
     """The card's repository as `HOST/OWNER/REPO`, from its worktree's origin (GIT-11)."""
     if t["workspace_kind"] != "worktree" or not t["branch_name"]:
-        raise Refused("this needs a worktree card with a branch; use complete instead")
+        raise Refused(
+            "this needs a worktree card with a branch. This card is scratch: if you opened a PR, "
+            "do not use complete (the PR would skip the warden); run kanban block --kind "
+            "needs_input and name the PR and the fix, a worktree workspace and a branch. "
+            "With no PR to review, use complete"
+        )
     origin = gitops.origin_url(t["workspace_path"])
     if not origin:
         raise Error(f"{t['workspace_path']} has no origin remote; run: kanban doctor")
@@ -97,6 +107,27 @@ def _check_pr(t: sqlite3.Row) -> tuple[int, str]:
     return number, validate.pr_url(url, {repo.split("/")[0], "github.com"})
 
 
+def _closes(conn: sqlite3.Connection, t: sqlite3.Row, number: int) -> None:
+    """A card tied to a GitHub issue needs `Closes OWNER/REPO#N` in its PR body, or the merge leaves
+    the issue open and the warden sends the PR back (LPS: 5 wasted rounds). Jira and unlinked cards pass."""
+    lk = conn.execute(
+        "SELECT repo, number FROM github_links WHERE task_id = ?", (t["id"],)
+    ).fetchone()
+    if lk is None:
+        return
+    repo, ref = _repo(t), views.issue_ref(lk)
+    owner_repo, n = ref.rsplit("#", 1)
+    forms = [re.escape(ref), rf"https?://\S*/{re.escape(owner_repo)}/issues/{n}"]
+    if repo.lower() == lk["repo"].lower():
+        forms.append(f"#{n}")  # GitHub resolves a bare #N inside the issue's own repo
+    keyword = rf"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+(?:{'|'.join(forms)})(?!\d)"
+    if not re.search(keyword, str(ghops.pr_view(repo, number, "body").get("body") or ""), re.I):
+        raise Refused(
+            f"this card is tied to GitHub issue {ref}; add the line `Closes {ref}` to the body of "
+            f"PR #{number} (gh pr edit {number} -R {repo} --body ...), then run this again"
+        )
+
+
 def _verdict(rows: list[tuple[str, str]]) -> tuple[str, str]:
     """Fold (name, bucket) pairs, bucket being pass, fail, pending, skipping or cancel."""
     failed = [n for n, b in rows if b in ("fail", "cancel")]
@@ -122,7 +153,7 @@ def _runs(gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int) ->
          else "fail" if r["conclusion"] in _FAILED_RUNS else "pass")
         for r in json.loads(listed.stdout)
     ]  # fmt: skip
-    return _verdict(rows) if rows else ("pending", "pending: no checks reported yet")
+    return _verdict(rows) if rows else ("none", "pending: no checks reported yet")
 
 
 def _poll(gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int) -> tuple[str, str]:
@@ -139,11 +170,40 @@ def _poll(gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int) ->
     raise Error(f"gh pr checks failed: {(p.stderr or p.stdout).strip()[:300]}")
 
 
+def _api(repo: str, path: str) -> "subprocess.CompletedProcess[str]":
+    host, _, slug = repo.partition("/")
+    return ghops.gh_rc("api", f"repos/{slug}/{path}", "--hostname", host, timeout=30)
+
+
+def _no_ci(
+    gh: Callable[..., "subprocess.CompletedProcess[str]"], repo: str, number: int
+) -> bool | None:
+    """True when the repo has no workflow, on its default branch and on the PR head; False when it
+    has one; None when GitHub did not say, which counts as "has CI" for the caller."""
+    try:
+        listed = _api(repo, "actions/workflows")
+        if listed.returncode != 0:
+            return None
+        if json.loads(listed.stdout)["total_count"] != 0:
+            return False
+        view = gh("pr", "view", str(number), "--json", "headRefOid")
+        if view.returncode != 0:
+            return None
+        head = _api(repo, f"contents/.github/workflows?ref={json.loads(view.stdout)['headRefOid']}")
+    except (Error, KeyError, TypeError, ValueError):
+        return None
+    if head.returncode == 0:  # the PR itself adds the first workflow; its checks are still to come
+        return False
+    return True if "404" in head.stderr + head.stdout else None
+
+
 def wait_ci(repo: str, number: int, deadline: float | None = None) -> tuple[str, str]:
     """(state, one line): poll the PR's checks until `deadline` (BUDGET_S from now). `pending`
     means ask again; a gh error or a PR with no checks yet is pending too, since the next call may
-    see them."""
-    deadline = deadline or time.monotonic() + BUDGET_S
+    see them. `no_ci` means the repo has no workflows at all: not a pass, there is nothing to trust."""
+    start = time.monotonic()
+    deadline = deadline or start + BUDGET_S
+    none_ci: bool | None = None
 
     def gh(*args: str) -> "subprocess.CompletedProcess[str]":
         left = max(1, min(30, int(deadline - time.monotonic())))
@@ -154,6 +214,16 @@ def wait_ci(repo: str, number: int, deadline: float | None = None) -> tuple[str,
             state, line = _poll(gh, number)
         except (Error, KeyError, TypeError, ValueError) as e:
             state, line = "pending", f"pending: gh did not answer, will retry ({e})"
+        if state == "none":
+            waited = time.monotonic() - start
+            none_ci = (
+                _no_ci(gh, repo, number) if none_ci is None and waited >= NO_CI_GRACE_S else none_ci
+            )
+            if none_ci:
+                return "no_ci", "no_ci: this repo has no CI workflows, so no check will ever report"
+            state = "pending"
+            if waited >= NO_CHECKS_CAP_S:
+                return state, f"pending: no checks reported yet after {NO_CHECKS_CAP_S} s"
         if state != "pending" or time.monotonic() + POLL_S > deadline:
             return state, line
         time.sleep(POLL_S)
@@ -272,6 +342,7 @@ def act(conn: sqlite3.Connection, run_id: int, verb: str, args: dict[str, Any]) 
         ahead, default = _facts(t, run)
         return store.complete(conn, run_id, summary, commits_ahead=ahead, default_branch=default)
     number, url = _check_pr(t)
+    _closes(conn, t, number)
     reviewer = args.get("reviewer")
     return store.request_review(
         conn, run_id, summary, pr_number=number, pr_url=url,

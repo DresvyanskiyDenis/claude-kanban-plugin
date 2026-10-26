@@ -833,6 +833,32 @@ def test_scratch_card_with_a_branch_is_refused(conn: Any, card: Card, repo: Path
     )
 
 
+PR_DELIVERABLE = "## Goal\ng\n\n## Deliverable\nPR against host/acme/proj:main, docs only.\n\n## Out of scope\nx\n"
+
+
+@pytest.mark.parametrize("assignee", ["smith", "designer"])
+def test_scratch_builder_card_whose_deliverable_is_a_pr_is_refused(
+    conn: Any, card: Card, assignee: str
+) -> None:
+    with pytest.raises(Refused, match=r"--workspace worktree:.* --branch feature/<slug>"):
+        card(body=PR_DELIVERABLE, assignee=assignee)
+    tid = card(body=PR_DELIVERABLE, assignee=assignee, triage=True)
+    with pytest.raises(Refused, match="request-review"):
+        store.specify(conn, tid, {})
+
+
+def test_scratch_card_without_a_pr_deliverable_is_still_fine(
+    conn: Any, card: Card, repo: Path
+) -> None:
+    assert card(body="## Deliverable\nA file at /abs/report.md\n\n## Context\nthe PR is #4\n")
+    assert card(body=PR_DELIVERABLE, assignee="scout"), "a scout writes no PR, whatever it reads"
+    store.board_create(conn, "wt", default_workdir=str(repo))
+    assert store.create(
+        conn, "wt", "w", body=PR_DELIVERABLE, assignee="smith",
+        workspace=f"worktree:{repo}", branch="feat/x",
+    )  # fmt: skip
+
+
 def test_base_defaults_to_the_only_worktree_parent_base(conn: Any, board: str, repo: Path) -> None:
     store.board_create(conn, "wt", default_workdir=str(repo))
     ws = f"worktree:{repo}"

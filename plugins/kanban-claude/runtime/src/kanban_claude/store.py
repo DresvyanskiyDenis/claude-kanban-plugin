@@ -205,6 +205,7 @@ STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "
 NOT_RUNNING = tuple(s for s in STATUSES if s != "running")
 WORKER_BLOCK_KINDS = ("needs_input", "capability", "transient")
 BUILDERS = ("smith", "designer")
+PR_WORD = re.compile(r"\bPR\b|pull request", re.I)
 PARTIAL_REVIEW = "PARTIAL REVIEW"  # a warden approval the owner merges (D10), never the daemon
 MERGE_METHODS = ("squash", "merge", "rebase")
 ADVISOR_POLICIES = ("inherit", "off", "ab")
@@ -949,6 +950,13 @@ def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> No
             raise Refused(
                 "a scratch card has no repo, so a branch cannot apply; "
                 "pass --workspace worktree:<repo> with --branch, or leave the branch out"
+            )
+        deliverable = re.search(r"^## Deliverable[ \t]*\n(.*?)(?=^## |\Z)", t["body"], re.M | re.S)
+        if t["assignee"] in BUILDERS and deliverable and PR_WORD.search(deliverable[1]):
+            raise Refused(
+                "the Deliverable is a PR, but a scratch card has no repo or branch, so its worker "
+                "cannot run request-review and the PR would skip the warden; pass "
+                f"--workspace worktree:{board['default_workdir'] or '<repo>'} --branch feature/<slug>"
             )
         return
     validate.workspace(kind, t["workspace_path"], claude_dirs=claude_dirs(conn, board))

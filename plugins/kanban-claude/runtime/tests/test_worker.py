@@ -99,6 +99,67 @@ def test_request_review_finds_the_pr_by_the_card_not_by_the_summary(
     ]  # fmt: skip
 
 
+def link_issue(
+    conn: Any, tid: str, repo: str = "example.invalid/acme/proj", number: int = 12
+) -> None:
+    conn.execute(
+        "INSERT INTO github_links(task_id, repo, number, node_id, base_title, base_body, card_title,"
+        " card_body, synced_status, synced_version, created_at) VALUES (?,?,?,'n','t','b','t','b','todo',1,0)",
+        (tid, repo, number),
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Closes acme/proj#12",
+        "closes ACME/proj#12.",
+        "Fixes acme/proj#12\nGate: x",
+        "Resolves #12",
+        "Closes https://example.invalid/acme/proj/issues/12",
+    ],
+)
+def test_request_review_takes_a_linked_card_whose_pr_closes_the_issue(
+    conn: Any, wt: tuple[str, int], set_prs: Prs, body: str
+) -> None:
+    tid, run = wt
+    link_issue(conn, tid)
+    set_prs({"7": {**PR, "body": f"Summary\n\n{body}\n"}})
+    got = ask(conn, run, "request-review", summary="done")
+    assert got["exit"] == 0, got
+    assert store.get_task(conn, tid)["status"] == "review"
+
+
+@pytest.mark.parametrize(
+    "body", ["", "no link here", "Closes acme/proj#123", "Closes acme/other#12", "see acme/proj#12"]
+)
+def test_request_review_refuses_a_linked_card_whose_pr_lacks_the_closes_line(
+    conn: Any, wt: tuple[str, int], set_prs: Prs, body: str
+) -> None:
+    tid, run = wt
+    link_issue(conn, tid)
+    set_prs({"7": {**PR, "body": body}})
+    got = ask(conn, run, "request-review", summary="done")
+    assert got["exit"] == 4 and "`Closes acme/proj#12`" in got["message"], got
+    assert "PR #7" in got["message"] and store.get_task(conn, tid)["status"] == "running"
+
+
+@pytest.mark.parametrize("jira", [False, True])
+def test_request_review_needs_no_closes_line_without_a_github_link(
+    conn: Any, wt: tuple[str, int], set_prs: Prs, jira: bool
+) -> None:
+    tid, run = wt
+    if jira:  # a Jira-only card has no GitHub issue to close
+        conn.execute(
+            "INSERT INTO jira_links(task_id, jira_key, base_title, base_body, card_title, card_body,"
+            " synced_status, synced_version, created_at) VALUES (?,'ABC-1','t','b','t','b','todo',1,0)",
+            (tid,),
+        )
+    set_prs({"7": {**PR, "body": "no closing line at all"}})
+    got = ask(conn, run, "request-review", summary="done")
+    assert got["exit"] == 0, got
+
+
 @pytest.mark.parametrize(
     "change",
     [{"state": "MERGED"}, {"headRefName": "feat/other"}, {"baseRefName": "develop"}],
@@ -121,6 +182,16 @@ def test_request_review_refuses_several_open_prs(
     got = ask(conn, run, "request-review", summary="done")
     assert got["exit"] == 4 and "#7" in got["message"] and "#8" in got["message"], got
     assert store.get_task(conn, tid)["status"] == "running"
+
+
+def test_request_review_on_a_scratch_card_says_to_block_not_to_complete(
+    conn: Any, card: Callable[..., str]
+) -> None:
+    run = store.claim(conn, card("s"))
+    assert run
+    got = ask(conn, run, "request-review", summary="PR #5 is open")
+    assert got["exit"] == 4 and "kanban block --kind needs_input" in got["message"], got
+    assert "skip the warden" in got["message"]
 
 
 def test_request_review_needs_a_summary(conn: Any, wt: tuple[str, int], set_prs: Prs) -> None:
@@ -280,8 +351,80 @@ def test_wait_ci_failed_run_fails_and_no_run_at_all_stays_pending(
         pr_checks=[(0, "[]", "")],
         pr_view=[(0, json.dumps({"headRefOid": "abc"}), "")],
         run_list=[(0, "[]", "")],
+        **WORKFLOWS_2,
     )
-    assert worker.wait_ci("h/o/r", 7) == ("pending", "pending: no checks reported yet")
+    state, line = worker.wait_ci("h/o/r", 7)
+    assert state == "pending" and "no checks reported" in line
+
+
+WF_API = "api_repos/o/r/actions/workflows"
+WF_DIR = "api_repos/o/r/contents/.github/workflows?ref=abc"
+WORKFLOWS_2 = {WF_API: [(0, json.dumps({"total_count": 2}), "")]}
+NO_WORKFLOWS = {WF_API: [(0, json.dumps({"total_count": 0}), "")]}
+NOT_FOUND = (1, "", "gh: Not Found (HTTP 404)")
+
+
+def no_checks(**extra: list[Reply]) -> dict[str, list[Reply]]:
+    return {
+        "pr_checks": [(1, "", NO_CHECKS)],
+        "pr_view": [(0, json.dumps({"headRefOid": "abc"}), "")],
+        "run_list": [(0, "[]", "")],
+        **extra,
+    }
+
+
+def test_wait_ci_on_a_repo_without_workflows_says_no_ci_after_the_grace(
+    fake_gh: Callable[..., FakeGh],
+) -> None:
+    gh = fake_gh(**no_checks(**NO_WORKFLOWS, **{WF_DIR: [NOT_FOUND]}))
+    state, line = worker.wait_ci("h/o/r", 7)
+    assert state == "no_ci" and "passed" not in line and "green" not in line
+    assert worker.NO_CI_GRACE_S <= gh.t < worker.NO_CI_GRACE_S + worker.POLL_S
+    asked = [c for c in gh.calls if c[0] == "api"]
+    assert asked[0][1] == "repos/o/r/actions/workflows" and asked[0][-2:] == ("--hostname", "h")
+
+
+def test_wait_ci_does_not_declare_no_ci_when_the_pr_adds_the_first_workflow(
+    fake_gh: Callable[..., FakeGh],
+) -> None:
+    gh = fake_gh(**no_checks(**NO_WORKFLOWS, **{WF_DIR: [(0, "[]", "")]}))
+    assert worker.wait_ci("h/o/r", 7)[0] == "pending"
+    assert gh.t >= worker.NO_CHECKS_CAP_S
+
+
+def test_wait_ci_with_workflows_caps_the_no_checks_phase_and_stays_pending(
+    fake_gh: Callable[..., FakeGh],
+) -> None:
+    gh = fake_gh(**no_checks(**WORKFLOWS_2))
+    state, line = worker.wait_ci("h/o/r", 7)
+    assert state == "pending" and "no checks reported" in line
+    assert worker.NO_CHECKS_CAP_S <= gh.t < worker.NO_CHECKS_CAP_S + worker.POLL_S
+    assert not any(c[0] == "api" and "contents" in c[1] for c in gh.calls)
+
+
+def test_wait_ci_unknown_workflow_lookup_is_not_no_ci(fake_gh: Callable[..., FakeGh]) -> None:
+    fake_gh(**no_checks(**{WF_API: [(1, "", "HTTP 502")]}))
+    assert worker.wait_ci("h/o/r", 7)[0] == "pending"
+
+
+def test_wait_ci_late_checks_still_count_after_the_grace(fake_gh: Callable[..., FakeGh]) -> None:
+    fake_gh(**{**no_checks(**WORKFLOWS_2), "pr_checks": [
+        (1, "", NO_CHECKS), (1, "", NO_CHECKS), (1, "", NO_CHECKS), (1, "", NO_CHECKS),
+        (0, checks(("lint", "pass")), ""),
+    ]})  # fmt: skip
+    assert worker.wait_ci("h/o/r", 7) == ("passed", "passed: 1 check")
+
+
+def test_wait_ci_cli_exits_6_for_no_ci(
+    kb: Any, wt: tuple[str, int], fake_gh: Callable[..., FakeGh], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KANBAN_RUN_ID", str(wt[1]))
+    fake_gh(**no_checks(**{
+        "api_repos/acme/proj/actions/workflows": NO_WORKFLOWS[WF_API],
+        "api_repos/acme/proj/contents/.github/workflows?ref=abc": [NOT_FOUND],
+    }))  # fmt: skip
+    got, out, _ = kb("wait-ci", "--pr", "7")
+    assert got == 6 and out.startswith("no_ci") and worker.CI_EXIT["no_ci"] not in (0, 1, 2)
 
 
 def test_wait_ci_survives_a_gh_error_and_reports_it_when_time_runs_out(
