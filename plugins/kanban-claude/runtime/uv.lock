@@ -90,7 +90,7 @@ wheels = [
 
 [[package]]
 name = "kanban-claude"
-version = "0.4.0.dev2"
+version = "0.4.0.dev3"
 source = { editable = "." }
 
 [package.dev-dependencies]

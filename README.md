@@ -68,7 +68,7 @@ To follow the board from a session, run `kanban watch --actionable --wait --boar
 
 ## Session start
 
-`hooks/scripts/session_start.sh` (POSIX `sh`, well under 50 ms, read-only) runs at the start of every session except a worker's. It prints nothing when the machine is not set up or all is well. When the plugin's version differs from `installed.json` it prints `kanban-claude: daemon a.b.c, plugin x.y.z — run /kanban-claude:setup to upgrade`. While dispatch is paused it prints one line of enumerated codes (`manual`, `systemic`, `auth:<config dir>`, `quota:<config dir> until <time>`) and `kanban doctor` as the way to the fix. It reads the two versions with a fixed `sed` pattern, queries the database with `sqlite3 -readonly`, never evaluates a file, never prints card or worker text, and never installs anything.
+`hooks/scripts/session_start.sh` (POSIX `sh`, well under 50 ms, read-only) runs at the start of every session except a worker's. It prints nothing when the machine is not set up or all is well. When the plugin's version differs from `installed.json` it prints `kanban-claude: daemon a.b.c, plugin x.y.z — run /kanban-claude:setup to upgrade`. While dispatch is paused it prints one line of enumerated codes (`manual`, `systemic`, `auth:<config dir>`, `quota:<config dir> until <time>`; a `systemic` pause lifts itself after a passing model-call probe) and `kanban doctor` as the way to the fix. It reads the two versions with a fixed `sed` pattern, queries the database with `sqlite3 -readonly`, never evaluates a file, never prints card or worker text, and never installs anything.
 
 ## Board pane
 
