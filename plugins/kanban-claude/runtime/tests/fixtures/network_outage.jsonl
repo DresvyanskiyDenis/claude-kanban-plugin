@@ -1,0 +1,15 @@
+{"type": "system", "subtype": "init", "session_id": "s1", "model": "claude-sonnet-x", "permissionMode": "auto", "claude_code_version": "2.1.0", "plugins": [{"name": "kanban-claude"}]}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "tu1", "name": "Bash", "input": {"command": "ls"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tu1", "content": "ok"}]}}
+{"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10, "retry_delay_ms": 1000, "error_status": null, "error": "unknown"}
+{"type": "system", "subtype": "api_retry", "attempt": 2, "max_retries": 10, "retry_delay_ms": 2000, "error_status": null, "error": "unknown"}
+{"type": "system", "subtype": "api_retry", "attempt": 3, "max_retries": 10, "retry_delay_ms": 3000, "error_status": null, "error": "unknown"}
+{"type": "system", "subtype": "api_retry", "attempt": 4, "max_retries": 10, "retry_delay_ms": 4000, "error_status": null, "error": "unknown"}
+{"type": "system", "subtype": "api_retry", "attempt": 5, "max_retries": 10, "retry_delay_ms": 5000, "error_status": null, "error": "unknown"}
+{"type": "system", "subtype": "api_retry", "attempt": 6, "max_retries": 10, "retry_delay_ms": 6000, "error_status": null, "error": "unknown"}
+{"type": "system", "subtype": "api_retry", "attempt": 7, "max_retries": 10, "retry_delay_ms": 7000, "error_status": null, "error": "unknown"}
+{"type": "system", "subtype": "api_retry", "attempt": 8, "max_retries": 10, "retry_delay_ms": 8000, "error_status": null, "error": "unknown"}
+{"type": "system", "subtype": "api_retry", "attempt": 9, "max_retries": 10, "retry_delay_ms": 9000, "error_status": null, "error": "unknown"}
+{"type": "system", "subtype": "api_retry", "attempt": 10, "max_retries": 10, "retry_delay_ms": 10000, "error_status": null, "error": "unknown"}
+{"type": "assistant", "message": {"content": [{"type": "text", "text": "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"}]}}
+{"type": "result", "subtype": "success", "is_error": true, "api_error_status": null, "terminal_reason": "api_error", "num_turns": 1, "result": "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)", "total_cost_usd": 0}

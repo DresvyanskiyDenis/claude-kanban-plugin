@@ -280,7 +280,7 @@ select.input { padding-right: 6px; }
 .o-completed, .o-approved { --oc: var(--st-done-f); --oci: var(--st-done-i); }
 .o-review_requested { --oc: var(--st-review-f); --oci: var(--st-review-i); }
 .o-changes_requested, .o-interrupted { --oc: var(--warn-f); --oci: var(--warn-i); }
-.o-blocked, .o-crashed, .o-auth_lost, .o-timeout { --oc: var(--st-blocked-f); --oci: var(--st-blocked-i); }
+.o-blocked, .o-crashed, .o-auth_lost, .o-timeout, .o-network, .o-stalled { --oc: var(--st-blocked-f); --oci: var(--st-blocked-i); }
 .o-running { --oc: var(--st-running-f); --oci: var(--st-running-i); }
 .o-info { --oc: var(--st-review-f); --oci: var(--st-review-i); }
 .o-ok { --oc: var(--st-done-f); --oci: var(--st-done-i); }

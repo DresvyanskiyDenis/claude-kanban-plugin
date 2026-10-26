@@ -145,7 +145,7 @@ function niceMax(v) {
 
 // --- the view ------------------------------------------------------------------------------
 
-const OUTCOME = { completed: "ok", review_requested: "info", approved: "ok", changes_requested: "warn", blocked: "bad", crashed: "bad", auth_lost: "bad", interrupted: "warn", timeout: "bad" };
+const OUTCOME = { completed: "ok", review_requested: "info", approved: "ok", changes_requested: "warn", blocked: "bad", crashed: "bad", auth_lost: "bad", network: "warn", stalled: "warn", interrupted: "warn", timeout: "bad" };
 
 export function createStats(root, S, nav) {
   let timer = null;

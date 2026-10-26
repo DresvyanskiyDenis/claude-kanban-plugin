@@ -948,3 +948,11 @@ def test_an_ab_role_records_its_arm_on_the_run_and_the_switch_in_its_params(
     run = execute(card())
     assert run["advisor"] == "off"
     assert json.loads(run["params"])["env"]["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+
+
+def test_a_worker_waits_for_its_background_tasks_without_claudes_10_minute_ceiling(
+    conn: Any, card: Card, tmp_path: Path
+) -> None:
+    """`-p` stops background work 10 min after the last turn and exits 0; 0 waits indefinitely.
+    The no-progress watchdog (worker.stall_s) is what ends a background task that hangs."""
+    assert env_for(conn, card("t"), tmp_path)["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == "0"

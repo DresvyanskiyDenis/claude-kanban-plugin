@@ -216,6 +216,11 @@ SYSTEMIC_CRASH_COUNT = 3
 SYSTEMIC_WINDOW_S = 600
 MAX_ATTACH_BYTES = 25 * 1024 * 1024
 COUNTED_OUTCOMES = ("budget_exceeded", "timed_out", "crashed")
+# the machine or the network, not the card: retried with a growing wait, counted only past the cap
+TRANSIENT_OUTCOMES = ("network", "stalled")
+TRANSIENT_RETRIES = 6
+TRANSIENT_COOLDOWN_S = 300
+TRANSIENT_COOLDOWN_MAX_S = 1800
 TRIAGE_RUNTIME_S = 7200
 OWNER = "owner:cli"
 RUN_ENDED = "run ended; the owner stopped it or it already finished. Stop working and exit"
@@ -271,6 +276,9 @@ DEFAULTS: dict[str, Any] = {
     "quota.requeue_s": 300,
     "worker.keep_awake": True,
     "worker.terminal_grace_s": 120,
+    # awake seconds with no assistant/tool event before the run is stopped and retried (0 = off);
+    # above the 600 s Bash cap and the 540 s `wait-ci` poll
+    "worker.stall_s": 1200,
     "worker.max_turns": None,
     "worker.env_passthrough": [],
     "worker.plugin_allowlist": [],
@@ -305,6 +313,7 @@ BOUNDS: dict[str, tuple[int, int | None]] = {
     "dispatch.failure_limit": (1, None),
     "retention.stream_days": (1, None),
     "worker.max_turns": (1, None),
+    "worker.stall_s": (0, None),
 }
 
 Row = sqlite3.Row
@@ -1919,6 +1928,20 @@ def infra_streak(conn: sqlite3.Connection, task_id: str, before_run: int, cap: i
     return streak
 
 
+def transient_streak(conn: sqlite3.Connection, task_id: str, before_run: int) -> int:
+    """How many of the card's latest runs before this one ended `network` or `stalled`, unbroken
+    by any other outcome; counted up to `TRANSIENT_RETRIES`."""
+    streak = 0
+    for (outcome,) in conn.execute(
+        "SELECT outcome FROM task_runs WHERE task_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+        (task_id, before_run, TRANSIENT_RETRIES),
+    ):
+        if outcome not in TRANSIENT_OUTCOMES:
+            break
+        streak += 1
+    return streak
+
+
 def _retry_rule(
     conn: sqlite3.Connection,
     t: Row,
@@ -1947,6 +1970,12 @@ def _retry_rule(
             )
             event(conn, None, "dispatch_paused", "runner", {"reason": "systemic", "detail": detail})
             count = False
+    if outcome in TRANSIENT_OUTCOMES:
+        streak = transient_streak(conn, t["id"], run["id"])
+        if streak >= TRANSIENT_RETRIES:
+            count = True  # a real fault hides behind "the network": let the failure limit end it
+        elif retry_after is None:
+            retry_after = ts + min(TRANSIENT_COOLDOWN_S * 2**streak, TRANSIENT_COOLDOWN_MAX_S)
     limit_card = t["max_retries"]
     if outcome == "protocol_violation":
         streak = t["protocol_violations"] + 1
