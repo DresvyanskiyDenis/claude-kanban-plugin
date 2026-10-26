@@ -862,6 +862,75 @@ def test_scratch_card_with_a_branch_is_refused(conn: Any, card: Card, repo: Path
     )
 
 
+PR_DELIVERABLE = "## Goal\ng\n\n## Deliverable\nPR against host/acme/proj:main, docs only.\n\n## Out of scope\nx\n"
+
+
+@pytest.mark.parametrize("assignee", ["smith", "designer"])
+def test_scratch_builder_card_whose_deliverable_is_a_pr_is_refused(
+    conn: Any, card: Card, assignee: str
+) -> None:
+    with pytest.raises(Refused, match=r"--workspace worktree:.* --branch feature/<slug>"):
+        card(body=PR_DELIVERABLE, assignee=assignee)
+    tid = card(body=PR_DELIVERABLE, assignee=assignee, triage=True)
+    with pytest.raises(Refused, match="request-review"):
+        store.specify(conn, tid, {})
+
+
+def test_scratch_card_without_a_pr_deliverable_is_still_fine(
+    conn: Any, card: Card, repo: Path
+) -> None:
+    assert card(body="## Deliverable\nA file at /abs/report.md\n\n## Context\nthe PR is #4\n")
+    assert card(body=PR_DELIVERABLE, assignee="scout"), "a scout writes no PR, whatever it reads"
+    store.board_create(conn, "wt", default_workdir=str(repo))
+    assert store.create(
+        conn, "wt", "w", body=PR_DELIVERABLE, assignee="smith",
+        workspace=f"worktree:{repo}", branch="feat/x",
+    )  # fmt: skip
+
+
+NO_PR_DELIVERABLE = "## Goal\ng\n\n## Deliverable\nA file at /abs/report.md. Do not open a PR.\n\n## Out of scope\nx\n"
+
+
+@pytest.mark.parametrize(
+    "deliverable",
+    [
+        "A file at /abs/report.md. Do not open a PR.",
+        "A summary; the card opens no pull request.",
+        "No PR: a file at /abs/report.md.",
+        "A report, without a PR.",
+    ],
+)
+def test_a_negated_pr_deliverable_does_not_count_as_a_pr(
+    conn: Any, card: Card, deliverable: str
+) -> None:
+    assert card(body=f"## Deliverable\n{deliverable}\n\n## Out of scope\nx\n", assignee="smith")
+
+
+@pytest.mark.parametrize(
+    "deliverable",
+    [
+        "PR against host/acme/proj:main. Do not touch docs.",
+        "One PR from `feature/x` into `main`, no other changes.",
+        "A file, then open a pull request.",
+    ],
+)
+def test_an_affirmative_pr_deliverable_still_counts_as_a_pr(
+    conn: Any, card: Card, deliverable: str
+) -> None:
+    with pytest.raises(Refused, match="Deliverable is a PR"):
+        card(body=f"## Deliverable\n{deliverable}\n", assignee="smith")
+
+
+def test_edit_refuses_a_scratch_builder_card_that_would_deliver_a_pr(conn: Any, card: Card) -> None:
+    tid = card(body=NO_PR_DELIVERABLE, assignee="smith")
+    with pytest.raises(Refused, match="Deliverable is a PR"):
+        store.edit(conn, tid, {"body": PR_DELIVERABLE})
+    scout = card(body=PR_DELIVERABLE, assignee="scout")
+    with pytest.raises(Refused, match="Deliverable is a PR"):
+        store.edit(conn, scout, {"title": "t"}, assignee="smith")
+    assert store.edit(conn, tid, {"title": "still fine"})["fields"] == ["title"]
+
+
 def test_base_defaults_to_the_only_worktree_parent_base(conn: Any, board: str, repo: Path) -> None:
     store.board_create(conn, "wt", default_workdir=str(repo))
     ws = f"worktree:{repo}"
@@ -1086,3 +1155,15 @@ def test_the_measure_columns_arrive_on_an_old_board_and_old_runs_stay_unmeasured
             "api_ms", "harness", "params"} <= cols  # fmt: skip
     assert c.execute("PRAGMA user_version").fetchone()[0] == len(store.MIGRATIONS)
     c.close()
+
+
+@pytest.mark.parametrize("value", [1, 699])
+def test_a_stall_limit_that_would_kill_a_healthy_wait_is_refused(conn: Any, value: int) -> None:
+    with pytest.raises(Refused, match=r"0 \(off\) or at least 700.*wait-ci"):
+        store.config_set(conn, "worker.stall_s", value)
+
+
+@pytest.mark.parametrize("value", [0, 700, 1200])
+def test_a_stall_limit_of_zero_or_at_least_700_is_accepted(conn: Any, value: int) -> None:
+    store.config_set(conn, "worker.stall_s", value)
+    assert store.cfg(conn, "worker.stall_s") == value

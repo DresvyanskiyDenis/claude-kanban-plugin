@@ -253,10 +253,16 @@ def test_a_network_outage_is_retried_later_and_counts_for_nothing(
     assert store.state_get(conn, "dispatch_paused") is None
 
 
-def test_a_run_with_no_progress_is_killed_and_resumed_not_failed(
-    conn: Any, card: Card, execute: Execute
-) -> None:
+def short_stall(conn: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 1 s watchdog, which the 700 s floor on `worker.stall_s` refuses to configure."""
+    monkeypatch.setattr(store, "STALL_MIN_S", 1)
     store.config_set(conn, "worker.stall_s", 1)
+
+
+def test_a_run_with_no_progress_is_killed_and_resumed_not_failed(
+    conn: Any, card: Card, execute: Execute, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    short_stall(conn, monkeypatch)
     tid = card()
     started = time.monotonic()
     run = execute(tid, "stalled", FAKE_CLAUDE_SLEEP="60")
@@ -278,16 +284,18 @@ def test_a_401_the_login_probe_does_not_confirm_is_a_backed_off_retry_not_a_paus
     assert not account(conn, tid).get("auth_paused") and t["retry_after"] > time.time()
 
 
-def test_a_quiet_background_wait_is_not_a_stall(conn: Any, card: Card, execute: Execute) -> None:
+def test_a_quiet_background_wait_is_not_a_stall(
+    conn: Any, card: Card, execute: Execute, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The tail of SDM t_645a5a4e run 6: the turn ended, a background task runs, nothing arrives."""
-    store.config_set(conn, "worker.stall_s", 1)
+    short_stall(conn, monkeypatch)
     run = execute(card(), "background_wait", FAKE_CLAUDE_SLEEP="4")
     assert run["outcome"] == "protocol_violation"
 
 
 def test_api_retries_during_a_background_wait_are_still_a_stall(
-    conn: Any, card: Card, execute: Execute
+    conn: Any, card: Card, execute: Execute, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store.config_set(conn, "worker.stall_s", 1)
+    short_stall(conn, monkeypatch)
     run = execute(card(), "background_wait_outage", FAKE_CLAUDE_SLEEP="60")
     assert run["outcome"] == "stalled"

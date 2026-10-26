@@ -205,6 +205,8 @@ STATUSES = ("triage", "todo", "ready", "running", "review", "blocked", "done", "
 NOT_RUNNING = tuple(s for s in STATUSES if s != "running")
 WORKER_BLOCK_KINDS = ("needs_input", "capability", "transient")
 BUILDERS = ("smith", "designer")
+PR_WORD = re.compile(r"\bPR\b|pull request", re.I)
+NEGATION = re.compile(r"\b(?:no|not|never|without|none)\b|n't", re.I)
 PARTIAL_REVIEW = "PARTIAL REVIEW"  # a warden approval the owner merges (D10), never the daemon
 MERGE_METHODS = ("squash", "merge", "rebase")
 ADVISOR_POLICIES = ("inherit", "off", "ab")
@@ -305,6 +307,7 @@ DEFAULTS: dict[str, Any] = {
     },
 }  # fmt: skip
 
+STALL_MIN_S = 700  # above the 600 s Bash cap and the 540 s `wait-ci`, which are quiet by design
 BOUNDS: dict[str, tuple[int, int | None]] = {
     "jira.poll_s": (1, None),
     "github.poll_s": (1, None),
@@ -474,6 +477,11 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         if type(value) is not int or value < low or (high is not None and value > high):
             span = f"from {low} to {high}" if high else f"of at least {low}"
             raise Refused(f"{key} must be an integer {span}")
+    if key == "worker.stall_s" and value is not None and 0 < value < STALL_MIN_S:
+        raise Refused(
+            f"worker.stall_s must be 0 (off) or at least {STALL_MIN_S}: a shorter value would stop a "
+            "healthy `kanban wait-ci` (up to 540 s) or a foreground Bash call (up to 600 s)"
+        )
     if key == "budget.ceiling" and value <= 0:
         raise Refused("budget.ceiling must be positive")
     if (
@@ -939,6 +947,15 @@ def _columns(conn: sqlite3.Connection, fields: dict[str, Any], board: Row) -> di
     return out
 
 
+def _deliverable_is_pr(text: str) -> bool:
+    """A PR mention counts unless a negation sits among the four words before it in its sentence
+    ("Do not open a PR", "no PR"). shortcut: a negation after the PR word is not read."""
+    return any(
+        not NEGATION.search(" ".join(re.split(r"[.;:!?\n]", text[: m.start()])[-1].split()[-4:]))
+        for m in PR_WORD.finditer(text)
+    )
+
+
 def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> None:
     """The non-triage checks of lifecycle #1, on a merged card (SEC-10, GIT-01/09, MN-31)."""
     _need(
@@ -958,6 +975,13 @@ def _dispatchable(conn: sqlite3.Connection, t: dict[str, Any], board: Row) -> No
             raise Refused(
                 "a scratch card has no repo, so a branch cannot apply; "
                 "pass --workspace worktree:<repo> with --branch, or leave the branch out"
+            )
+        deliverable = re.search(r"^## Deliverable[ \t]*\n(.*?)(?=^## |\Z)", t["body"], re.M | re.S)
+        if t["assignee"] in BUILDERS and deliverable and _deliverable_is_pr(deliverable[1]):
+            raise Refused(
+                "the Deliverable is a PR, but a scratch card has no repo or branch, so its worker "
+                "cannot run request-review and the PR would skip the warden; pass "
+                f"--workspace worktree:{board['default_workdir'] or '<repo>'} --branch feature/<slug>"
             )
         return
     validate.workspace(kind, t["workspace_path"], claude_dirs=claude_dirs(conn, board))

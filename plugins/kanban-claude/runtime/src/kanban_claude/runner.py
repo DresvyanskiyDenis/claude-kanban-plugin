@@ -677,8 +677,12 @@ class Runner:
                 traceback.print_exc()
         if isinstance(ev, dict):
             if ev.get("type") == "system" and ev.get("subtype") == "background_tasks_changed":
+                if self.bg_tasks != bool(ev.get("tasks")):
+                    self.progress_at = t  # the quiet wait was not stalled; time it afresh
                 self.bg_tasks = bool(ev.get("tasks"))
             elif ev.get("type") == "system" and ev.get("subtype") == "api_retry":
+                if not self.api_retrying:
+                    self.progress_at = t
                 self.api_retrying = True
             if classify.is_progress(ev):
                 self.progress_at, self.api_retrying = t, False

@@ -241,6 +241,11 @@ def _frame(what: str, author: str | None, ts: int | None, text: str, limit: int)
     return f"{what} from worker `{author or 'unknown'}`{when}:\n{cap(text, limit)}"
 
 
+def issue_ref(lk: sqlite3.Row) -> str:
+    """`OWNER/REPO#N` of a github_links row, whose repo is `HOST/OWNER/REPO`."""
+    return f"{lk['repo'].partition('/')[2]}#{lk['number']}"
+
+
 def github_line(conn: sqlite3.Connection, task_id: str) -> list[str]:
     """A card tied to a GitHub issue says so, with the line that makes its PR close the issue on merge."""
     lk = conn.execute(
@@ -248,7 +253,7 @@ def github_line(conn: sqlite3.Connection, task_id: str) -> list[str]:
     ).fetchone()
     if lk is None:
         return []
-    ref = f"{lk['repo'].partition('/')[2]}#{lk['number']}"
+    ref = issue_ref(lk)
     return [
         f"- github issue: {ref}; put the line `Closes {ref}` in the PR body so the merge closes it"
     ]
