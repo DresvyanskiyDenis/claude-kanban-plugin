@@ -83,7 +83,7 @@ VERB_HELP = {
     "complete": "end the run: the work is done",
     "request-review": "end the run: the PR is ready, hand it to the reviewer",
     "request-changes": "send a reviewed card back to its builder with the reasons",
-    "wait-ci": "wait up to 9 minutes for the PR checks; exit 0 pass, 1 fail, 2 pending, 6 repo has no CI",
+    "wait-ci": "wait up to 9 minutes for the PR checks; exit 0 pass, 1 fail, 2 pending, 6 repo has no CI, 7 every check skipped",
     "gate": "run a gate command; the full output goes to a log, a short digest is printed",
     "boards": "list, create, edit or archive boards",
     "jira": "import, link, unlink or sync Jira issues",

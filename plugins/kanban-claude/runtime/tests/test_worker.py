@@ -293,6 +293,19 @@ def fake_gh(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeGh]:
     return install
 
 
+@pytest.mark.parametrize("n", [1, 3])
+def test_wait_ci_all_skipped_is_not_a_pass(fake_gh: Callable[..., FakeGh], n: int) -> None:
+    fake_gh(pr_checks=[(0, checks(*[(f"c{i}", "skipping") for i in range(n)]), "")])
+    state, line = worker.wait_ci("h/o/r", 7)
+    assert state == "skipped" and line.startswith("skipped:") and "passed" not in line
+    assert worker.CI_EXIT[state] not in (0, worker.CI_EXIT["pending"])
+
+
+def test_wait_ci_failed_beats_skipped(fake_gh: Callable[..., FakeGh]) -> None:
+    fake_gh(pr_checks=[(1, checks(("a", "skipping"), ("b", "fail")), "")])
+    assert worker.wait_ci("h/o/r", 7)[0] == "failed"
+
+
 def test_wait_ci_passes_and_names_the_count(fake_gh: Callable[..., FakeGh]) -> None:
     gh = fake_gh(pr_checks=[(0, checks(("lint", "pass"), ("tests", "skipping")), "")])
     assert worker.wait_ci("h/o/r", 7) == ("passed", "passed: 2 checks")

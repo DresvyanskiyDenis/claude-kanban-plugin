@@ -38,7 +38,7 @@ POLL_S = 20
 # or event filter kept them off the head, so the wait ends instead of burning the whole budget.
 NO_CI_GRACE_S = 60
 NO_CHECKS_CAP_S = 180
-CI_EXIT = {"passed": 0, "failed": 1, "pending": 2, "no_ci": 6}  # no_ci is never a pass
+CI_EXIT = {"passed": 0, "failed": 1, "pending": 2, "no_ci": 6, "skipped": 7}  # neither is a pass
 GATE_LINES = 40
 GATE_RE = re.compile(r"FAIL|Error|error:|failed|Traceback|AssertionError|✗")
 _FAILED_RUNS = ("failure", "timed_out", "cancelled", "startup_failure", "action_required")
@@ -136,6 +136,8 @@ def _verdict(rows: list[tuple[str, str]]) -> tuple[str, str]:
         return "failed", "failed: " + ", ".join(failed[:8])
     if pending:
         return "pending", f"pending: {len(pending)} of {len(rows)} checks still running"
+    if all(b == "skipping" for _, b in rows):  # nothing ran: a pass needs at least one passing check
+        return "skipped", f"skipped: all {len(rows)} check{'' if len(rows) == 1 else 's'} skipped"
     return "passed", f"passed: {len(rows)} check{'' if len(rows) == 1 else 's'}"
 
 
