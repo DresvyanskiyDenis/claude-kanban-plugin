@@ -168,3 +168,31 @@ def test_m3_a_child_of_a_finalize_card_starts_at_approval_not_at_the_owners_merg
         store.get_task(conn, finalize_card)["merged_at"] and kinds() == before
     )  # no event wakes a watcher
 
+
+@pytest.mark.parametrize("parts", [1, 2])
+def test_m4_the_finalize_card_the_reference_prescribes_is_based_on_the_default_branch(
+    conn: Any, repo: Path, parts: int
+) -> None:
+    """With one part the card would inherit the part's base and its PR would go to the milestone branch."""
+    store.board_create(conn, "main", default_workdir=str(repo))
+    milestone = f"milestone/1-{SLUG}"
+    ws = f"worktree:{repo}"
+    ids = [
+        str(
+            store.create(
+                conn, "main", f"Part {i}", body="b", assignee="smith", workspace=ws,
+                branch=f"{milestone}-p{i}", base=milestone,
+            )["id"]
+        )
+        for i in range(parts)
+    ]  # fmt: skip
+    (block,) = (
+        b for b in re.findall(r"```bash\n(.*?)```", REFERENCE.read_text(), re.S) if "-final --" in b
+    )
+    base = re.search(r"--base (\S+)", block)
+    assert base, "the finalize card must pass --base"
+    final = store.create(
+        conn, "main", "Finalize", body="b", assignee="smith", workspace=ws,
+        branch=f"{milestone}-final", base=base[1].replace("<default>", "main"), parents=ids,
+    )  # fmt: skip
+    assert store.get_task(conn, str(final["id"]))["base_branch"] == "main"

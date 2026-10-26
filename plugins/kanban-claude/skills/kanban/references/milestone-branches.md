@@ -36,11 +36,11 @@ With more than one milestone, post the rest of the plan once, as `kanban comment
 
    The Deliverable section says `PR against <repo>:milestone/<n>-<slug>`. Link parts that depend on each other with `--parent`; a child starts only after its parent's PR is merged into the milestone branch. Check each card against `snapshot --ref milestone/<n>-<slug>`.
 
-3. Create one finalize card, a child of every part. It has no `--base`, so its branch is cut from the current `origin/<default>`:
+3. Create one finalize card, a child of every part. Its `--base` is always `<default>`: without it, a card with one part takes that part's base, and the finalize PR would go to the milestone branch. The branch is cut from the current `origin/<default>`:
 
    ```bash
    kanban --board <board> create "Finalize milestone <n>: <slug>" --assignee smith \
-     --workspace worktree:<root> --branch milestone/<n>-<slug>-final --max-runtime 2h \
+     --workspace worktree:<root> --branch milestone/<n>-<slug>-final --base <default> --max-runtime 2h \
      --parent <part id> --parent <part id> --body-file -
    ```
 
