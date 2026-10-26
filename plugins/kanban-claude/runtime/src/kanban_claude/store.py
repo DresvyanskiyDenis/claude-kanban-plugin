@@ -307,6 +307,7 @@ DEFAULTS: dict[str, Any] = {
     },
 }  # fmt: skip
 
+STALL_MIN_S = 700  # above the 600 s Bash cap and the 540 s `wait-ci`, which are quiet by design
 BOUNDS: dict[str, tuple[int, int | None]] = {
     "jira.poll_s": (1, None),
     "github.poll_s": (1, None),
@@ -476,6 +477,11 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
         if type(value) is not int or value < low or (high is not None and value > high):
             span = f"from {low} to {high}" if high else f"of at least {low}"
             raise Refused(f"{key} must be an integer {span}")
+    if key == "worker.stall_s" and value is not None and 0 < value < STALL_MIN_S:
+        raise Refused(
+            f"worker.stall_s must be 0 (off) or at least {STALL_MIN_S}: a shorter value would stop a "
+            "healthy `kanban wait-ci` (up to 540 s) or a foreground Bash call (up to 600 s)"
+        )
     if key == "budget.ceiling" and value <= 0:
         raise Refused("budget.ceiling must be positive")
     if (

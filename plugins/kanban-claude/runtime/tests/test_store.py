@@ -921,9 +921,7 @@ def test_an_affirmative_pr_deliverable_still_counts_as_a_pr(
         card(body=f"## Deliverable\n{deliverable}\n", assignee="smith")
 
 
-def test_edit_refuses_a_scratch_builder_card_that_would_deliver_a_pr(
-    conn: Any, card: Card
-) -> None:
+def test_edit_refuses_a_scratch_builder_card_that_would_deliver_a_pr(conn: Any, card: Card) -> None:
     tid = card(body=NO_PR_DELIVERABLE, assignee="smith")
     with pytest.raises(Refused, match="Deliverable is a PR"):
         store.edit(conn, tid, {"body": PR_DELIVERABLE})
@@ -1157,3 +1155,15 @@ def test_the_measure_columns_arrive_on_an_old_board_and_old_runs_stay_unmeasured
             "api_ms", "harness", "params"} <= cols  # fmt: skip
     assert c.execute("PRAGMA user_version").fetchone()[0] == len(store.MIGRATIONS)
     c.close()
+
+
+@pytest.mark.parametrize("value", [1, 699])
+def test_a_stall_limit_that_would_kill_a_healthy_wait_is_refused(conn: Any, value: int) -> None:
+    with pytest.raises(Refused, match=r"0 \(off\) or at least 700.*wait-ci"):
+        store.config_set(conn, "worker.stall_s", value)
+
+
+@pytest.mark.parametrize("value", [0, 700, 1200])
+def test_a_stall_limit_of_zero_or_at_least_700_is_accepted(conn: Any, value: int) -> None:
+    store.config_set(conn, "worker.stall_s", value)
+    assert store.cfg(conn, "worker.stall_s") == value
