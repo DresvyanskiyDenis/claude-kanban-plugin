@@ -26,13 +26,15 @@ The script decides nothing. A `CHECK` is a question for you.
 
 ## 3. Depth
 
-- `light`: read the diff and run the gate.
+- `light`: read the diff and run the gate (or skip the re-run as section 4 allows).
 - `standard`: also read callers, and run the tests that cover the change.
 - `deep` (sensitive paths such as auth, secrets, migrations, workflows, hooks, or more than 500 non-test lines): all of the above, the full security pass, and a `review-helper` per area for bounded evidence.
 
 ## 4. Contract ledger
 
 List each requirement of the contract and mark it `met`, `unmet` or `unverifiable`, each with evidence. Run the gate command from the `Gate:` line yourself on the head when the repo lets you, as `kanban gate -- '<that command>'`, and open the full log it names only where the excerpt is not enough; a result you did not reproduce is `unverifiable`, not `met`.
+
+Skip that re-run when both hold: pre-flight prints `ok the Gate line names the head commit` (the same sha, not an older ancestor), and every check on the head sha is completed and successful (pre-flight's `ok CI green on the head`, or confirm with `gh pr checks <n> --json name,bucket` or `gh api repos/<owner>/<repo>/commits/<sha>/check-runs`). Then the `Gate:` line plus the green checks make the gate item `met`; still read the whole diff, and run only the tests that cover the changed area when they are cheap. Missing, failing or running checks, no checks at all, or a `Gate:` line on another sha: run the full gate as above. Read the checks themselves: a `kanban wait-ci` exit or a `no_ci` result is not evidence that CI is green.
 
 ## 5. Security pass
 
@@ -48,6 +50,8 @@ Look for: input reaching a shell, SQL query, file path or template unescaped; se
 | `nit` | Taste |
 
 Only an open `blocker` or `major` stops an approval.
+
+GitHub Enterprise and headless runs often cannot attach images to a PR. A written description of what was checked, screenshot files committed under a path in the PR, or screenshot file paths named in the PR body all satisfy a request for screenshots. Never request changes only for a missing image unless the card's Deliverable or Acceptance gate explicitly requires screenshots and the PR has none of those three; then ask for one of them, not for an attachment.
 
 ## 7. Prove or demote
 
@@ -72,6 +76,6 @@ First compare `git status --porcelain` with the count pre-flight printed. If it 
 
 Then exactly one of:
 
-- No open `blocker` or `major`, CI green on the head, gate verified: `kanban complete $KANBAN_TASK --summary "WARDEN: APPROVED PR #<n> @ <head sha> ..."`. After the sha you may add `PARTIAL REVIEW` with its file list, minors, unverified concerns and unverifiable contract items. The marker `WARDEN: APPROVED PR #<n> @ <sha>` must be exact: the board refuses an approval without it. A `PARTIAL REVIEW` approval goes to the owner to merge: the daemon never auto-merges it and emits `awaiting_owner_merge`, so say in the summary what was left unread.
+- No open `blocker` or `major`, CI green on the head, gate verified (by your run or by the section 4 skip): `kanban complete $KANBAN_TASK --summary "WARDEN: APPROVED PR #<n> @ <head sha> ..."`. After the sha you may add `PARTIAL REVIEW` with its file list, minors, unverified concerns and unverifiable contract items. The marker `WARDEN: APPROVED PR #<n> @ <sha>` must be exact: the board refuses an approval without it. A `PARTIAL REVIEW` approval goes to the owner to merge: the daemon never auto-merges it and emits `awaiting_owner_merge`, so say in the summary what was left unread.
 - Otherwise: post the ledger, then `kanban request-changes $KANBAN_TASK --reason "<the required changes, by finding ID>"`. On a card with no builder, a PR reviewed on its own, the same call blocks the card for the owner to pass on.
 - Something only the owner can settle, or a finding stuck for two rounds: `kanban block $KANBAN_TASK --kind needs_input --reason "<what and why>"`.

@@ -108,8 +108,9 @@ Run `kanban watch --actionable --wait --board <slug>` as a background Bash comma
 | `merge_failed` | tell the owner the reason; `kanban merge-retry <id>`, or `promote <child> --ignore-merge --reason` when a child should start anyway |
 | `gave_up`, `stopped` | read `kanban runs <id>` and `kanban log <id> --tail 80`, then decide with the owner |
 | `quota_wall` | nothing to fix. One per wall, for every board on the account: `kind` is `hard` (the limit was hit) or `soft` (close to it, new runs hold), `until` is when it lifts (epoch seconds), `cards` is how many cards wait. Dispatch resumes by itself. Tell the owner when `until` is hours away |
-| `auth_lost`, `account_paused` | the Claude login is gone: tell the owner the `login` command the payload names; after they sign in, `kanban resume`. The daemon also probes the login again after 5, 15, then every 60 minutes and lifts the pause itself (`account_resumed`) |
+| `auth_lost`, `account_paused` | the Claude login is gone: tell the owner the `login` command the payload names; after they sign in, `kanban resume`. The daemon also probes the login again after 5, 15, then every 60 minutes and lifts the pause itself (`account_resumed`). A 401/403 pauses the account only when a fresh probe under the same login fails too |
 | `crashed`, `timed_out`, `interrupted` | the dispatcher retries; no action unless it becomes `gave_up` |
+| `network`, `stalled` (run outcomes) | the API was unreachable, or the run made no assistant/tool event for `worker.stall_s` (default 20 min) and was stopped. Not a failure: the card is retried after 5, 10, 20, then 30 min, and only the 7th in a row counts toward `gave_up`. A `dispatch_paused` with reason `systemic` lifts itself once a model call goes through (probes after 5, 15, then every 60 min; `dispatch_resumed`) |
 
 The owner's own feedback goes back to the builder by the card's status: `kanban reopen-review <id> --reason "<feedback>"` on a card in `review`, `kanban reopen <id> --reason "<feedback>"` on a card already `done` (PR open or merged). A comment alone moves nothing. Both write the reason as a `REOPEN:` comment, which the builder's next run reads.
 

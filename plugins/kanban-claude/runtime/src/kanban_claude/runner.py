@@ -238,6 +238,9 @@ def worker_env(
         KANBAN_HOME=str(d.home), KANBAN_WORK=str(d.work), TMPDIR=str(card_tmp(t["id"])),
         # claude's Bash default of 120 s would cut `kanban wait-ci` (up to 540 s) off
         BASH_DEFAULT_TIMEOUT_MS="600000",
+        # `-p` otherwise stops background tasks 10 min after the last turn and exits 0 (a
+        # protocol_violation); 0 waits for them, and worker.stall_s ends one that hangs
+        CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="0",
     )  # fmt: skip
     if t["workspace_kind"] != "scratch" and (host := origin_host(workspace)):
         env.setdefault("GH_HOST", host)
@@ -266,24 +269,42 @@ def login_command(env: dict[str, str]) -> str:
     return "claude /login"
 
 
-def auth_probe(conn: sqlite3.Connection, config_dir: str) -> str | None:
-    """OBS-03: one cheap `claude -p` under the account's own login. None when the login passes,
-    else why not: only a login failure counts as one; a probe that could not run says so."""
+def probe_claude(conn: sqlite3.Connection, config_dir: str) -> dict[str, Any]:
+    """One cheap `claude -p` under the account's own login; its parsed JSON result."""
     env = with_config_dir(base_env(conn), config_dir)
     claude = store.cfg(conn, "claude.bin") or shutil.which("claude") or "claude"
+    p = subprocess.run(
+        [claude, "-p", "ok", "--model", "haiku", "--effort", "low", "--tools", "",
+         "--max-turns", "1", "--output-format", "json"],
+        capture_output=True, text=True, env=env, timeout=120, stdin=subprocess.DEVNULL,
+    )  # fmt: skip
+    out: dict[str, Any] = json.loads(p.stdout)
+    return out
+
+
+def auth_probe(conn: sqlite3.Connection, config_dir: str) -> str | None:
+    """OBS-03: None when the login passes, else why not: only a login failure counts as one;
+    a probe that could not run says so."""
     try:
-        p = subprocess.run(
-            [claude, "-p", "ok", "--model", "haiku", "--effort", "low", "--tools", "",
-             "--max-turns", "1", "--output-format", "json"],
-            capture_output=True, text=True, env=env, timeout=120, stdin=subprocess.DEVNULL,
-        )  # fmt: skip
-        out = json.loads(p.stdout)
+        out = probe_claude(conn, config_dir)
         line = classify.first_line(out)
         if out.get("api_error_status") not in (401, 403) and not classify.AUTH_RE.match(line):
             return None
     except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as e:
         return f"probe failed: {e}"
+    env = with_config_dir(base_env(conn), config_dir)
     return f"login failed ({line or out.get('api_error_status')}); run: {login_command(env)}"
+
+
+def api_probe(conn: sqlite3.Connection, config_dir: str) -> str | None:
+    """None when a model call goes through (API reachable, login good), else why not."""
+    try:
+        out = probe_claude(conn, config_dir)
+        if not out.get("is_error"):
+            return None
+        return classify.first_line(out) or f"api error {out.get('api_error_status')}"
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as e:
+        return f"probe failed: {e}"
 
 
 def skill_exists(config_dir: str, name: str) -> bool:
@@ -373,6 +394,11 @@ class Runner:
         self.config_dir = ""
         self.signalled = False
         self.timed_out = False
+        self.stalled = False
+        self.stall_s = 0
+        self.progress_at = 0.0
+        self.bg_tasks = False
+        self.api_retrying = False
         self.killed = False
         self.eof = False
         self.term_at: float | None = None
@@ -551,6 +577,8 @@ class Runner:
                 "UPDATE task_runs SET claude_pid = ?, claude_started = ? WHERE id = ?",
                 (self.proc.pid, started, self.run_id),
             )
+        self.stall_s = store.cfg(self.conn, "worker.stall_s")
+        self.progress_at = time.monotonic()
         self.supervise(time.monotonic() + (run["max_runtime_seconds"] or store.TRIAGE_RUNTIME_S))
         self.finish()
         return 0
@@ -574,6 +602,9 @@ class Runner:
         if t >= deadline and self.term_at is None:
             self.timed_out = True
             self.stop_claude()
+        if self.stall_armed() and t >= self.progress_at + self.stall_s:
+            self.stalled = True
+            self.stop_claude()
         r = self.conn.execute(
             "SELECT status, terminal_verb FROM task_runs WHERE id = ?", (self.run_id,)
         ).fetchone()
@@ -587,6 +618,14 @@ class Runner:
             self.killed = True
             signal_group(self.proc.pid if self.proc else None, signal.SIGKILL)
 
+    def stall_armed(self) -> bool:
+        """The no-progress watchdog runs unless claude waits on background tasks: that wait is quiet
+        by design (`-p` ceiling 0). A main thread retrying the API meanwhile is an outage, not a wait.
+        shortcut: a background task that hangs for good is left to the runtime cap."""
+        return bool(
+            self.stall_s and self.term_at is None and (not self.bg_tasks or self.api_retrying)
+        )
+
     def wake_in(self, t: float, deadline: float) -> float:
         due = [t + QUIET_POLL_S]
         if self.term_at is None:
@@ -594,6 +633,8 @@ class Runner:
         elif not self.killed:
             due.append(self.term_at + KILL_GRACE_S)
         due += [x for x in (self.silence_at, self.reap_at) if x]
+        if self.stall_armed():
+            due.append(self.progress_at + self.stall_s)
         return max(0.05, min(due) - t)
 
     def supervise(self, deadline: float) -> None:
@@ -634,6 +675,13 @@ class Runner:
                 self.measure.feed(ev)
             except Exception:  # noqa: BLE001 - counting must never end a paid run
                 traceback.print_exc()
+        if isinstance(ev, dict):
+            if ev.get("type") == "system" and ev.get("subtype") == "background_tasks_changed":
+                self.bg_tasks = bool(ev.get("tasks"))
+            elif ev.get("type") == "system" and ev.get("subtype") == "api_retry":
+                self.api_retrying = True
+            if classify.is_progress(ev):
+                self.progress_at, self.api_retrying = t, False
         if not isinstance(ev, dict):
             self.tail.append(line.rstrip())
         if self.silence_at is not None or (kind == "limit" and self.stream.rejected):
@@ -694,11 +742,13 @@ class Runner:
         run = self.row()
         verdict = classify.classify(
             st, exit_code=code, timed_out=self.timed_out,
-            now=int(time.time()),
+            now=int(time.time()), stalled_s=self.stall_s if self.stalled else 0,
             requeue_s=store.cfg(self.conn, "quota.requeue_s"), stderr="\n".join(self.tail),
         )  # fmt: skip
         if self.signalled and not run["terminal_verb"]:
             verdict = classify.Verdict("interrupted", "the runner was signalled")
+        elif verdict.outcome == "auth_lost" and not self.login_confirmed_lost():
+            verdict = classify.Verdict("network", f"{verdict.error} (a fresh login probe passed)")
         with store.tx(self.conn):
             store.record_result(self.conn, run, code, res)
             try:
@@ -713,7 +763,8 @@ class Runner:
                 f"classified={verdict.outcome}: {verdict.error}" if ended else "run already ended"
             )
             print(f"[kanban] exit={code} {detail}", flush=True)
-            if ended and verdict.outcome == "auth_lost":
+        if ended and verdict.outcome == "auth_lost":
+            with store.tx(self.conn):
                 store.account_set(
                     self.conn,
                     self.config_dir,
@@ -727,6 +778,17 @@ class Runner:
                     },
                 )  # fmt: skip
         self.afterwards()
+
+    def login_confirmed_lost(self) -> bool:
+        """A 401/403 in a stream can be a proxy or a token race: pause the account only when a
+        fresh probe under the same login fails too (a probe that cannot run counts as failed)."""
+        if auth_probe(self.conn, self.config_dir) is None:
+            print(
+                "[kanban] auth_lost not confirmed: the login probe passed, account stays open",
+                flush=True,
+            )
+            return False
+        return True
 
     def afterwards(self) -> None:
         """The `[run]` line, worktree cleanup for a finished card, and a wake-up for the tick."""
