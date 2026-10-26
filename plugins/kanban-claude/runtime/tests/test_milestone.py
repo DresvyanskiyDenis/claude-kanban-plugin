@@ -1,5 +1,6 @@
 """TST-M: the milestone-branches reference. Its replay block runs against real git; its gating claims run on the store."""
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -65,7 +66,9 @@ def finalize(dev: Path, n: int, prev: str) -> Path:
     git("fetch", "origin", cwd=dev)
     wt = dev.parent / f"final-{n}-{prev.replace('/', '_')}"
     git("worktree", "add", "-b", f"milestone/{n}-{SLUG}-final", str(wt), "origin/main", cwd=dev)
-    subprocess.run(["bash", "-ec", replay_script(n, prev)], cwd=wt, check=True)
+    # a fixed committer date: copies cut in the same second as the originals would get identical hashes
+    env = {**os.environ, "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z"}
+    subprocess.run(["bash", "-ec", replay_script(n, prev)], cwd=wt, check=True, env=env)
     return wt
 
 
@@ -164,3 +167,4 @@ def test_m3_a_child_of_a_finalize_card_starts_at_approval_not_at_the_owners_merg
     assert (
         store.get_task(conn, finalize_card)["merged_at"] and kinds() == before
     )  # no event wakes a watcher
+
