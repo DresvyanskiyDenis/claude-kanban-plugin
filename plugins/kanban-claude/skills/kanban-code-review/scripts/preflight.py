@@ -49,7 +49,10 @@ def is_test(path: str) -> bool:
 
 
 def gate_fact(
-    body: str, sha: str, merge_only_since: Callable[[str], bool] = lambda _: False
+    body: str,
+    sha: str,
+    merge_only_since: Callable[[str], bool] = lambda _: False,
+    ci_green: bool = False,
 ) -> list[str]:
     gates = [ln for ln in body.splitlines() if ln.lstrip().startswith("Gate:")]
     if not gates:
@@ -59,9 +62,16 @@ def gate_fact(
         return ["ok the Gate line names the head commit"]
     for tok in named:
         if merge_only_since(tok):
+            if ci_green:
+                return [
+                    f"ok the Gate line names {tok[:7]}, an ancestor of the head {sha[:7]} with only merge commits since; "
+                    "the green checks on the head cover the merged tree, so a base merge is no stale-gate finding "
+                    "against the PR (your own gate run on the head still follows section 4)"
+                ]
             return [
-                f"ok the Gate line names {tok[:7]}, an ancestor of the head {sha[:7]} with only merge commits since; "
-                "a base merge needs no new local gate run (CI and the review gate still run on the head)"
+                f"CHECK the Gate line names {tok[:7]}, an ancestor of the head {sha[:7]} with only merge commits since, "
+                "and no green CI covers the head: nothing has tested the merged tree, so your gate run on it is the "
+                "only evidence there will be"
             ]
     return [
         f"CHECK the Gate line does not name the head commit {sha[:7]}: {gates[0].strip()[:120]}"
@@ -326,7 +336,8 @@ def main(argv: list[str]) -> int:
     ]
     if status:
         facts.append("CHECK the working tree is not clean")
-    facts += gate_fact(pr["body"] or "", sha, lambda tok: merge_only_since(tok, sha))
+    ci_green = bool(checks) and all(c["bucket"] == "pass" for c in checks)
+    facts += gate_fact(pr["body"] or "", sha, lambda tok: merge_only_since(tok, sha), ci_green)
     facts += checks_fact(checks)
     facts += merge_only_fact(card["runs"], sha, pr["baseRefName"])
     facts += nonconventional(own_headlines(pr["commits"]))

@@ -3,6 +3,7 @@ import os
 import signal
 import subprocess
 import sys
+import urllib.request  # noqa: F401  # see the comment on the macOS fake in `env`
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -219,7 +220,10 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     install_fake(bindir / "loginctl", LOGINCTL_SCRIPT)
     install_fake(bindir / "uv", UV_SCRIPT)
     install_fake(bindir / "claude", NO_CLAUDE_SCRIPT)
-    # the fakes stand in for the Mac, so setup's macOS check passes on a Linux CI runner too
+    # the fakes stand in for the Mac, so setup's macOS check passes on a Linux CI runner too.
+    # `urllib.request` is imported at the top of this file for the same reason: its one-time
+    # `if sys.platform == "darwin": from _scproxy import ...` must run before this fake, or the
+    # first lazy import of it (Path.as_uri on 3.14) raises ModuleNotFoundError on Linux.
     monkeypatch.setattr(install.sys, "platform", "darwin")
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("LAUNCHCTL_FAKE_LOG", str(tmp_path / "launchctl.log"))

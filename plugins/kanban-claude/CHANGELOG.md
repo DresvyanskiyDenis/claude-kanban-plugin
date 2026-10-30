@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The review pre-flight no longer clears a stale `Gate:` line on a repo without CI. A gate sha that is an ancestor of the head with only merge commits since is an `ok` only when every check on the head passed, because those checks are what tested the merged tree; with no green CI the line is a `CHECK` and warden runs the gate on the head itself. `smith` and `designer` now say on the line *below* `Gate:` when no CI covers the merged head, instead of leaving the pre-merge sha to speak for it, and never name the head on the `Gate:` line itself: pre-flight reads every sha on that line, and one matching the head reads as a gate run that happened.
+- The runtime tests run on CPython 3.14. The autouse fixture fakes macOS by setting `sys.platform`, and `urllib.request` runs its one-time `_scproxy` import under that fake the first time something imports it lazily (`Path.as_uri()` in `web.py` on 3.14), which fails on Linux: every test in `test_web.py` returned 500. `conftest.py` now imports `urllib.request` before any fake is in place.
+
 ## 0.4.0.dev3
 
 Upgrade between cards: run `/kanban-claude:setup` (or the plugin's `skills/setup/scripts/bootstrap.sh`) so the daemon and the CLI move together. The schema stays at 7. Then run `kanban doctor`: check 19 now also reads protection on one `milestone/*` branch per repo, and the README's ruleset covers both `feature/*` and `milestone/*`. On Linux the daemon is a systemd user unit and needs `loginctl enable-linger $USER` once. Workers that began under 0.4.0.dev2 keep running without the new stall watchdog.
