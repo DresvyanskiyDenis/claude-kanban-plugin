@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- The review pre-flight no longer clears a stale `Gate:` line on a repo without CI. A gate sha that is an ancestor of the head with only merge commits since is an `ok` only when every check on the head passed, because those checks are what tested the merged tree; with no green CI the line is a `CHECK` and warden runs the gate on the head itself. `smith` now says on the `Gate:` line when no CI covers the merged head, instead of leaving the pre-merge sha to speak for it.
+- The review pre-flight no longer clears a stale `Gate:` line on a repo without CI. A gate sha that is an ancestor of the head with only merge commits since is an `ok` only when every check on the head passed, because those checks are what tested the merged tree; with no green CI the line is a `CHECK` and warden runs the gate on the head itself. `smith` and `designer` now say on the line *below* `Gate:` when no CI covers the merged head, instead of leaving the pre-merge sha to speak for it, and never name the head on the `Gate:` line itself: pre-flight reads every sha on that line, and one matching the head reads as a gate run that happened.
 - The runtime tests run on CPython 3.14. The autouse fixture fakes macOS by setting `sys.platform`, and `urllib.request` runs its one-time `_scproxy` import under that fake the first time something imports it lazily (`Path.as_uri()` in `web.py` on 3.14), which fails on Linux: every test in `test_web.py` returned 500. `conftest.py` now imports `urllib.request` before any fake is in place.
 
 ## 0.4.0.dev3

@@ -118,6 +118,8 @@ def test_gate_sha_may_be_an_ancestor_when_only_merges_followed(repo: Repo):
     assert levels(stale) == ["CHECK"]
     assert gated[:7] in stale[0] and head[:7] in stale[0]
     assert levels(p.gate_fact(body, head)) == ["CHECK"]
+    named_head = f"Gate: `pytest` exit 0 at {gated[:7]}, head {head[:7]} adds a merge, no CI"
+    assert "names the head commit" in p.gate_fact(named_head, head, only_merges)[0]
     repo.edit("a.txt", 3, "late fix")
     repo.commit("fix: late")
     late = repo.git("rev-parse", "HEAD")

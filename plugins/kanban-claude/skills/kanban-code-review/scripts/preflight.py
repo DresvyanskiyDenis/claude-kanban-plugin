@@ -65,11 +65,13 @@ def gate_fact(
             if ci_green:
                 return [
                     f"ok the Gate line names {tok[:7]}, an ancestor of the head {sha[:7]} with only merge commits since; "
-                    "the green checks on the head cover the merged tree, so a base merge needs no new local gate run"
+                    "the green checks on the head cover the merged tree, so a base merge is no stale-gate finding "
+                    "against the PR (your own gate run on the head still follows section 4)"
                 ]
             return [
                 f"CHECK the Gate line names {tok[:7]}, an ancestor of the head {sha[:7]} with only merge commits since, "
-                "and no green CI covers the head: nothing has run the gate on the merged tree, so run it yourself"
+                "and no green CI covers the head: nothing has tested the merged tree, so your gate run on it is the "
+                "only evidence there will be"
             ]
     return [
         f"CHECK the Gate line does not name the head commit {sha[:7]}: {gates[0].strip()[:120]}"
