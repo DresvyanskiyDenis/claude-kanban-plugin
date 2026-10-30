@@ -107,9 +107,16 @@ def test_gate_sha_may_be_an_ancestor_when_only_merges_followed(repo: Repo):
     repo.git("merge", "-q", "--no-ff", "origin/main", "-m", "Merge origin/main")
     head = repo.git("rev-parse", "HEAD")
     body = f"Gate: `pytest` exit 0 at {gated[:7]}"
-    fact = p.gate_fact(body, head, lambda tok: p.merge_only_since(tok, head))
+
+    def only_merges(tok: str) -> bool:
+        return p.merge_only_since(tok, head)
+
+    fact = p.gate_fact(body, head, only_merges, ci_green=True)
     assert levels(fact) == ["ok"]
     assert gated[:7] in fact[0] and "merge" in fact[0]
+    stale = p.gate_fact(body, head, only_merges)  # no green CI vouches for the merged tree
+    assert levels(stale) == ["CHECK"]
+    assert gated[:7] in stale[0] and head[:7] in stale[0]
     assert levels(p.gate_fact(body, head)) == ["CHECK"]
     repo.edit("a.txt", 3, "late fix")
     repo.commit("fix: late")
