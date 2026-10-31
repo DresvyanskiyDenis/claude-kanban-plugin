@@ -79,7 +79,8 @@ def test_r1_the_argv_is_exactly_the_contract(
         "Bash(kanban grant:*)", f"Edit(/{dirs().home}/**)",
     ]  # fmt: skip
     assert "Agent(kanban-claude:warden)" in deny and "Agent(kanban-claude:card-helper)" not in deny
-    assert settings["permissions"]["allow"] == ["Bash(npm publish)"]
+    # the protocol's own `gh` writes first, then the card's grants
+    assert settings["permissions"]["allow"] == [*runner.PROTOCOL_RULES, "Bash(npm publish)"]
     assert seen["env"]["TMPDIR"] == str(dirs().work / "tmp" / tid)
     assert (dirs().work / "tmp" / tid).is_dir()
     assert run["last_output_at"] is None
@@ -185,6 +186,17 @@ def test_d1_the_deny_list_leaves_each_role_only_its_helper_and_what_its_job_need
     assert "Edit" not in deny("smith") and "Write" not in deny("smith")
     assert not any(d.startswith("Agent(") for d in deny("atlassian"))
     assert deny("") == deny("card-checker")[:5] == deny("smith")[:5]
+
+
+def test_the_protocol_may_write_its_own_pr_but_still_cannot_merge_it() -> None:
+    """Auto mode refuses an external system write when no one can answer the prompt, which left a
+    builder unable to put the gate evidence or a `Closes` line in its own PR body."""
+    for role in ("smith", "designer", "warden"):
+        settings = json.loads(runner.settings_json(Path("/h"), ["Bash(granted:*)"], role))
+        allow, deny = settings["permissions"]["allow"], settings["permissions"]["deny"]
+        assert {"Bash(gh pr create:*)", "Bash(gh pr edit:*)", "Bash(gh pr comment:*)"} <= {*allow}
+        assert "Bash(granted:*)" in allow  # a card's own grants still come through
+        assert "Bash(gh pr merge:*)" in deny and "Bash(gh pr merge:*)" not in allow
 
 
 def test_d1_a_role_may_spawn_only_its_own_helper_and_nothing_else() -> None:
