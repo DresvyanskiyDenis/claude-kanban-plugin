@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.0.dev4
+
+Upgrade between cards: run `/kanban-claude:setup` so the daemon and the CLI move together. The schema stays at 7. Then check `kanban config get worker.stall_s`: a value you stored by hand under 0.4.0.dev3 is left as it is, and anything below 1900 s now stops a healthy 30-minute foreground gate call as `stalled` — raise it with `kanban config set worker.stall_s 2400`. A board that never set the key gets the new default. Runs that began under 0.4.0.dev3 keep the old 10-minute Bash cap.
 
 ### Changed
 
