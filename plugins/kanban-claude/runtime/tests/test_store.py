@@ -1157,13 +1157,20 @@ def test_the_measure_columns_arrive_on_an_old_board_and_old_runs_stay_unmeasured
     c.close()
 
 
-@pytest.mark.parametrize("value", [1, 699])
+@pytest.mark.parametrize("value", [1, store.STALL_MIN_S - 1])
 def test_a_stall_limit_that_would_kill_a_healthy_wait_is_refused(conn: Any, value: int) -> None:
-    with pytest.raises(Refused, match=r"0 \(off\) or at least 700.*wait-ci"):
+    with pytest.raises(Refused, match=rf"0 \(off\) or at least {store.STALL_MIN_S}.*wait-ci"):
         store.config_set(conn, "worker.stall_s", value)
 
 
-@pytest.mark.parametrize("value", [0, 700, 1200])
-def test_a_stall_limit_of_zero_or_at_least_700_is_accepted(conn: Any, value: int) -> None:
+@pytest.mark.parametrize("value", [0, store.STALL_MIN_S, store.STALL_MIN_S + 500])
+def test_a_stall_limit_of_zero_or_above_the_floor_is_accepted(conn: Any, value: int) -> None:
     store.config_set(conn, "worker.stall_s", value)
     assert store.cfg(conn, "worker.stall_s") == value
+
+
+def test_the_stall_floor_outlives_the_longest_quiet_call(conn: Any) -> None:
+    """A foreground Bash call is silent for up to the cap the runner sets; the watchdog must not
+    stop a run that is only waiting for one."""
+    assert store.STALL_MIN_S > store.BASH_CAP_MS // 1000
+    assert store.DEFAULTS["worker.stall_s"] >= store.STALL_MIN_S

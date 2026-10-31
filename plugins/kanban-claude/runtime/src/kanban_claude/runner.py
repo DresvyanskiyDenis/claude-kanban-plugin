@@ -61,6 +61,12 @@ NO_FILE_WRITES = {
     "atlassian": ("Edit", "Write", "NotebookEdit"),
     "scout": ("Edit", "NotebookEdit"),
 }
+# The protocol's own `gh` writes. `--permission-mode auto` classifies a `gh` write as an external
+# system write, and `--permission-prompts none` turns that question into a refusal, so a builder
+# asked to put the gate evidence or a `Closes` line in its own PR body could not do it and ended
+# `blocked/capability` with the work finished. `Bash(gh pr merge:*)` stays in the deny list, which
+# outranks an allow: a worker still cannot merge its own PR.
+PROTOCOL_RULES = ("Bash(gh pr create:*)", "Bash(gh pr edit:*)", "Bash(gh pr comment:*)")
 ROLE_SERVERS = {"atlassian": ("atlassian",)}
 # mcp-atlassian enforces ENABLED_TOOLS when it lists and when it calls a tool
 ATLASSIAN_TOOLS = (
@@ -156,7 +162,8 @@ def role_denies(role: str) -> list[str]:
 def settings_json(
     home: Path, rules: list[str], role: str = "", off: dict[str, bool] | None = None
 ) -> str:
-    """RUN-06: guard rails, the role's denies, the active grants and the plugin switches."""
+    """RUN-06: guard rails, the role's denies, the protocol's own writes, the active grants and the
+    plugin switches."""
     deny = [
         "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(gh pr merge:*)",
         "Bash(kanban grant:*)", f"Edit(/{home}/**)", *role_denies(role),
@@ -168,7 +175,11 @@ def settings_json(
         "PreToolUse": [{"matcher": "Agent|Task", "hooks": [{"type": "command", "command": guard}]}]
     }
     return json.dumps(
-        {"permissions": {"deny": deny, "allow": rules}, "enabledPlugins": plugins, "hooks": hooks}
+        {
+            "permissions": {"deny": deny, "allow": [*PROTOCOL_RULES, *rules]},
+            "enabledPlugins": plugins,
+            "hooks": hooks,
+        }
     )
 
 
@@ -236,8 +247,9 @@ def worker_env(
         CLAUDE_CODE_WEB_FETCH_AGENT="0", CLAUDE_SKIP_SOUL="1", KANBAN_TASK=t["id"],
         KANBAN_BOARD=t["board"], KANBAN_RUN_ID=str(run_id), KANBAN_WORKSPACE=str(workspace),
         KANBAN_HOME=str(d.home), KANBAN_WORK=str(d.work), TMPDIR=str(card_tmp(t["id"])),
-        # claude's Bash default of 120 s would cut `kanban wait-ci` (up to 540 s) off
-        BASH_DEFAULT_TIMEOUT_MS="600000",
+        # claude's Bash default of 120 s would cut `kanban wait-ci` (up to 540 s) off, and the
+        # default alone stays capped at claude's own 600 s: the max has to rise with it
+        BASH_DEFAULT_TIMEOUT_MS=str(store.BASH_CAP_MS), BASH_MAX_TIMEOUT_MS=str(store.BASH_CAP_MS),
         # `-p` otherwise stops background tasks 10 min after the last turn and exits 0 (a
         # protocol_violation); 0 waits for them, and worker.stall_s ends one that hangs
         CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="0",

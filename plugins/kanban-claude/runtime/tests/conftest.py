@@ -53,6 +53,14 @@ elif args[:2] == ["pr", "merge"]:
         sys.exit(1)
     pr["state"] = "MERGED"
     json.dump(prs, open(os.environ["GH_FAKE_PRS"], "w"))
+elif args[:2] == ["pr", "edit"]:
+    prs = json.load(open(os.environ["GH_FAKE_PRS"]))
+    pr = prs.get(args[2])
+    if pr is None or os.environ.get("GH_FAKE_EDIT_FAIL"):
+        sys.stderr.write("could not edit pull request\\n")
+        sys.exit(1)
+    pr["body"] = sys.stdin.read()  # the runtime always sends `--body-file -`
+    json.dump(prs, open(os.environ["GH_FAKE_PRS"], "w"))
 elif args[:2] == ["repo", "view"]:
     if "-R" in args:  # real gh: the repository is positional here
         sys.stderr.write("unknown shorthand flag: 'R' in -R\\n")

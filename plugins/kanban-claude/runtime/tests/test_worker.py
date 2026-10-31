@@ -133,15 +133,32 @@ def test_request_review_takes_a_linked_card_whose_pr_closes_the_issue(
 @pytest.mark.parametrize(
     "body", ["", "no link here", "Closes acme/proj#123", "Closes acme/other#12", "see acme/proj#12"]
 )
-def test_request_review_refuses_a_linked_card_whose_pr_lacks_the_closes_line(
-    conn: Any, wt: tuple[str, int], set_prs: Prs, body: str
+def test_request_review_adds_the_closes_line_a_linked_cards_pr_lacks(
+    conn: Any, wt: tuple[str, int], set_prs: Prs, body: str, env: Path
 ) -> None:
+    """The builder cannot run `gh pr edit` itself (auto mode refuses an external system write), so
+    the refusal used to throw away a finished run: the line goes in here instead."""
     tid, run = wt
     link_issue(conn, tid)
     set_prs({"7": {**PR, "body": body}})
     got = ask(conn, run, "request-review", summary="done")
-    assert got["exit"] == 4 and "`Closes acme/proj#12`" in got["message"], got
-    assert "PR #7" in got["message"] and store.get_task(conn, tid)["status"] == "running"
+    assert got["exit"] == 0, got
+    assert store.get_task(conn, tid)["status"] == "review"
+    after = json.loads((env / "prs.json").read_text())["7"]["body"]
+    assert after.rstrip().endswith("Closes acme/proj#12")
+    assert body.strip() in after  # whatever the builder wrote is kept
+
+
+def test_request_review_refuses_when_the_closes_line_cannot_be_added(
+    conn: Any, wt: tuple[str, int], set_prs: Prs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tid, run = wt
+    link_issue(conn, tid)
+    set_prs({"7": {**PR, "body": "no link here"}})
+    monkeypatch.setenv("GH_FAKE_EDIT_FAIL", "1")
+    got = ask(conn, run, "request-review", summary="done")
+    assert got["exit"] != 0 and "gh pr edit failed" in got["message"], got
+    assert store.get_task(conn, tid)["status"] == "running"
 
 
 @pytest.mark.parametrize("jira", [False, True])

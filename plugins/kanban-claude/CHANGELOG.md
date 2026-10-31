@@ -2,7 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- A worker's foreground `Bash` call may now run for 30 minutes, not 10. `BASH_DEFAULT_TIMEOUT_MS` alone stays capped at claude's own 600 s default, so the runner sets `BASH_MAX_TIMEOUT_MS` with it; measured on the jobbot board, 202 of 434 gate runs hit the old cap and the agent then spent turns polling the backgrounded run with `pgrep`/`tail`. `worker.stall_s` follows the cap (floor 1900 s, default 2400 s): a foreground call is silent by design for as long as the cap allows, and a lower watchdog would stop a healthy run.
+- `kanban stats` reports `owner_reopens` and `cards_owner_reopened` beside `send_backs`. The `guards` block only ever counted the reviewer's verdicts, so a card the owner sent back himself still read as a first-pass approval; on the jobbot board that hid 10 of 46 returns in a 7-day window. `first_pass_rate` stays the reviewer's metric.
+
 ### Fixed
+
+- `kanban request-review` adds the `Closes OWNER/REPO#N` line to the PR body itself when a card tied to a GitHub issue lacks it, instead of refusing with exit 4 and telling the builder to run `gh pr edit`. `--permission-mode auto --permission-prompts none` classifies that edit as an external system write and refuses it, so 26 of 29 `blocked/capability` runs on the jobbot board were finished work with a green gate and an open PR, thrown away over one missing line. The CLI runs outside the classifier; it keeps whatever the builder wrote and appends the line, and a failed edit is still loud.
+- A worker may now run `gh pr create`, `gh pr edit` and `gh pr comment`, the writes its own protocol asks for. `--permission-mode auto` classifies a `gh` write as an external system write and `--permission-prompts none` turns that question into a refusal, so a builder asked to put the gate evidence or a `Closes` line in its own PR body ended `blocked/capability` with the work finished. `Bash(gh pr merge:*)` stays in the deny list, which outranks an allow: a worker still cannot merge its own PR.
+- `card-checker` now puts the *directory* on the `touches:` line for a file the card adds, not the new filename. Two new filenames never overlap, so the dispatcher ran both cards and the second collided: 4 of 39 reviewer send-backs on the jobbot board were a second Alembic head.
 
 - The review pre-flight no longer clears a stale `Gate:` line on a repo without CI. A gate sha that is an ancestor of the head with only merge commits since is an `ok` only when every check on the head passed, because those checks are what tested the merged tree; with no green CI the line is a `CHECK` and warden runs the gate on the head itself. `smith` and `designer` now say on the line *below* `Gate:` when no CI covers the merged head, instead of leaving the pre-merge sha to speak for it, and never name the head on the `Gate:` line itself: pre-flight reads every sha on that line, and one matching the head reads as a gate run that happened.
 - The runtime tests run on CPython 3.14. The autouse fixture fakes macOS by setting `sys.platform`, and `urllib.request` runs its one-time `_scproxy` import under that fake the first time something imports it lazily (`Path.as_uri()` in `web.py` on 3.14), which fails on Linux: every test in `test_web.py` returned 500. `conftest.py` now imports `urllib.request` before any fake is in place.

@@ -9,10 +9,14 @@ from . import gitops
 from .errors import Error
 
 
-def gh_rc(*args: str, timeout: int = 60) -> "subprocess.CompletedProcess[str]":
+def gh_rc(
+    *args: str, timeout: int = 60, stdin: str | None = None
+) -> "subprocess.CompletedProcess[str]":
     """Run `gh`; a non-zero exit is the caller's to read (`pr checks` exits 8 while pending)."""
     try:
-        return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(
+            ["gh", *args], capture_output=True, text=True, timeout=timeout, input=stdin
+        )
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Error(f"gh failed: {e}") from e
 
@@ -73,6 +77,13 @@ def repo_default_branch(repo: str) -> str:
         )
     except (ValueError, KeyError, TypeError) as e:
         raise Error("gh returned unreadable JSON for the repository") from e
+
+
+def pr_set_body(repo: str, number: int, body: str) -> None:
+    """Replace the PR body. `--body-file -` so a body with quotes, newlines or `$` survives."""
+    p = gh_rc("pr", "edit", str(number), "-R", repo, "--body-file", "-", stdin=body, timeout=60)
+    if p.returncode != 0:
+        raise Error(f"gh pr edit failed for PR #{number}: {(p.stderr or p.stdout).strip()[:300]}")
 
 
 METHOD_FLAGS = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}

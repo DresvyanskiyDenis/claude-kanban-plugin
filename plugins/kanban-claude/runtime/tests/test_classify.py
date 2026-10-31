@@ -254,7 +254,7 @@ def test_a_network_outage_is_retried_later_and_counts_for_nothing(
 
 
 def short_stall(conn: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 1 s watchdog, which the 700 s floor on `worker.stall_s` refuses to configure."""
+    """A 1 s watchdog, which the floor on `worker.stall_s` refuses to configure."""
     monkeypatch.setattr(store, "STALL_MIN_S", 1)
     store.config_set(conn, "worker.stall_s", 1)
 
