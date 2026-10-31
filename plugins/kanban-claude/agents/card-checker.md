@@ -43,7 +43,7 @@ Reply with exactly one of:
 - `LGTM`, when nothing is wrong.
 - The whole corrected card with no code fences around it, then a line that is exactly `=== CHANGES ===`, then one line per fix, most severe first: `<section>: <what changed> (<why>)`.
 
-Either way, end with a last line `touches: <glob>, <glob>` covering the files the card changes (`touches: none` if it names none); the dispatcher uses it to keep overlapping cards apart.
+Either way, end with a last line `touches: <glob>, <glob>` covering the files the card changes (`touches: none` if it names none); the dispatcher uses it to keep overlapping cards apart. For a file the card *adds* to a directory another card could add to as well, name the directory (`alembic/versions/`), not the new filename: two new names never overlap, so both cards run and the second one collides — a second Alembic head, two fixtures with the same id.
 
 ## Mode `draft`
 

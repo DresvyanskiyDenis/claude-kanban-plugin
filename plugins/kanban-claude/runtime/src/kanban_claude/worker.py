@@ -109,7 +109,8 @@ def _check_pr(t: sqlite3.Row) -> tuple[int, str]:
 
 def _closes(conn: sqlite3.Connection, t: sqlite3.Row, number: int) -> None:
     """A card tied to a GitHub issue needs `Closes OWNER/REPO#N` in its PR body, or the merge leaves
-    the issue open and the warden sends the PR back (LPS: 5 wasted rounds). Jira and unlinked cards pass."""
+    the issue open and the warden sends the PR back (LPS: 5 wasted rounds). Added here when the body
+    lacks it, since the builder may not write it itself. Jira and unlinked cards pass."""
     lk = conn.execute(
         "SELECT repo, number FROM github_links WHERE task_id = ?", (t["id"],)
     ).fetchone()
@@ -121,11 +122,14 @@ def _closes(conn: sqlite3.Connection, t: sqlite3.Row, number: int) -> None:
     if repo.lower() == lk["repo"].lower():
         forms.append(f"#{n}")  # GitHub resolves a bare #N inside the issue's own repo
     keyword = rf"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+(?:{'|'.join(forms)})(?!\d)"
-    if not re.search(keyword, str(ghops.pr_view(repo, number, "body").get("body") or ""), re.I):
-        raise Refused(
-            f"this card is tied to GitHub issue {ref}; add the line `Closes {ref}` to the body of "
-            f"PR #{number} (gh pr edit {number} -R {repo} --body ...), then run this again"
-        )
+    body = str(ghops.pr_view(repo, number, "body").get("body") or "")
+    if re.search(keyword, body, re.I):
+        return
+    # Add it here rather than send the run back for it: a builder's own `gh pr edit` is an external
+    # system write, which `--permission-mode auto --permission-prompts none` refuses, so the run
+    # ended `blocked/capability` with the work finished and the PR open (26 of 29 such blocks).
+    kept = f"{body.rstrip()}\n\n" if body.strip() else ""
+    ghops.pr_set_body(repo, number, f"{kept}Closes {ref}\n")
 
 
 def _verdict(rows: list[tuple[str, str]]) -> tuple[str, str]:

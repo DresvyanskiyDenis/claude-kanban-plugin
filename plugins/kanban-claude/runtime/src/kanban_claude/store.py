@@ -227,6 +227,14 @@ TRIAGE_RUNTIME_S = 7200
 OWNER = "owner:cli"
 RUN_ENDED = "run ended; the owner stopped it or it already finished. Stop working and exit"
 
+# the ceiling on a worker's foreground Bash call. Claude caps `BASH_DEFAULT_TIMEOUT_MS` at its own
+# 600 s default unless `BASH_MAX_TIMEOUT_MS` rises with it, so the runner sets both: at 600 s a full
+# repo gate was cut off, and the agent then spent turns polling the backgrounded run with `pgrep`.
+BASH_CAP_MS = 1_800_000
+# the shortest `worker.stall_s` that cannot stop a healthy run: a foreground Bash call is quiet by
+# design for as long as the cap allows, and `kanban wait-ci` for its 540 s budget
+STALL_MIN_S = BASH_CAP_MS // 1000 + 100
+
 DEFAULTS: dict[str, Any] = {
     "claude.bin": None,
     "claude.config_dir": None,
@@ -279,8 +287,8 @@ DEFAULTS: dict[str, Any] = {
     "worker.keep_awake": True,
     "worker.terminal_grace_s": 120,
     # awake seconds with no assistant/tool event before the run is stopped and retried (0 = off);
-    # above the 600 s Bash cap and the 540 s `wait-ci` poll
-    "worker.stall_s": 1200,
+    # above the Bash cap and the 540 s `wait-ci` poll, both of which are quiet by design
+    "worker.stall_s": STALL_MIN_S + 500,
     "worker.max_turns": None,
     "worker.env_passthrough": [],
     "worker.plugin_allowlist": [],
@@ -307,7 +315,6 @@ DEFAULTS: dict[str, Any] = {
     },
 }  # fmt: skip
 
-STALL_MIN_S = 700  # above the 600 s Bash cap and the 540 s `wait-ci`, which are quiet by design
 BOUNDS: dict[str, tuple[int, int | None]] = {
     "jira.poll_s": (1, None),
     "github.poll_s": (1, None),
@@ -480,7 +487,8 @@ def config_set(conn: sqlite3.Connection, key: str, value: Any, *, actor: str = O
     if key == "worker.stall_s" and value is not None and 0 < value < STALL_MIN_S:
         raise Refused(
             f"worker.stall_s must be 0 (off) or at least {STALL_MIN_S}: a shorter value would stop a "
-            "healthy `kanban wait-ci` (up to 540 s) or a foreground Bash call (up to 600 s)"
+            f"healthy `kanban wait-ci` (up to 540 s) or a foreground Bash call (up to "
+            f"{BASH_CAP_MS // 1000} s)"
         )
     if key == "budget.ceiling" and value <= 0:
         raise Refused("budget.ceiling must be positive")
@@ -2441,6 +2449,13 @@ def _measure_stats(
         "AND x.kind = 'review' AND x.terminal_verb IN ('complete', 'request-changes'))",
         args,
     ).fetchone()
+    # the same window as `base`, on the event's own columns
+    window = where.replace("r.started_at", "e.created_at").replace("t.board", "e.board")
+    owner_reopens, cards_reopened = conn.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT e.task_id) FROM task_events e "
+        f"WHERE e.kind = 'changes_requested' AND e.actor NOT LIKE 'worker:%' AND {window}",
+        args,
+    ).fetchone()
     approved = [
         row[0]
         for row in conn.execute(
@@ -2501,11 +2516,15 @@ def _measure_stats(
             "cost": round(spent, 4),
             "avg_cost": round(spent / cards, 4) if cards else None,
         },  # fmt: skip
+        # `send_backs` and `first_pass_rate` are the reviewer's record; `owner_reopens` counts the
+        # cards the owner sent back himself, which no review run records and the rate cannot see
         "guards": {
             "reviews": reviews,
             "first_pass_approvals": first_ok,
             "send_backs": sent,
             "first_pass_rate": round(first_ok / cards_judged, 3) if cards_judged else None,
+            "owner_reopens": owner_reopens,
+            "cards_owner_reopened": cards_reopened,
         },  # fmt: skip
         "skills": counts("skills"),
         "mcp": counts("mcp"),

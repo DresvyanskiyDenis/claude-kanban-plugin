@@ -305,11 +305,15 @@ def test_stats_guards_and_cost_per_approved_card(conn: Any, card: Card, claim: C
     review(a, "complete", 1.0)  # approved first time
     review(b, "request-changes", 2.0)
     review(b, "complete", 3.0)  # approved on the second round
+    # the owner sending a card back himself is no review run, so the rate above cannot see it
+    store.event(conn, store.get_task(conn, a), "changes_requested", "owner:cli", {"reason": "redo"})
     s = store.stats(conn, days=1)
     assert s["guards"] == {
         "reviews": 3,
         "first_pass_approvals": 1,
         "send_backs": 1,
         "first_pass_rate": 0.5,
+        "owner_reopens": 1,
+        "cards_owner_reopened": 1,
     }
     assert s["per_approved_card"] == {"cards": 2, "cost": 6.0, "avg_cost": 3.0}
