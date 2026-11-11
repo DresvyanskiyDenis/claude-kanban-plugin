@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Workers decide ambiguity alone. `rules.md` tells every role that nobody watches the run: take the most reasonable reading, state it at the top of the summary and the PR body, and carry on. `needs_input` is kept for a decision that can't be undone and could reasonably go either way, after the preparation is done. `scout` no longer blocks on an ambiguous question. A block on a question the worker could have answered alone costs a full owner round trip, and an unattended run has nobody to answer it quickly.
+
 ## 0.4.0.dev4
 
 Upgrade between cards: run `/kanban-claude:setup` so the daemon and the CLI move together. The schema stays at 7. Then check `kanban config get worker.stall_s`: a value you stored by hand under 0.4.0.dev3 is left as it is, and anything below 1900 s now stops a healthy 30-minute foreground gate call as `stalled` — raise it with `kanban config set worker.stall_s 2400`. A board that never set the key gets the new default. Runs that began under 0.4.0.dev3 keep the old 10-minute Bash cap.
