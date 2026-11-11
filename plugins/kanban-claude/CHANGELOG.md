@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.0.dev5
+
+Upgrade between cards: update the plugin in every Claude account your boards run on (`/plugin update`), then run `/kanban-claude:setup` so the daemon and the CLI move with it. The schema stays at 7. From this version the dispatcher starts no card on an account whose installed plugin is at another version than the daemon, so an account left on 0.4.0.dev4 holds its boards (`plugin_mismatch:0.4.0.dev4`) until it is updated.
 
 ### Added
 
