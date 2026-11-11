@@ -6,6 +6,10 @@
 
 - Workers settle an ambiguous card alone. `rules.md` tells every role that nobody watches the run: take the most reasonable reading of what the card asks, state it at the top of the summary (and the PR body, if one is opened), and carry on. Blocking with `needs_input` over such an ambiguity is kept for a choice that can't be undone and could reasonably go either way, after the preparation is done; the `needs_input` cases each role already names are unchanged. `scout` no longer blocks on an ambiguous question. A block on a question the worker could have answered alone costs a full owner round trip, and an unattended run has nobody to answer it quickly.
 
+### Fixed
+
+- `kanban wait-ci` no longer reports a check as failed when its workflow run was only cancelled because a newer run of the same workflow replaced it. A concurrency group with `cancel-in-progress` cancels the older run as soon as a second trigger starts one on the same head commit, and until the newer run registers its own check, `gh pr checks` still lists the cancelled one, in the `fail` bucket. `wait-ci` then answered `failed` in seconds and the builder went looking for a failure that isn't in the code. It now reads the workflow runs of the head commit whenever a failing check links to one, and judges a cancelled run by the newest run of the same workflow and event: pending while that one runs, then its own result. A run that failed by itself stays failed, and so does a cancelled run that nothing replaced or whose replacement was cancelled too. The same rule applies when the PR reports no checks yet and the runs are judged directly.
+
 ## 0.4.0.dev4
 
 Upgrade between cards: run `/kanban-claude:setup` so the daemon and the CLI move together. The schema stays at 7. Then check `kanban config get worker.stall_s`: a value you stored by hand under 0.4.0.dev3 is left as it is, and anything below 1900 s now stops a healthy 30-minute foreground gate call as `stalled` — raise it with `kanban config set worker.stall_s 2400`. A board that never set the key gets the new default. Runs that began under 0.4.0.dev3 keep the old 10-minute Bash cap.

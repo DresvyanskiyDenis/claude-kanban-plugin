@@ -42,6 +42,8 @@ CI_EXIT = {"passed": 0, "failed": 1, "pending": 2, "no_ci": 6, "skipped": 7}  # 
 GATE_LINES = 40
 GATE_RE = re.compile(r"FAIL|Error|error:|failed|Traceback|AssertionError|✗")
 _FAILED_RUNS = ("failure", "timed_out", "cancelled", "startup_failure", "action_required")
+_RUN_FIELDS = "databaseId,workflowName,event,name,status,conclusion"
+_RUN_ID = re.compile(r"/actions/runs/(\d+)")
 
 
 def _text(body: dict[str, Any], key: str) -> str:
@@ -146,31 +148,66 @@ def _verdict(rows: list[tuple[str, str]]) -> tuple[str, str]:
     return "passed", f"passed: {len(rows)} check{'' if len(rows) == 1 else 's'}"
 
 
-def _runs(gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int) -> tuple[str, str]:
-    """The PR reports no checks yet: judge the workflow runs of its head commit instead."""
+def _head_runs(
+    gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int
+) -> list[dict[str, Any]]:
+    """The workflow runs of the PR's head commit, newest first."""
     view = gh("pr", "view", str(number), "--json", "headRefOid")
     if view.returncode != 0:
         raise Error(f"gh pr view failed: {view.stderr.strip()[:300]}")
     sha = json.loads(view.stdout)["headRefOid"]
-    listed = gh("run", "list", "--commit", sha, "--json", "name,status,conclusion")
+    listed = gh("run", "list", "--commit", sha, "--json", _RUN_FIELDS)
     if listed.returncode != 0:
         raise Error(f"gh run list failed: {listed.stderr.strip()[:300]}")
-    rows = [
-        (r["name"], "pending" if r["status"] != "completed"
-         else "fail" if r["conclusion"] in _FAILED_RUNS else "pass")
-        for r in json.loads(listed.stdout)
-    ]  # fmt: skip
+    runs: list[dict[str, Any]] = json.loads(listed.stdout)
+    return sorted(runs, key=lambda r: r["databaseId"], reverse=True)
+
+
+def _run_bucket(r: dict[str, Any]) -> str:
+    if r["status"] != "completed":
+        return "pending"
+    return "fail" if r["conclusion"] in _FAILED_RUNS else "pass"
+
+
+def _replaced(runs: list[dict[str, Any]]) -> dict[int, str]:
+    """Run id -> bucket of its replacement, for each cancelled run that a newer run of the same
+    workflow and event followed on the same head. A concurrency group cancels the older run; it
+    says nothing about the code, and the newer run is the one that judges the head. A cancelled
+    run that nothing replaced, and a run that failed by itself, are not in the result."""
+    newest: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in runs:  # newest first
+        newest.setdefault((r["workflowName"], r["event"]), r)
+    return {
+        r["databaseId"]: _run_bucket(new)
+        for r in runs
+        if r["conclusion"] == "cancelled"
+        and (new := newest[r["workflowName"], r["event"]]) is not r
+        and new["conclusion"] != "cancelled"
+    }
+
+
+def _runs(gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int) -> tuple[str, str]:
+    """The PR reports no checks yet: judge the workflow runs of its head commit instead."""
+    runs = _head_runs(gh, number)
+    gone = _replaced(runs)
+    rows = [(r["name"], _run_bucket(r)) for r in runs if r["databaseId"] not in gone]
     return _verdict(rows) if rows else ("none", "pending: no checks reported yet")
 
 
 def _poll(gh: Callable[..., "subprocess.CompletedProcess[str]"], number: int) -> tuple[str, str]:
-    p = gh("pr", "checks", str(number), "--json", "name,bucket")
+    p = gh("pr", "checks", str(number), "--json", "name,bucket,link")
     try:
         rows = json.loads(p.stdout)
     except ValueError:
         rows = None
     if isinstance(rows, list) and rows:
-        return _verdict([(str(r["name"]), str(r["bucket"])) for r in rows])
+        pairs = [(str(r["name"]), str(r["bucket"])) for r in rows]
+        ids = [int(m[1]) if m else 0 for m in (_RUN_ID.search(str(r.get("link"))) for r in rows)]
+        if any(i and b in ("fail", "cancel") for (_, b), i in zip(pairs, ids, strict=True)):
+            # gh shows the check of a cancelled run until its replacement registers one
+            new_bucket = _replaced(_head_runs(gh, number))
+            pairs = [(n, new_bucket.get(i, b)) for (n, b), i in zip(pairs, ids, strict=True)]
+        return _verdict(pairs)
     # gh gives no stable exit code for "no checks yet", so the message decides, not the code.
     if rows == [] or "no checks reported" in p.stdout + p.stderr:
         return _runs(gh, number)
