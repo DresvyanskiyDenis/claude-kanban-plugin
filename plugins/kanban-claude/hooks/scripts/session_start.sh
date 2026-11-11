@@ -18,7 +18,7 @@ daemon=$(version "$home/installed.json")
 
 plugin=$(version "$root/.claude-plugin/plugin.json")
 if [ -n "$plugin" ] && [ "$plugin" != "$daemon" ]; then
-    echo "kanban-claude: daemon $daemon, plugin $plugin — new roles and skills run on the old daemon, CLI and protocol until /kanban-claude:setup; run it between cards (a running card finishes on old code)"
+    echo "kanban-claude: daemon $daemon, plugin $plugin — the daemon starts no card on an account whose plugin differs from it; run /kanban-claude:setup (a running card finishes on old code)"
 fi
 
 [ -f "$home/kanban.db" ] || exit 0

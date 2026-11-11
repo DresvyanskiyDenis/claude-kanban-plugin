@@ -211,11 +211,14 @@ def skip_reason(
         return "board_archived"
     if held := jira.claim_gate(conn, t):
         return held
-    acct = store.account_get(conn, store.effective_config_dir(conn, board))
+    config_dir = store.effective_config_dir(conn, board)
+    acct = store.account_get(conn, config_dir)
     if acct.get("auth_paused"):
         return "account_paused"
     if max(acct.get("hard_until") or 0, acct.get("soft_until") or 0) > ts:
         return "quota_wall"
+    if other := runner.plugin_mismatch(config_dir):
+        return f"plugin_mismatch:{other}"
     if (t["retry_after"] or 0) > ts:
         return "retry_after"
     last = conn.execute(
