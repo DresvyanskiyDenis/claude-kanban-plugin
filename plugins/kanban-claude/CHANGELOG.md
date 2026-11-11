@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Workers decide ambiguity alone. `rules.md` tells every role that nobody watches the run: take the most reasonable reading, state it at the top of the summary and the PR body, and carry on. `needs_input` is kept for a decision that can't be undone and could reasonably go either way, after the preparation is done. `scout` no longer blocks on an ambiguous question. A block on a question the worker could have answered alone costs a full owner round trip, and an unattended run has nobody to answer it quickly.
+- Workers settle an ambiguous card alone. `rules.md` tells every role that nobody watches the run: take the most reasonable reading of what the card asks, state it at the top of the summary (and the PR body, if one is opened), and carry on. Blocking with `needs_input` over such an ambiguity is kept for a choice that can't be undone and could reasonably go either way, after the preparation is done; the `needs_input` cases each role already names are unchanged. `scout` no longer blocks on an ambiguous question. A block on a question the worker could have answered alone costs a full owner round trip, and an unattended run has nobody to answer it quickly.
 
 ## 0.4.0.dev4
 
