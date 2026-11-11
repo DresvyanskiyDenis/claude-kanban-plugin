@@ -354,8 +354,8 @@ def test_wait_ci_gives_up_inside_the_budget_and_says_pending(
 def test_wait_ci_with_no_checks_yet_falls_back_to_the_runs_of_the_head_commit(
     fake_gh: Callable[..., FakeGh],
 ) -> None:
-    running = [{"name": "ci", "status": "in_progress", "conclusion": ""}]
-    done = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+    running = [wf_run(1, "in_progress", workflow="ci")]
+    done = [wf_run(1, "completed", "success", workflow="ci")]
     gh = fake_gh(
         pr_checks=[(1, "", NO_CHECKS)],
         pr_view=[(0, json.dumps({"headRefOid": "abc123"}), "")],
@@ -370,7 +370,7 @@ def test_wait_ci_with_no_checks_yet_falls_back_to_the_runs_of_the_head_commit(
 def test_wait_ci_failed_run_fails_and_no_run_at_all_stays_pending(
     fake_gh: Callable[..., FakeGh],
 ) -> None:
-    failed = [{"name": "build", "status": "completed", "conclusion": "failure"}]
+    failed = [wf_run(1, "completed", "failure", workflow="build")]
     fake_gh(
         pr_checks=[(1, "", NO_CHECKS)],
         pr_view=[(0, json.dumps({"headRefOid": "abc"}), "")],
@@ -385,6 +385,79 @@ def test_wait_ci_failed_run_fails_and_no_run_at_all_stays_pending(
     )
     state, line = worker.wait_ci("h/o/r", 7)
     assert state == "pending" and "no checks reported" in line
+
+
+def wf_run(n: int, status: str, conclusion: str = "", workflow: str = "explain") -> dict[str, Any]:
+    return {
+        "databaseId": n,
+        "workflowName": workflow,
+        "event": "pull_request",
+        "name": workflow,
+        "status": status,
+        "conclusion": conclusion,
+    }
+
+
+def linked(*rows: tuple[str, str, int]) -> str:
+    link = "https://example.invalid/o/r/actions/runs/{}/job/1"
+    return json.dumps([{"name": n, "bucket": b, "link": link.format(i)} for n, b, i in rows])
+
+
+@pytest.mark.parametrize("bucket", ["cancel", "fail"])
+def test_wait_ci_a_check_of_a_cancelled_run_waits_for_the_run_that_replaced_it(
+    fake_gh: Callable[..., FakeGh], bucket: str
+) -> None:
+    # A concurrency group cancelled run 20 when run 21 of the same workflow started on the head;
+    # run 21 is queued, so it has no check yet and the cancelled one is all `gh pr checks` shows.
+    gh = fake_gh(
+        pr_checks=[
+            (1, linked(("explainer", bucket, 20), ("tests", "pass", 19)), ""),
+            (0, linked(("explainer", "pass", 21), ("tests", "pass", 19)), ""),
+        ],
+        pr_view=[(0, json.dumps({"headRefOid": "abc"}), "")],
+        run_list=[
+            (0, json.dumps([wf_run(21, "queued"), wf_run(20, "completed", "cancelled")]), ""),
+        ],
+    )
+    assert worker.wait_ci("h/o/r", 7) == ("passed", "passed: 2 checks")
+    assert gh.slept == 1
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        [wf_run(20, "completed", "cancelled")],  # cancelled by hand: nothing replaced it
+        [wf_run(21, "queued"), wf_run(20, "completed", "failure")],  # a real failure stays one
+        [wf_run(21, "queued", workflow="other"), wf_run(20, "completed", "cancelled")],
+        [wf_run(21, "completed", "cancelled"), wf_run(20, "completed", "cancelled")],
+    ],
+)
+def test_wait_ci_a_failed_check_that_no_run_replaced_still_fails(
+    fake_gh: Callable[..., FakeGh], runs: list[dict[str, Any]]
+) -> None:
+    gh = fake_gh(
+        pr_checks=[(1, linked(("explainer", "cancel", 20)), "")],
+        pr_view=[(0, json.dumps({"headRefOid": "abc"}), "")],
+        run_list=[(0, json.dumps(runs), "")],
+    )
+    assert worker.wait_ci("h/o/r", 7) == ("failed", "failed: explainer")
+    assert gh.slept == 0
+
+
+def test_wait_ci_without_checks_ignores_a_cancelled_run_that_a_newer_one_replaced(
+    fake_gh: Callable[..., FakeGh],
+) -> None:
+    old = wf_run(20, "completed", "cancelled")
+    gh = fake_gh(
+        pr_checks=[(1, "", NO_CHECKS)],
+        pr_view=[(0, json.dumps({"headRefOid": "abc"}), "")],
+        run_list=[
+            (0, json.dumps([wf_run(21, "in_progress"), old]), ""),
+            (0, json.dumps([wf_run(21, "completed", "success"), old]), ""),
+        ],
+    )
+    assert worker.wait_ci("h/o/r", 7) == ("passed", "passed: 1 check")
+    assert gh.slept == 1
 
 
 WF_API = "api_repos/o/r/actions/workflows"
