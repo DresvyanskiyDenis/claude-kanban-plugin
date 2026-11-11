@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- The dispatcher holds a card while the plugin installed in its board's Claude account is at another version than the daemon. A worker is started as `claude --agent kanban-claude:<role>`, so it loads the roles, skills and rules of whatever version that account has installed, while the daemon, the CLI and the protocol stay at the version `/kanban-claude:setup` last installed. After a plugin update without setup the two drifted apart silently, and new role text ran against an old CLI. The dispatcher now reads `plugins/installed_plugins.json` in the board's config directory on each tick and skips the card with `plugin_mismatch:<version>` when kanban-claude is listed there only at other versions; the card starts on the first tick after they match. A missing or unreadable listing, an account with no install, and one install at the daemon's version (a user and a project install can differ) are not held. Running cards finish. The session-start line for a version difference now says that cards are held, and the `kanban` skill tells the orchestrator what to do with the skip.
+
 ### Changed
 
 - Workers settle an ambiguous card alone. `rules.md` tells every role that nobody watches the run: take the most reasonable reading of what the card asks, state it at the top of the summary (and the PR body, if one is opened), and carry on. Blocking with `needs_input` over such an ambiguity is kept for a choice that can't be undone and could reasonably go either way, after the preparation is done; the `needs_input` cases each role already names are unchanged. `scout` no longer blocks on an ambiguous question. A block on a question the worker could have answered alone costs a full owner round trip, and an unattended run has nobody to answer it quickly.

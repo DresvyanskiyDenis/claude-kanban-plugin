@@ -21,7 +21,7 @@ from pathlib import Path
 from string import Template
 from typing import IO, Any
 
-from . import classify, ghops, gitops, housekeeping, measure, store, validate
+from . import __version__, classify, ghops, gitops, housekeeping, measure, store, validate
 from .errors import Error
 from .gitops import ProvisionError
 from .paths import card_tmp, dirs, ensure_dir, nudge, run_files, write_private
@@ -139,6 +139,23 @@ def json_section(path: Path, key: str) -> dict[str, Any]:
     except (OSError, ValueError, AttributeError):
         return {}
     return section if isinstance(section, dict) else {}
+
+
+def plugin_mismatch(config_dir: str) -> str | None:
+    """A version of kanban-claude the account has installed, when none of its installs is this
+    runtime's: a worker there loads roles and skills written for another daemon and CLI. None when
+    one matches, or when the listing is missing or names no install (a `--plugin-dir` checkout)."""
+    path = Path(config_dir).expanduser() / "plugins" / "installed_plugins.json"
+    found = {
+        str(e["version"])
+        for key, entries in json_section(path, "plugins").items()
+        if key.partition("@")[0] == OWN_PLUGIN and isinstance(entries, list)
+        for e in entries
+        if isinstance(e, dict) and e.get("version")
+    }
+    # shortcut: one matching install counts as a match, since which of a user and a project install
+    # a worker loads is not known here; narrow it to the card's project if a stale one slips through
+    return None if not found or __version__ in found else max(found)
 
 
 def plugins_off(conn: sqlite3.Connection, config_dir: str) -> dict[str, bool]:

@@ -16,8 +16,8 @@ from .test_install import PLUGIN
 HOOK = PLUGIN / "hooks" / "scripts" / "session_start.sh"
 Hook = Callable[[], subprocess.CompletedProcess[str]]
 TAIL = (
-    " — new roles and skills run on the old daemon, CLI and protocol until /kanban-claude:setup;"
-    " run it between cards (a running card finishes on old code)"
+    " — the daemon starts no card on an account whose plugin differs from it;"
+    " run /kanban-claude:setup (a running card finishes on old code)"
 )
 UPGRADE = f"kanban-claude: daemon 1.0.0, plugin 1.1.0{TAIL}"
 

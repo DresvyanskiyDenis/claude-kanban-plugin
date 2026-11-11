@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from kanban_claude import dispatcher, gitops, runner, store
+from kanban_claude import __version__, dispatcher, gitops, runner, store
 from kanban_claude.dispatcher import dispatch_once
 from kanban_claude.errors import Refused
 
@@ -109,6 +109,27 @@ def test_a_ready_card_on_an_archived_board_is_skipped(
     report = tick(conn, procs)
     assert report["skipped"] == {tid: "board_archived"} and report["claimed"] == []
     assert procs.spawned == [] and store.get_task(conn, tid)["status"] == "ready"
+
+
+def test_a_plugin_installed_at_another_version_holds_dispatch_until_they_match(
+    conn: Any, card: Card, procs: FakeProcs
+) -> None:
+    tid = card()
+    cfg_dir = Path(store.effective_config_dir(conn, store.get_board(conn, "main")))
+    listing = cfg_dir / "plugins" / "installed_plugins.json"
+    listing.parent.mkdir(parents=True, exist_ok=True)
+
+    def installed(*versions: str) -> None:
+        entries = [{"scope": "user", "version": v} for v in versions]
+        listing.write_text(json.dumps({"plugins": {"kanban-claude@market": entries, "x@y": []}}))
+
+    installed("9.9.9")
+    held = tick(conn, procs)
+    assert held["skipped"] == {tid: "plugin_mismatch:9.9.9"} and held["claimed"] == []
+    listing.write_text("not json")  # an unreadable listing never holds a board
+    assert tick(conn, procs, dry_run=True)["skipped"] == {}
+    installed("9.9.9", __version__)
+    assert [c["id"] for c in tick(conn, procs)["claimed"]] == [tid]
 
 
 def test_d4_quota_walls_hold_and_expire(conn: Any, card: Card, procs: FakeProcs) -> None:
